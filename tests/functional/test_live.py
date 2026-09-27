@@ -92,7 +92,10 @@ def test_transport_security_headers():
 def test_static_assets_served():
     r = requests.get(BASE + "/accounts/login/", timeout=TIMEOUT)
     href = re.search(r'href="(/static/[^"]+\.css)"', r.text).group(1)
-    assert requests.get(BASE + href, timeout=TIMEOUT).status_code == 200
+    asset = requests.get(BASE + href, timeout=TIMEOUT)
+    assert asset.status_code == 200
+    # regression: WhiteNoise's default `Access-Control-Allow-Origin: *` (ZAP 10098)
+    assert "Access-Control-Allow-Origin" not in asset.headers
 
 
 def test_anonymous_access_is_refused():

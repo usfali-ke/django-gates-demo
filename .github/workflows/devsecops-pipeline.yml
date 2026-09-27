@@ -1067,10 +1067,21 @@ jobs:
           if ! read -r ZAP_SESSION ZAP_CSRF < <(uv run --frozen python tests/dast/login_session.py); then
             echo "::error::could not log in to pre-production"; echo "rc=login-failed" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          export ZAP_SESSION ZAP_CSRF TARGET="$BASE_URL"
-          docker run --rm --network host -v "$PWD/tests/dast:/zap/wrk/tests/dast:ro" -v "$PWD/$OUT:/zap/wrk/reports" \
-            -e TARGET -e ZAP_SESSION -e ZAP_CSRF "$ZAP" zap.sh -cmd -port 18090 -autorun /zap/wrk/tests/dast/zap-plan.yaml > "$OUT/zap.log" 2>&1
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          export TARGET="$BASE_URL" ZAP_CSRF ZAP_AUTH_HEADER=Cookie ZAP_AUTH_HEADER_SITE=localhost
+          export ZAP_AUTH_HEADER_VALUE="sessionid=$ZAP_SESSION; csrftoken=$ZAP_CSRF"
+          # ZAP doesn't substitute env vars in request headers: render the
+          # plan outside the uploaded report dir.
+          plan="$RUNNER_TEMP/zap-plan.yaml"
+          # shellcheck disable=SC2016  # the variable list is literal for envsubst
+          envsubst '$TARGET $ZAP_CSRF' < tests/dast/zap-plan.yaml > "$plan"
+          chmod 644 "$plan"   # read by the zap user in the container
+          docker run --rm --network host -v "$plan:/zap/plan.yaml:ro" -v "$PWD/$OUT:/zap/wrk/reports" \
+            -e ZAP_AUTH_HEADER -e ZAP_AUTH_HEADER_VALUE -e ZAP_AUTH_HEADER_SITE "$ZAP" zap.sh -cmd -port 18090 -autorun /zap/plan.yaml > "$OUT/zap.log" 2>&1
+          rc=$?
+          # the log echoes the plan; the preprod session dies with the job, but keep it out of artifacts
+          sed -i "s/${ZAP_CSRF}/[redacted]/g; s/${ZAP_SESSION}/[redacted]/g" "$OUT/zap.log"
+          rm -f "$plan"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
           tail -30 "$OUT/zap.log"
       - id: verdict
         if: always()

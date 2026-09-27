@@ -108,6 +108,9 @@ STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
 }
+# WhiteNoise sends `Access-Control-Allow-Origin: *` on static files by
+# default; nothing on another origin needs this app's assets.
+WHITENOISE_ALLOW_ALL_ORIGINS = False
 
 # The app accepts small text notes only.
 DATA_UPLOAD_MAX_MEMORY_SIZE = 64 * 1024
