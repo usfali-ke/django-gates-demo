@@ -1,0 +1,548 @@
+# Release, in ONE run: verify → approve (G4) → deploy (G5) → verify the
+# rollout (G6) → evidence. It runs against the digest devsecops-pipeline.yml
+# built, tested and signed from this commit. Start it from main: Actions →
+# devsecops-release → Run workflow, with the change-request issue number.
+#
+#   R1 verify    signature + SBOM + SLSA provenance (cosign and GitHub) ·
+#                evidence attestation says G2 and G3 passed for this digest ·
+#                target config: schema-valid, checkov-clean, only the digest changes
+#   R2 G4        protected environment `release-approval` (a human) AND the
+#                security dashboard's decision on the change record
+#   R3 deploy    the digest committed to deploy/kind (GitOps) → G5 gate
+#   R4 verify    wait for the dashboard's `security-dashboard/G6` status on
+#                the deploy commit (Argo CD sync + canary analysis + Kyverno)
+#   R5 evidence  every report + hash manifest → artifact `release-evidence`
+#                (90 days); after a deploy, attested to the image digest
+#
+# Nothing asks for approval before R1 passes, and nothing deploys before
+# G4 passes. Nothing here talks to the cluster: the deploy is a commit that
+# Argo CD syncs.
+
+name: devsecops-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      change:
+        description: Change request issue number (the CHG-<n> being released)
+        required: true
+        type: number
+      kind:
+        description: Deployment kind
+        required: true
+        type: choice
+        options: [planned, hotfix, fix_forward]
+        default: planned
+
+permissions: {}
+
+concurrency:
+  group: devsecops-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/usfali-ke/django-gates-demo
+  CHANGE_ID: CHG-${{ inputs.change }}
+  KUSTOMIZATION: deploy/kind/kustomization.yaml
+  # Only the pipeline on main signs releasable images.
+  CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
+  CERT_ISSUER: https://token.actions.githubusercontent.com
+  EVIDENCE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
+  RELEASE_EVIDENCE_TYPE: https://github.com/${{ github.repository }}/release-evidence/v1
+  RELEASE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-release.yml@refs/heads/main
+  CHECKOV: bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
+  KUBECONFORM: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
+  UV_VERSION: "0.12.19"
+
+jobs:
+  resolve:
+    name: R1 resolve the image for this commit
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      started-at: ${{ steps.digest.outputs.at }}
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: digest
+        run: |
+          set -euo pipefail
+          if ! digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE}:sha-${GITHUB_SHA}" 2>/dev/null) || [ -z "$digest" ]; then
+            echo "::error::No image ${IMAGE}:sha-${GITHUB_SHA} — devsecops-pipeline didn't publish this commit (a gate failed, or it hasn't finished)"
+            exit 1
+          fi
+          { echo "digest=$digest"; echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >> "$GITHUB_OUTPUT"
+          echo "Releasing \`${IMAGE}@${digest}\` for ${CHANGE_ID} (${GITHUB_SHA:0:7})" >> "$GITHUB_STEP_SUMMARY"
+
+  provenance:
+    name: R1 verify · signature, SBOM, SLSA provenance
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: provenance
+      OUT: reports/provenance
+      VERDICT_FILE: reports/provenance/verdict.json
+      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The provenance must name this exact commit — a valid attestation
+        # for some other build of main isn't enough.
+        run: |
+          mkdir -p "$OUT"
+          fail=""
+          id=(--certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER")
+          cosign verify "${id[@]}" "$REF" > "$OUT/signature.json" || fail="$fail signature"
+          cosign verify-attestation "${id[@]}" --type cyclonedx "$REF" > /dev/null || fail="$fail sbom-attestation"
+          if cosign verify-attestation "${id[@]}" --type slsaprovenance1 "$REF" > "$OUT/slsa.jsonl"; then
+            jq -r '.payload | @base64d | fromjson | .predicate.buildDefinition.resolvedDependencies[]?.digest.gitCommit // empty' "$OUT/slsa.jsonl" \
+              | grep -qx "$GITHUB_SHA" || fail="$fail slsa-commit-mismatch"
+          else
+            fail="$fail slsa-attestation"
+          fi
+          gh attestation verify "oci://${REF}" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/devsecops-pipeline.yml" --format json > "$OUT/gh-attestation.json" \
+            || fail="$fail gh-attestation"
+          if [ -z "$fail" ]; then
+            { echo "status=pass"; echo "detail=cosign signature + CycloneDX SBOM + SLSA v1 (commit ${GITHUB_SHA:0:7}) verified for devsecops-pipeline.yml@refs/heads/main; gh attestation verify passed"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "status=fail"; echo "detail=verification failed:${fail}"; } >> "$GITHUB_OUTPUT"
+          fi
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'verification did not run' }}
+          TOOL: cosign 2.6.5 + gh attestation
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-provenance
+          path: reports/provenance/
+          if-no-files-found: ignore
+
+  evidence-check:
+    name: R1 verify · pipeline evidence (G2 + G3 passed)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: evidence-check
+      OUT: reports/evidence-check
+      VERDICT_FILE: reports/evidence-check/verdict.json
+      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: check
+        # The signed manifest is the pipeline's own record of this digest:
+        # built from this commit, every control passed, G2 and G3 recorded.
+        run: |
+          mkdir -p "$OUT"
+          if ! cosign verify-attestation --type "$EVIDENCE_TYPE" --certificate-identity "$CERT_IDENTITY" \
+                 --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > "$OUT/attestation.jsonl"; then
+            { echo "status=fail"; echo "detail=no verified evidence attestation ($EVIDENCE_TYPE) on ${DIGEST:0:19}"; } >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The newest attestation wins if the pipeline was re-run.
+          jq -s 'map(.payload | @base64d | fromjson | .predicate) | sort_by(.generated_at) | last' "$OUT/attestation.jsonl" > "$OUT/manifest.json"
+          problems=$(jq -r --arg sha "$GITHUB_SHA" --arg digest "$DIGEST" '[
+              (if .commit_sha != $sha then "built from \(.commit_sha[0:7]), not \($sha[0:7])" else empty end),
+              (if .artifact_digest != $digest then "manifest is for \(.artifact_digest)" else empty end),
+              (if .result != "pass" then "pipeline result \(.result) (\(.counts.fail) failed, \(.counts.missing) missing)" else empty end),
+              (.gates as $g | ("G2","G3") | select(($g[.].status // "") != "pass" or ($g[.].recorded // false) != true) | "\(.) not passed+recorded")
+            ] | join("; ")' "$OUT/manifest.json")
+          if [ -z "$problems" ]; then
+            summary=$(jq -r '"\(.counts.pass) controls passed, \(.counts.skipped) skipped; G2 + G3 passed; run \(.run_url)"' "$OUT/manifest.json")
+            { echo "status=pass"; echo "detail=evidence attestation verified: $summary"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "status=fail"; echo "detail=evidence attestation verified but: $problems"; } >> "$GITHUB_OUTPUT"
+          fi
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
+          TOOL: cosign verify-attestation
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-evidence-check
+          path: reports/evidence-check/
+          if-no-files-found: ignore
+
+  config:
+    name: R1 verify · target config
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: config
+      OUT: reports/config
+      VERDICT_FILE: reports/config/verdict.json
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - id: check
+        # Schema-valid (-strict rejects unknown fields; Rollout and
+        # AnalysisTemplate schemas from the CRDs catalog), no checkov
+        # failures, and the only change vs git is the image digest.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST" || exit 0
+          kubectl kustomize deploy/kind > "$OUT/kind.yaml" || exit 0
+          grep -q "image: ${IMAGE}@${DIGEST}" "$OUT/kind.yaml" || { echo "::error::render does not reference the released digest"; exit 0; }
+          docker run --rm -v "$PWD/$OUT:/render:ro" "$KUBECONFORM" \
+            -strict -summary -output json -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /render/kind.yaml > "$OUT/kubeconform.json"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          mkdir -p "$OUT/checkov"
+          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/kind.yaml" > "$OUT/checkov/kind-scan-view.yaml"
+          docker run --rm -v "$PWD/$OUT/checkov:/work" "$CHECKOV" -f /work/kind-scan-view.yaml --framework kubernetes \
+            -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
+          echo "changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          RC: ${{ steps.check.outputs.rc }}
+          CHANGED: ${{ steps.check.outputs.changed }}
+          TOOL: kubeconform 0.8.0 + checkov 3.3.20
+        run: |
+          rc=0
+          CONTROL=config-schema OUTPUT=schema VERDICT_FILE="$OUT/kubeconform.verdict.json" \
+            python3 .github/scripts/verdict.py kubeconform "$OUT/kubeconform.json" || rc=1
+          CONTROL=config-checkov OUTPUT=checkov VERDICT_FILE="$OUT/checkov.verdict.json" \
+            python3 .github/scripts/verdict.py checkov "$OUT/checkov/results_json.json" || rc=1
+          status=$([ $rc = 0 ] && echo pass || echo fail)
+          detail="$(jq -r .detail "$OUT/kubeconform.verdict.json" 2>/dev/null) | checkov: $(jq -r .detail "$OUT/checkov.verdict.json" 2>/dev/null)"
+          python3 .github/scripts/verdict.py result "$status" "$detail"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-config
+          path: reports/config/
+          if-no-files-found: ignore
+
+  g4:
+    name: R2 G4 release approval
+    needs: [resolve, provenance, evidence-check, config]
+    environment: release-approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      statuses: read
+    env:
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - run: |
+          mkdir -p "$RUNNER_TEMP/release-request"
+          jq -n --arg change "$CHANGE_ID" --arg subject "$DIGEST" --arg sha "$GITHUB_SHA" \
+            '{change_id: $change, subject: $subject, commit_sha: $sha}' | tee "$RUNNER_TEMP/release-request/release-request.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-request
+          path: ${{ runner.temp }}/release-request/release-request.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Wait for the dashboard's G4 decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # Only a status pointing at this run answers this request; an older
+        # G4 status on the same commit belongs to another release.
+        run: |
+          set -uo pipefail
+          for _ in $(seq 60); do
+            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/statuses?per_page=100" \
+                  --jq "[.[] | select(.context == \"security-dashboard/G4\" and .target_url == \"${RUN_URL}\")][0] // empty" 2>/dev/null)
+            case "$(jq -r '.state // empty' <<<"${s:-null}")" in
+              success) echo "G4: $(jq -r .description <<<"$s")" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+              failure|error) echo "::error::$(jq -r '.description // "G4 blocked"' <<<"$s")"; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::dashboard collector did not answer within 20 minutes (no security-dashboard/G4 status for this run)"
+          exit 1
+
+  deploy:
+    name: R3 deploy (GitOps commit)
+    # The only write path to the cluster: a commit on main that Argo CD
+    # syncs. [skip ci] + paths-ignore keep it from re-running the pipeline.
+    needs: [resolve, g4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      gitops-sha: ${{ steps.commit.outputs.gitops_sha }}
+    env:
+      CONTROL: deploy
+      OUT: reports/deploy
+      VERDICT_FILE: reports/deploy/verdict.json
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true # zizmor: ignore[artipacked] this job pushes the deploy commit
+          fetch-depth: 0
+      - id: commit
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$KUSTOMIZATION"
+          git commit -m "deploy(kind): django-gates-demo ${DIGEST:7:12} ${CHANGE_ID} [skip ci]" \
+            -m "Released ${IMAGE}@${DIGEST} from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          git push origin HEAD:main
+          echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          SHA: ${{ steps.commit.outputs.gitops_sha }}
+          TOOL: git (GitOps) → Argo CD
+        run: |
+          mkdir -p "$OUT"
+          if [ -n "$SHA" ]; then
+            python3 .github/scripts/verdict.py result pass "GitOps commit ${SHA:0:7} on main → Argo CD app django-gates-demo-kind (automated sync)"
+          else
+            python3 .github/scripts/verdict.py result fail "GitOps commit/push to main failed"
+          fi
+      - name: Build deployment-event
+        if: steps.commit.outputs.gitops_sha != ''
+        env:
+          GITOPS_SHA: ${{ steps.commit.outputs.gitops_sha }}
+          KIND: ${{ inputs.kind }}
+        # in_progress: the commit is only the start. Argo CD notifications
+        # report the sync/canary outcome under the same external_id
+        # (deploy-<dashboard.environment>-<revision>).
+        run: |
+          mkdir -p "$RUNNER_TEMP/deployment-event"
+          jq -n \
+            --arg id "deploy-kind-${GITOPS_SHA}" --arg change "$CHANGE_ID" --arg sha "$GITHUB_SHA" \
+            --arg digest "$DIGEST" --arg commit_at "$(git show -s --format=%cI "$GITHUB_SHA")" \
+            --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg kind "$KIND" \
+            --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{external_id: $id, environment: "kind", change_id: $change, commit_sha: $sha,
+              artifact_digest: $digest, commit_at: $commit_at, started_at: $started,
+              status: "in_progress", kind: $kind, via_approved_path: true, break_glass: false,
+              run_url: $run}' | tee "$RUNNER_TEMP/deployment-event/deployment.json"
+          cp "$RUNNER_TEMP/deployment-event/deployment.json" "$OUT/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.commit.outputs.gitops_sha != ''
+        with:
+          name: deployment-event
+          path: ${{ runner.temp }}/deployment-event/deployment.json
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-deploy
+          path: reports/deploy/
+          if-no-files-found: ignore
+
+  gate-g5:
+    name: G5 deployment gate
+    needs: [resolve, provenance, evidence-check, config, deploy]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: G5
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.resolve.outputs.digest }}
+          artifact-digest: ${{ needs.resolve.outputs.digest }}
+          environment: kind
+          started-at: ${{ needs.resolve.outputs.started-at }}
+
+  post-deploy:
+    name: R4 verify the rollout (G6)
+    # Argo CD reports G6 (sync, canary analysis, Kyverno admission) to the
+    # dashboard; the dashboard mirrors it as commit status
+    # `security-dashboard/G6` on the deploy commit. A runner can't see the
+    # cluster, so this is how the release learns the outcome.
+    needs: [deploy, gate-g5]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      statuses: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: post-deploy
+      OUT: reports/post-deploy
+      VERDICT_FILE: reports/post-deploy/verdict.json
+      GITOPS_SHA: ${{ needs.deploy.outputs.gitops-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          for _ in $(seq 90); do
+            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITOPS_SHA}/statuses?per_page=100" \
+                  --jq '[.[] | select(.context == "security-dashboard/G6")][0] // empty' 2>/dev/null)
+            state=$(jq -r '.state // empty' <<<"${s:-null}")
+            if [ "$state" = success ] || [ "$state" = failure ] || [ "$state" = error ]; then
+              jq . <<<"$s" > "$OUT/g6-status.json"
+              { echo "status=$([ "$state" = success ] && echo pass || echo fail)"
+                echo "detail=G6 ${state}: $(jq -r '.description // ""' <<<"$s") ($(jq -r '.target_url // ""' <<<"$s"))"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 20
+          done
+          { echo "status=fail"; echo "detail=no security-dashboard/G6 status on ${GITOPS_SHA:0:7} within 30 minutes (Argo CD sync or notification didn't reach the dashboard)"; } >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.wait.outputs.status }}
+          DETAIL: ${{ steps.wait.outputs.detail || 'wait did not run' }}
+          TOOL: security dashboard (Argo CD notifications)
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-post-deploy
+          path: reports/post-deploy/
+          if-no-files-found: ignore
+
+  release-evidence:
+    name: R5 release evidence
+    needs: [resolve, provenance, evidence-check, config, g4, deploy, gate-g5, post-deploy]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
+      CONTROLS: provenance,evidence-check,config,deploy,post-deploy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: report-*
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gate-*
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: release-request
+          path: ${{ runner.temp }}/in/release-request
+      - name: Bundle + hash manifest
+        env:
+          G4_RESULT: ${{ needs.g4.result }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/evidence.py "$RUNNER_TEMP/in" release-evidence
+          cp "$RUNNER_TEMP/in/release-request/release-request.json" release-evidence/ 2>/dev/null || true
+          jq --arg change "$CHANGE_ID" --arg g4 "$G4_RESULT" '. + {change_id: $change, g4_job: $g4}' \
+            release-evidence/manifest.json > "$RUNNER_TEMP/m.json" && mv "$RUNNER_TEMP/m.json" release-evidence/manifest.json
+          (cd release-evidence && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-evidence
+          path: release-evidence/
+          retention-days: 90
+          if-no-files-found: error
+      - if: needs.deploy.result == 'success'
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - if: needs.deploy.result == 'success'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: needs.deploy.result == 'success'
+        name: Attest the release record to the image digest
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type "$RELEASE_EVIDENCE_TYPE" --predicate release-evidence/manifest.json "$REF"
+          cosign verify-attestation --type "$RELEASE_EVIDENCE_TYPE" --certificate-identity "$RELEASE_IDENTITY" \
+            --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
+          echo "Release record attested to ${REF} (${RELEASE_EVIDENCE_TYPE})" >> "$GITHUB_STEP_SUMMARY"

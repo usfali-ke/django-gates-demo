@@ -1,0 +1,4 @@
+body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+header { display: flex; justify-content: space-between; align-items: center; }
+form.inline { display: inline; }
+.error, .errorlist { color: #b00020; }

@@ -1,0 +1,36 @@
+{
+  "_doc": "Accepted-risk register. Each entry suppresses exactly one finding id for one control, with a reason and an expiry; an expired entry stops applying and the finding blocks again. verdict.py applies these and every verdict lists the ones it used, so the evidence shows what was accepted, not just that the control passed. Changes go through a reviewed PR like any code. Checkov exceptions live inline as checkov.io/skip annotations (checkov's own mechanism) and are counted in its verdict.",
+  "accepted": [
+    {
+      "control": "image-compliance",
+      "id": "DKL-DI-0005",
+      "reason": "Upstream python:3.13-slim leaves apt InRelease index files after `apt-get dist-clean` (no package lists). A later layer can't remove them from the base layers, and the runtime has no apt use.",
+      "expires": "2027-03-31"
+    },
+    {
+      "control": "image-compliance",
+      "id": "CIS-DI-0010",
+      "match": "settings.py",
+      "reason": "Filename heuristic: config/settings.py reads DJANGO_SECRET_KEY from the environment and contains no credential (bandit, semgrep p/secrets, gitleaks and trufflehog scan the file itself).",
+      "expires": "2027-03-31"
+    },
+    {
+      "control": "dast-tls",
+      "id": "cert_revocation",
+      "reason": "Pre-production uses a throwaway Caddy internal CA with no CRL/OCSP. The control tests the TLS protocol/cipher/header configuration, not certificate issuance.",
+      "expires": "2027-03-31"
+    },
+    {
+      "control": "dast-tls",
+      "id": "intermediate_cert_notAfter",
+      "reason": "Caddy's internal intermediate is valid for 7 days by design; the environment lives for minutes.",
+      "expires": "2027-03-31"
+    },
+    {
+      "control": "dast-tls",
+      "id": "intermediate_cert_expiration",
+      "reason": "As intermediate_cert_notAfter.",
+      "expires": "2027-03-31"
+    }
+  ]
+}

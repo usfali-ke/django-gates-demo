@@ -1,0 +1,14 @@
+{
+	admin off
+	skip_install_trust
+	# Java (ZAP) sends no SNI for a dotless name like localhost.
+	default_sni localhost
+}
+
+# `tls internal`: a throwaway CA per environment. Caddy also redirects
+# :80 to HTTPS and sets X-Forwarded-Proto, which Django trusts
+# (SECURE_PROXY_SSL_HEADER) because only this proxy can reach the app.
+localhost {
+	tls internal
+	reverse_proxy app:8000
+}

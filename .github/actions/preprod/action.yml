@@ -1,0 +1,65 @@
+name: Pre-production environment
+description: >
+  Starts the exact image this run built (artifact `image`, never rebuilt)
+  the way the cluster runs it — read-only root, no capabilities, non-root —
+  behind a TLS proxy playing the ingress (tests/preprod/compose.yaml), with
+  a fresh random secret key and two random-password test users.
+  The secrets never enter GITHUB_ENV (step logs list those variables, and
+  masking can be switched off by the workflow commands it relies on):
+  they go to the 0600 file $RUNNER_TEMP/preprod.env — a step that needs
+  them runs `set -a; . "$RUNNER_TEMP/preprod.env"; set +a` (BASE_URL, HTTP_URL,
+  USER_A/B, PASSWORD_A/B, REQUESTS_CA_BUNDLE / SSL_CERT_FILE for the
+  proxy's throwaway CA, and what compose itself needs). Stop it with
+  `docker compose -f tests/preprod/compose.yaml down` — `if: always()`,
+  after saving its logs as evidence.
+
+inputs:
+  image-tag:
+    description: Tag the image artifact was built with (build job output `tag`)
+    required: true
+  digest:
+    description: Expected image digest (build job output `digest`); the loaded image must match it
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: image
+        path: ${{ runner.temp }}/image
+    - shell: bash
+      env:
+        TAG: ${{ inputs.image-tag }}
+        DIGEST: ${{ inputs.digest }}
+      run: |
+        set -euo pipefail
+        # The OCI layout's index names the manifest this run built; testing
+        # anything else would make every result below meaningless.
+        got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
+        [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 1; }
+        docker load -i "$RUNNER_TEMP/image/image.oci.tar"
+        rand() { python3 -c 'import secrets; print(secrets.token_urlsafe(24))'; }
+        env_file="$RUNNER_TEMP/preprod.env"
+        (umask 077; {
+          echo "APP_IMAGE=$TAG"
+          echo "DJANGO_SECRET_KEY=$(rand)"
+          echo "USER_A=preprod-alice"; echo "PASSWORD_A=$(rand)"
+          echo "USER_B=preprod-bob"; echo "PASSWORD_B=$(rand)"
+          echo "BASE_URL=https://localhost"; echo "HTTP_URL=http://localhost"
+          echo "REQUESTS_CA_BUNDLE=$RUNNER_TEMP/preprod-ca.crt"
+          echo "SSL_CERT_FILE=$RUNNER_TEMP/preprod-ca.crt"; } > "$env_file")
+        # shellcheck source=/dev/null
+        set -a; . "$env_file"; set +a
+        compose=(docker compose -f tests/preprod/compose.yaml)
+        if ! "${compose[@]}" up -d --wait --wait-timeout 120; then
+          "${compose[@]}" logs --no-color | tail -80
+          echo "::error::pre-production did not become healthy"
+          exit 1
+        fi
+        ENSURE_USER_PASSWORD="$PASSWORD_A" "${compose[@]}" exec -T -e ENSURE_USER_PASSWORD app python manage.py ensure_user "$USER_A"
+        ENSURE_USER_PASSWORD="$PASSWORD_B" "${compose[@]}" exec -T -e ENSURE_USER_PASSWORD app python manage.py ensure_user "$USER_B"
+        "${compose[@]}" cp proxy:/data/caddy/pki/authorities/local/root.crt "$RUNNER_TEMP/preprod-ca.crt"
+        chmod 644 "$RUNNER_TEMP/preprod-ca.crt"   # read by tool containers running as other uids
+        curl -fsS --cacert "$RUNNER_TEMP/preprod-ca.crt" -o /dev/null https://localhost/healthz
+        echo "pre-production up: $TAG ($DIGEST) at https://localhost"

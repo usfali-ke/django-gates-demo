@@ -1,0 +1,48 @@
+# Pre-production: the exact image under test, run the way the cluster runs
+# it (read-only root, no capabilities, non-root, writable /tmp and /data
+# only), behind a TLS-terminating proxy that plays the ingress — so
+# functional, performance and DAST tests see HTTPS, HSTS and the
+# HTTP→HTTPS redirect, not a bare dev server.
+#
+#   APP_IMAGE=<image> DJANGO_SECRET_KEY=... docker compose -f tests/preprod/compose.yaml up -d --wait
+#
+# Reachable at https://localhost (Caddy's internal CA: `docker compose cp
+# proxy:/data/caddy/pki/authorities/local/root.crt .`).
+name: preprod
+
+services:
+  app:
+    image: ${APP_IMAGE:?set APP_IMAGE to the image under test}
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp
+      - /data:uid=10001,gid=10001
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set a random DJANGO_SECRET_KEY}
+      DJANGO_ALLOWED_HOSTS: localhost
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/healthz', headers={'Host': 'localhost'}), timeout=4)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  proxy:
+    image: caddy:2.11.4@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-80}:80"
+      - "127.0.0.1:${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "/dev/null", "https://localhost/healthz"]
+      interval: 3s
+      timeout: 5s
+      retries: 20

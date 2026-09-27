@@ -1,0 +1,110 @@
+# Progressive delivery: half the replicas move to the new digest, the
+# AnalysisTemplate probes the canary, and only a passing analysis promotes
+# to 100%. A failed analysis aborts and scales the canary back to stable.
+#
+# Data: SQLite in a per-pod emptyDir (migrated at start by gunicorn). Each
+# pod has its own database and nothing survives a restart — enough for
+# gate and canary testing, not a data design. DJANGO_SECRET_KEY comes from
+# the Secret `django-gates-demo` (key `secret-key`), created out of band;
+# it is never in git.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: django-gates-demo
+  labels:
+    app: django-gates-demo
+  annotations:
+    # Accepted, documented exceptions to the iac-checkov control:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is platform-owned; the Argo CD AppProject forbids product repos from shipping one
+    checkov.io/skip2: CKV_K8S_35=The only secret is DJANGO_SECRET_KEY, read once at start; Django has no file-based setting for it
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: django-gates-demo
+  strategy:
+    canary:
+      canaryService: django-gates-demo-canary
+      stableService: django-gates-demo-stable
+      steps:
+        - setWeight: 50
+        - analysis:
+            templates:
+              - templateName: django-gates-demo-canary-health
+        - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: django-gates-demo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: django-gates-demo
+          # Kustomize `images:` rewrites this to ghcr.io/...@sha256:<digest>.
+          image: django-gates-demo
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DJANGO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: django-gates-demo
+                  key: secret-key
+            - name: DJANGO_ALLOWED_HOSTS
+              value: localhost,django-gates-demo,django-gates-demo-canary.django-gates-demo.svc,django-gates-demo-stable.django-gates-demo.svc,django-gates-demo.django-gates-demo.svc
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+          # Django validates Host; the kubelet would send the pod IP.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
+        - name: data
+          emptyDir:
+            sizeLimit: 64Mi

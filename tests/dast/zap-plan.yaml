@@ -1,0 +1,85 @@
+# ZAP Automation Framework plan: authenticated spider + passive + active
+# scan of pre-production. The pipeline logs in as a test user first and
+# hands ZAP the session through ZAP_SESSION / ZAP_CSRF (env vars in this
+# plan are substituted by ZAP), so the scan covers the logged-in pages and
+# the JSON API, not just the login form. Logout is out of scope so the
+# session survives the scan.
+#
+#   docker run --network host -v $PWD:/zap/wrk -e TARGET=... -e ZAP_SESSION=... -e ZAP_CSRF=... \
+#     ghcr.io/zaproxy/zaproxy:stable zap.sh -cmd -autorun /zap/wrk/tests/dast/zap-plan.yaml
+env:
+  contexts:
+    - name: preprod
+      urls:
+        - ${TARGET}/notes/
+        - ${TARGET}/api/notes/
+        - ${TARGET}/accounts/login/
+      includePaths:
+        - ${TARGET}.*
+      excludePaths:
+        - ${TARGET}/accounts/logout/.*
+  parameters:
+    failOnError: true
+    failOnWarning: true  # e.g. the seed requests not returning 201/200: the session did not work
+    progressToStdout: true
+
+jobs:
+  - type: replacer
+    parameters:
+      deleteAllRules: true
+    rules:
+      - description: authenticated session
+        matchType: req_header
+        matchString: Cookie
+        replacementString: sessionid=${ZAP_SESSION}; csrftoken=${ZAP_CSRF}
+      - description: CSRF header for JSON API requests
+        matchType: req_header
+        matchString: X-CSRFToken
+        replacementString: ${ZAP_CSRF}
+
+  - type: spider
+    parameters:
+      context: preprod
+      maxDuration: 2
+
+  - type: requestor
+    # The spider only finds links and forms; seed the JSON API explicitly.
+    requests:
+      - url: ${TARGET}/api/notes/
+        method: POST
+        headers:
+          - "Content-Type: application/json"
+          - "Origin: ${TARGET}"
+        data: '{"text": "zap seed"}'
+        responseCode: 201
+      - url: ${TARGET}/api/notes/
+        method: GET
+        responseCode: 200
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  - type: activeScan
+    parameters:
+      context: preprod
+      maxRuleDurationInMins: 2
+      maxScanDurationInMins: 15
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk/reports
+      reportFile: zap
+    risks: [info, low, medium, high]
+    confidences: [falsepositive, low, medium, high, confirmed]
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/wrk/reports
+      reportFile: zap

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Your notes</h2>
+<form method="post" action="{% url 'notes:list' %}">{% csrf_token %}
+  {{ form.non_field_errors }}
+  {{ form.text.errors }}
+  <label for="{{ form.text.id_for_label }}">New note</label> {{ form.text }}
+  <button type="submit">Add</button>
+</form>
+<ul>
+{% for note in notes %}
+  <li><span>{{ note.text }}</span>
+    <form method="post" action="{% url 'notes:delete' note.pk %}" class="inline">{% csrf_token %}<button type="submit">Delete</button></form>
+  </li>
+{% empty %}
+  <li>No notes yet.</li>
+{% endfor %}
+</ul>
+{% endblock %}
