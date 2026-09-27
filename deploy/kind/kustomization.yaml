@@ -17,4 +17,4 @@ images:
   # requires digests.
   - name: django-gates-demo
     newName: ghcr.io/usfali-ke/django-gates-demo
-    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    digest: sha256:f843645951af13cca92c2ab2854ffa44460873da4b8b154a6be01992b47d09ce
