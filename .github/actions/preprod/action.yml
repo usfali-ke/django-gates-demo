@@ -38,7 +38,8 @@ runs:
         # anything else would make every result below meaningless.
         got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
         [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 1; }
-        docker load -i "$RUNNER_TEMP/image/image.oci.tar"
+        # docker load only reads OCI layouts with the containerd image store
+        skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$TAG"
         rand() { python3 -c 'import secrets; print(secrets.token_urlsafe(24))'; }
         env_file="$RUNNER_TEMP/preprod.env"
         (umask 077; {

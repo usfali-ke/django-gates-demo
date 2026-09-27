@@ -684,7 +684,8 @@ jobs:
           mkdir -p "$OUT"
           got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
-          docker load -i "$RUNNER_TEMP/image/image.oci.tar"
+          # docker load only reads OCI layouts with the containerd image store
+          skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$IMAGE_TAG"
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/$OUT:/out" "$DOCKLE" \
             -f json -o /out/dockle.json --exit-code 0 "$IMAGE_TAG" || true
       - id: verdict
@@ -730,7 +731,8 @@ jobs:
           mkdir -p "$OUT"
           got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
-          docker load -i "$RUNNER_TEMP/image/image.oci.tar"
+          # docker load only reads OCI layouts with the containerd image store
+          skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$IMAGE_TAG"
           DJANGO_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(50))'); export DJANGO_SECRET_KEY
           docker run --rm --read-only --tmpfs /tmp -e DJANGO_SECRET_KEY -e DJANGO_ALLOWED_HOSTS=app.example.invalid \
             "$IMAGE_TAG" python manage.py check --deploy --fail-level WARNING > "$OUT/check-deploy.txt" 2>&1
