@@ -47,7 +47,7 @@ CONTROLS = {
     "publish": ("3-publish", None, None),
     "functional": ("4-preprod", None, None),
     "performance": ("4-preprod", None, None),
-    "dast-zap": ("5-dast", "zap.json", "ZAP Scan"),
+    "dast-zap": ("5-dast", "zap.xml", "ZAP Scan"),  # DefectDojo's ZAP parser is XML-only
     "dast-nuclei": ("5-dast", "nuclei.jsonl", "Nuclei Scan"),
     "dast-tls": ("5-dast", None, None),
     # devsecops-release.yml

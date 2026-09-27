@@ -74,6 +74,15 @@ jobs:
     risks: [info, low, medium, high]
     confidences: [falsepositive, low, medium, high, confirmed]
 
+  # DefectDojo's "ZAP Scan" parser reads only the XML report.
+  - type: report
+    parameters:
+      template: traditional-xml
+      reportDir: /zap/wrk/reports
+      reportFile: zap
+    risks: [info, low, medium, high]
+    confidences: [falsepositive, low, medium, high, confirmed]
+
   - type: report
     parameters:
       template: traditional-html
