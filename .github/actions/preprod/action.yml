@@ -48,8 +48,10 @@ runs:
           echo "USER_A=preprod-alice"; echo "PASSWORD_A=$(rand)"
           echo "USER_B=preprod-bob"; echo "PASSWORD_B=$(rand)"
           echo "BASE_URL=https://localhost"; echo "HTTP_URL=http://localhost"
-          echo "REQUESTS_CA_BUNDLE=$RUNNER_TEMP/preprod-ca.crt"
-          echo "SSL_CERT_FILE=$RUNNER_TEMP/preprod-ca.crt"; } > "$env_file")
+          # system CAs + the proxy's CA: tools that also fetch from the
+          # internet (uv downloading a Python) must still verify it
+          echo "REQUESTS_CA_BUNDLE=$RUNNER_TEMP/preprod-bundle.crt"
+          echo "SSL_CERT_FILE=$RUNNER_TEMP/preprod-bundle.crt"; } > "$env_file")
         # shellcheck source=/dev/null
         set -a; . "$env_file"; set +a
         compose=(docker compose -f tests/preprod/compose.yaml)
@@ -61,6 +63,7 @@ runs:
         ENSURE_USER_PASSWORD="$PASSWORD_A" "${compose[@]}" exec -T -e ENSURE_USER_PASSWORD app python manage.py ensure_user "$USER_A"
         ENSURE_USER_PASSWORD="$PASSWORD_B" "${compose[@]}" exec -T -e ENSURE_USER_PASSWORD app python manage.py ensure_user "$USER_B"
         "${compose[@]}" cp proxy:/data/caddy/pki/authorities/local/root.crt "$RUNNER_TEMP/preprod-ca.crt"
-        chmod 644 "$RUNNER_TEMP/preprod-ca.crt"   # read by tool containers running as other uids
+        cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/preprod-ca.crt" > "$RUNNER_TEMP/preprod-bundle.crt"
+        chmod 644 "$RUNNER_TEMP/preprod-ca.crt" "$RUNNER_TEMP/preprod-bundle.crt"   # read by tool containers running as other uids
         curl -fsS --cacert "$RUNNER_TEMP/preprod-ca.crt" -o /dev/null https://localhost/healthz
         echo "pre-production up: $TAG ($DIGEST) at https://localhost"

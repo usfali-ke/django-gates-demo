@@ -9,6 +9,10 @@ const BASE = __ENV.BASE_URL;
 export const options = {
   vus: 10,
   duration: '30s',
+  // Each VU is one user who logs in once. k6's default clears the jar every
+  // iteration, which would re-login (a deliberately slow password hash)
+  // ~30 times a second and measure the hasher, not the app.
+  noCookiesReset: true,
 };
 
 function login() {
