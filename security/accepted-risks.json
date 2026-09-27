@@ -31,6 +31,62 @@
       "id": "intermediate_cert_expiration",
       "reason": "As intermediate_cert_notAfter.",
       "expires": "2027-03-31"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2025-69720",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): libncursesw6, libtinfo6, ncurses-base, ncurses-bin — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-16742",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): libsystemd0, libudev1 — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-54369",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): libacl1 — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-76642",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-78408",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-78409",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-78410",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux — Debian status affected, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
+    },
+    {
+      "control": "image-scan",
+      "id": "CVE-2026-9538",
+      "unfixed_only": true,
+      "reason": "Base image python:3.13-slim (Debian 13): perl-base — Debian status fix_deferred, no fixed version released as of 2026-09-27. Stops applying as soon as a fix is released; accepted by the owner (usfali-ke) for the demo.",
+      "expires": "2026-12-25"
     }
   ]
 }

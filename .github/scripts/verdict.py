@@ -15,7 +15,9 @@ script is the one place a threshold is decided. Settings come from env,
 never from ${{ }} inside a script.
 
 Accepted risks (security/accepted-risks.json) are applied here and listed
-in the verdict; an expired entry no longer applies.
+in the verdict (id, match, reason, expiry), so the evidence says what was
+accepted and why; an expired entry no longer applies, and an
+`"unfixed_only": true` entry stops applying once a fix is released.
 """
 
 import datetime as dt
@@ -56,9 +58,10 @@ def missing(tool):
     return False, f"{tool} did not produce a report", None
 
 
-def accepted(finding_id, text=""):
+def accepted(finding_id, text="", fixed=False):
     """True if the register accepts this finding for this control (and the
-    entry hasn't expired). Records every entry used."""
+    entry hasn't expired, and isn't `unfixed_only` for a finding that now
+    has a fix). Records every entry used."""
     register = load(env("ACCEPTED_RISKS", "security/accepted-risks.json")) or {}
     today = dt.date.today().isoformat()
     for entry in register.get("accepted", []):
@@ -68,8 +71,11 @@ def accepted(finding_id, text=""):
             continue
         if entry.get("expires", "") < today:
             continue
-        if finding_id not in _applied:
-            _applied.append(finding_id)
+        if entry.get("unfixed_only") and fixed:
+            continue
+        used = {k: entry[k] for k in ("id", "match", "unfixed_only", "reason", "expires") if k in entry}
+        if used not in _applied:
+            _applied.append(used)
         return True
     return False
 
@@ -293,7 +299,8 @@ def trivy(path):
     report = load(path)
     if report is None:
         return missing("trivy")
-    vulns = [v for r in report.get("Results") or [] for v in r.get("Vulnerabilities") or [] if not accepted(v["VulnerabilityID"])]
+    vulns = [v for r in report.get("Results") or [] for v in r.get("Vulnerabilities") or []
+             if not accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion")))]
     secrets = [s for r in report.get("Results") or [] for s in r.get("Secrets") or [] if not accepted(s.get("RuleID", ""))]
     block_unfixed = env("BLOCK_UNFIXED") == "true"
     blocking = vulns if block_unfixed else [v for v in vulns if v.get("FixedVersion")]
@@ -468,7 +475,9 @@ def main():
         out["metrics"] = metrics
     if _applied:
         out["accepted"] = _applied
-        out["detail"] = (out["detail"] + f"; accepted risks applied: {', '.join(_applied)}")[:1000]
+        ids = sorted({a["id"] for a in _applied})
+        listed = ", ".join(ids) if len(ids) <= 5 else f"{len(ids)} ids, listed in `accepted`"
+        out["detail"] = (out["detail"] + f"; accepted risks applied: {listed}")[:1000]
     print(f"{out['status']}: {out['detail']}")
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
         f.write(f"{env('OUTPUT', 'result')}={json.dumps(out)}\n")
