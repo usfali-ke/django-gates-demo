@@ -31,7 +31,7 @@ spec:
         job:
           spec:
             backoffLimit: 0
-            activeDeadlineSeconds: 90
+            activeDeadlineSeconds: 120
             template:
               spec:
                 restartPolicy: Never
@@ -66,6 +66,15 @@ spec:
                       - |
                         set -u
                         fail=0
+                        # The analysis starts the moment the canary Service's
+                        # selector switches; its endpoints can lag a few
+                        # seconds. Wait for the canary to answer, then check.
+                        i=0
+                        until curl -fsS -o /dev/null --max-time 3 "$BASE/healthz"; do
+                          i=$((i + 1))
+                          [ "$i" -lt 10 ] || { echo "FAIL canary never answered $BASE/healthz"; exit 1; }
+                          sleep 2
+                        done
                         headers=$(curl -sS -D - -o /dev/null --max-time 10 "$BASE/accounts/login/") || headers=""
                         for h in "x-content-type-options: nosniff" "x-frame-options: DENY" "content-security-policy: default-src 'none'" "cross-origin-opener-policy: same-origin"; do
                           if printf '%s' "$headers" | tr -d '\r' | grep -qi "^$h"; then echo "ok   header $h"
