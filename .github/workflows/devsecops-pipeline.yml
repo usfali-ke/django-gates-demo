@@ -204,6 +204,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      security-events: write
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
@@ -224,6 +225,15 @@ jobs:
         env:
           TOOL: semgrep 1.177.0 (p/default, python, django, dockerfile, github-actions)
         run: python3 .github/scripts/verdict.py semgrep "$OUT/semgrep.json"
+      # Code scanning: the same findings inline on the PR diff and in the
+      # Security tab. Public repos only (private ones need GitHub Advanced
+      # Security); a fork PR's token can't write, hence continue-on-error.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/sast-semgrep/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/sast-semgrep/findings.sarif
+          category: semgrep
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -237,6 +247,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      security-events: write
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
@@ -258,6 +269,13 @@ jobs:
           TOOL: gitleaks 8.30.1
           SCOPE: every commit reachable from this ref
         run: python3 .github/scripts/verdict.py gitleaks "$OUT/gitleaks.json"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/secrets-gitleaks/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/secrets-gitleaks/findings.sarif
+          category: secrets-gitleaks
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -312,6 +330,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      security-events: write
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
@@ -331,6 +350,13 @@ jobs:
         env:
           TOOL: trivy 0.74.0 (fs, lockfile incl. dev dependencies)
         run: python3 .github/scripts/verdict.py trivy-fs "$OUT/trivy-fs.json"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/sca-trivy/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/sca-trivy/findings.sarif
+          category: sca-trivy
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -344,6 +370,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      security-events: write
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
@@ -373,6 +400,13 @@ jobs:
         env:
           TOOL: checkov 3.3.20
         run: python3 .github/scripts/verdict.py checkov "$OUT/checkov.json"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/iac-checkov/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/iac-checkov/findings.sarif
+          category: iac-checkov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -469,6 +503,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      security-events: write
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
@@ -499,6 +534,13 @@ jobs:
         env:
           TOOL: trivy 0.74.0 (OS + Python packages, secrets)
         run: python3 .github/scripts/verdict.py trivy "$OUT/trivy.json"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/image-scan/trivy.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/image-scan/trivy.sarif
+          category: trivy-image
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -1061,7 +1103,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      security-events: write
     env:
       DIGEST: ${{ needs.build.outputs.digest }}
       REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.build.outputs.digest }}
@@ -1096,20 +1137,6 @@ jobs:
           path: evidence/
           retention-days: 90
           if-no-files-found: error
-      # Code scanning (public repos, or private with GitHub Advanced
-      # Security) shows the same findings inline on pull requests.
-      - if: ${{ !github.event.repository.private && hashFiles('evidence/reports/sast-semgrep/semgrep.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
-        continue-on-error: true
-        with:
-          sarif_file: evidence/reports/sast-semgrep/semgrep.sarif
-          category: semgrep
-      - if: ${{ !github.event.repository.private && hashFiles('evidence/reports/image-scan/trivy.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
-        continue-on-error: true
-        with:
-          sarif_file: evidence/reports/image-scan/trivy.sarif
-          category: trivy-image
       # On main, bind the evidence to the published image: anyone holding
       # the digest can fetch and verify the manifest, then check each report
       # file against its sha256. devsecops-release.yml requires it.
@@ -1131,3 +1158,56 @@ jobs:
           cosign verify-attestation --type "$PREDICATE_TYPE" --certificate-identity "$CERT_IDENTITY" \
             --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
           echo "Evidence manifest attested to ${REF} (${PREDICATE_TYPE})" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── PR comment ─────────────────────────────────────────────────────────
+  # One comment per PR, edited in place: every control, what's new compared
+  # with main, links to the job summaries. Its own job so only it can write
+  # to the PR. Same-repo PRs only: a fork's token is read-only, and running
+  # fork code with a write token is what pull_request_target gets wrong.
+  pr-comment:
+    name: PR findings comment
+    needs: evidence
+    if: always() && startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: report-*
+          path: ${{ runner.temp }}/current
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gate-*
+          path: ${{ runner.temp }}/current
+      - name: Baseline (latest completed run on main)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          read -r id sha < <(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/devsecops-pipeline.yml/runs?branch=main&status=completed&per_page=20" \
+            --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")][0] | "\(.id) \(.head_sha)"')
+          [ -n "${id:-}" ] && [ "$id" != null ] || exit 0
+          gh run download "$id" -R "$GITHUB_REPOSITORY" -p 'report-*' -D "$RUNNER_TEMP/baseline" && echo "BASELINE_SHA=$sha" >> "$GITHUB_ENV"
+      - name: Post or update the comment
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/findings.py pr-comment "$RUNNER_TEMP/current" "$RUNNER_TEMP/baseline" > "$RUNNER_TEMP/comment.md"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- devsecops-findings -->"))) | .id' | head -1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F "body=@${RUNNER_TEMP}/comment.md" > /dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F "body=@${RUNNER_TEMP}/comment.md" > /dev/null
+          fi

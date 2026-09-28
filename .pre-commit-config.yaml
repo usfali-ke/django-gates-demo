@@ -1,0 +1,33 @@
+# Local hooks over the Makefile targets, so they use the pipeline's pinned
+# images, arguments and thresholds (verdict.py) — a hook that passes here
+# passes in CI. Install: `pre-commit install --hook-type pre-commit --hook-type pre-push`.
+repos:
+  - repo: local
+    hooks:
+      - id: secrets-gitleaks
+        name: secrets · gitleaks (staged changes)
+        entry: make --no-print-directory pre-commit-secrets
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: sca-trivy
+        name: SCA · trivy (lockfile)
+        entry: make --no-print-directory sca-trivy
+        language: system
+        files: ^(uv\.lock|pyproject\.toml)$
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: iac-checkov
+        name: IaC · checkov (Dockerfile + k8s render)
+        entry: make --no-print-directory iac-checkov
+        language: system
+        files: ^(Dockerfile|deploy/)
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: sast-semgrep
+        name: SAST · semgrep (whole repo, before push)
+        entry: make --no-print-directory sast-semgrep
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

@@ -61,6 +61,55 @@ they appear as `gate-preview-*`). The `evidence` bundle also feeds
 DefectDojo: the dashboard's collector reimports every report listed in
 `manifest.json`.
 
+### When a control fails
+
+verdict.py records every finding in the same shape, whatever the tool:
+severity, id, title, file and line or package and version, the fix, and a
+link. `.github/scripts/findings.py` turns those findings into:
+
+- **The job summary** (open the red job). It says why the control failed:
+  - *findings*: the tool reported something that blocks.
+  - *tool*: nothing was checked, and the tool's output is shown.
+  - *policy*: a threshold such as coverage wasn't met.
+
+  Blocking findings come first, sorted by severity, with the fix and up to
+  50 rows. SCA and image findings also get an upgrade plan with one row per
+  package (the version that fixes all of that package's findings).
+  Accepted risks, with their reason and expiry, and non-blocking findings
+  are in collapsed sections. The summary ends with the `make` command that
+  reproduces the failure.
+- **Annotations**: the first 9 blocking findings that have a file and line
+  appear on the PR's Files tab.
+- **Code scanning** (public repos only; private ones need GitHub Advanced
+  Security). Each control uploads its own `findings.sarif` (semgrep,
+  gitleaks, trivy SCA, checkov) or trivy's SARIF (image scan), so alerts
+  open and close per control. A control whose tool failed uploads nothing,
+  so that failure can't close real alerts.
+- **One PR comment**, edited in place on every run. It lists every control
+  and marks the blocking findings that are new compared with the latest
+  `main` run. A finding counts as the same if the control, id and file or
+  package match; line numbers are ignored. Fork PRs get no comment,
+  because their token is read-only. Their job summaries carry the same
+  information.
+- **`findings.json`** in each `report-<control>` artifact: every finding,
+  uncapped. It is also part of the evidence bundle.
+
+The same scans run locally with the pipeline's pinned images, arguments
+and thresholds. The Makefile reads the image pins from the workflow, so
+the two can't drift:
+
+```
+make scan            # semgrep · gitleaks · trufflehog · trivy SCA · checkov
+make scan-image      # docker build, then trivy image · dockle · check --deploy
+make sca-trivy       # any single control, by its pipeline name
+pre-commit install --hook-type pre-commit --hook-type pre-push
+```
+
+The pre-commit hooks are defined in `.pre-commit-config.yaml`:
+- On commit: gitleaks on the staged changes; trivy when `uv.lock` or
+  `pyproject.toml` changes; checkov when `Dockerfile` or `deploy/` changes.
+- On push: semgrep.
+
 ### Checking the evidence later
 
 ```
