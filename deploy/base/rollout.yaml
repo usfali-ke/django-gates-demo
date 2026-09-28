@@ -7,6 +7,9 @@
 # gate and canary testing, not a data design. DJANGO_SECRET_KEY comes from
 # the Secret `django-gates-demo` (key `secret-key`), created out of band;
 # it is never in git.
+#
+# Shared by every environment; deploy/<env>/ sets the namespace, the
+# replica count, the namespace-qualified host names and the image digest.
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
@@ -60,8 +63,10 @@ spec:
                 secretKeyRef:
                   name: django-gates-demo
                   key: secret-key
+            # Short names only; each overlay replaces this with its
+            # namespace's .svc names added (env index 1).
             - name: DJANGO_ALLOWED_HOSTS
-              value: localhost,django-gates-demo,django-gates-demo-canary.django-gates-demo.svc,django-gates-demo-stable.django-gates-demo.svc,django-gates-demo.django-gates-demo.svc
+              value: localhost,django-gates-demo,django-gates-demo-canary,django-gates-demo-stable
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

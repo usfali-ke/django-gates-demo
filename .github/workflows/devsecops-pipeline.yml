@@ -407,8 +407,9 @@ jobs:
           cp Dockerfile "$OUT/input/Dockerfile"
           # checkov skips CRDs, so the Rollout is scanned as the Deployment
           # it is equivalent to (scan_view.py) — never applied.
-          kubectl kustomize deploy/kind | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/kind.yaml" || exit 0
-          docker run --rm -v "$PWD/$OUT:/work" "$CHECKOV" -f /work/input/kind.yaml -f /work/input/Dockerfile \
+          # Prod's render: every overlay is deploy/base plus names and a digest.
+          kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/prod.yaml" || exit 0
+          docker run --rm -v "$PWD/$OUT:/work" "$CHECKOV" -f /work/input/prod.yaml -f /work/input/Dockerfile \
             --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
           mv "$OUT/results_json.json" "$OUT/checkov.json" || true
           cat "$OUT/results_cli.txt" 2>/dev/null || true

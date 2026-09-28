@@ -1,0 +1,4 @@
+# The staging test job's self-hosted runner (README: "Staging test runner").
+self-hosted-runner:
+  labels:
+    - django-gates-demo-staging
