@@ -31,13 +31,10 @@ CONTROLS = {
     "unit-tests": ("1-build", None, None),
     "coverage": ("1-build", None, None),
     "sast-semgrep": ("2-static", "semgrep.json", "Semgrep JSON Report"),
-    "sast-bandit": ("2-static", "bandit.json", "Bandit Scan"),
-    "workflow-audit": ("2-static", "zizmor.sarif", "SARIF"),
     "secrets-gitleaks": ("2-static", "gitleaks.json", "Gitleaks Scan"),
     "secrets-trufflehog": ("2-static", "trufflehog.jsonl", "Trufflehog Scan"),
-    "sca-osv": ("2-static", "osv.json", "OSV Scan"),
+    "sca-trivy": ("2-static", "trivy-fs.json", "Trivy Scan"),
     "iac-checkov": ("2-static", "checkov.json", "Checkov Scan"),
-    "iac-hadolint": ("2-static", "hadolint.json", "Hadolint Dockerfile check"),
     "reviewers": ("2-static", None, None),
     "commits-signed": ("2-static", None, None),
     "image-scan": ("2-image", "trivy.json", "Trivy Scan"),
@@ -47,7 +44,6 @@ CONTROLS = {
     "publish": ("3-publish", None, None),
     "functional": ("4-preprod", None, None),
     "performance": ("4-preprod", None, None),
-    "dast-zap": ("5-dast", "zap.xml", "ZAP Scan"),  # DefectDojo's ZAP parser is XML-only
     "dast-nuclei": ("5-dast", "nuclei.jsonl", "Nuclei Scan"),
     "dast-tls": ("5-dast", None, None),
     # devsecops-release.yml

@@ -32,13 +32,13 @@ the image behind a TLS proxy), which the pipeline starts.
 
 ```
 1 build ──────── build twice (reproducible?) · unit tests + coverage
-2 static ─────── semgrep · bandit · zizmor+actionlint · gitleaks · trufflehog
-                 osv-scanner · checkov · hadolint · reviewers · signed commits
-2 image ──────── trivy · syft SBOM · dockle · manage.py check --deploy
+2 static ─────── semgrep · gitleaks · trufflehog · trivy SCA (uv.lock) · checkov
+                 reviewers · signed commits
+2 image ──────── trivy image scan · syft SBOM · dockle · manage.py check --deploy
 3 publish ────── (main only) push by digest · cosign sign · SBOM + SLSA attestations
    └─ G2 artifact gate ── a failed G2 stops here ──┐
 4 preprod ────── functional · k6 performance       │  (full_scan=true on a
-5 dast ───────── ZAP (authenticated) · nuclei · testssl   manual run overrides)
+5 dast ───────── nuclei · testssl                  │   manual run overrides)
    └─ G3 pre-production gate
 6 evidence ───── bundle + sha256 manifest → artifact `evidence` (90 days);
                  on main, cosign-attested to the image digest

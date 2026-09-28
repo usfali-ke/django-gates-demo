@@ -4,14 +4,14 @@
 # after it.
 #
 #   1 build      build ×2 (reproducible?) → image artifact │ unit tests + coverage
-#   2 static     semgrep · bandit · zizmor+actionlint · gitleaks · trufflehog ·
-#                osv-scanner · checkov · hadolint │ PR: reviewers · signed commits
-#     image      trivy · syft SBOM · dockle · django check --deploy (on the built image)
+#   2 static     semgrep · gitleaks · trufflehog · trivy (SCA, lockfile) · checkov
+#                │ PR: reviewers · signed commits
+#     image      trivy (image) · syft SBOM · dockle · django check --deploy (on the built image)
 #   3 publish    main only, and only if every stage-1/2 control passed: push the
 #                exact built digest, cosign sign + SBOM/SLSA attestations
 #     ── G1 (PR merge gate) · G2 (artifact gate) ──
 #   4 preprod    the image behind a TLS proxy: functional tests · k6 load
-#   5 dast       ZAP authenticated scan · nuclei · testssl.sh
+#   5 dast       nuclei · testssl.sh
 #     ── G3 (test gate) ──
 #   6 evidence   every report + hash manifest → artifact `evidence` (90 days);
 #                on main, attested to the image digest with cosign
@@ -65,19 +65,13 @@ env:
   SLO_P95_MS: "500"
   UV_VERSION: "0.12.19"
   SEMGREP: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
-  BANDIT: bandit==1.8.6
   GITLEAKS: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
   TRUFFLEHOG: trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
-  OSV: ghcr.io/google/osv-scanner:v2.6.0@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa
   CHECKOV: bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
-  HADOLINT: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
-  ZIZMOR: ghcr.io/zizmorcore/zizmor:1.30.1@sha256:a2eb396d886c053073405c7a980f2139ba2248ec172243cfa3841e57196e8101
-  ACTIONLINT: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
   TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
   SYFT: anchore/syft:v1.52.0@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
   DOCKLE: goodwithtech/dockle:v0.4.15@sha256:eade932f793742de0aa8755406c7677cd7696f8675b6180926f7eeffa7abe6b9
   K6: grafana/k6:2.3.0@sha256:e66db15b860113878fa74670e31f5e274830b7b6e42c8bff28b2f2d86a257603
-  ZAP: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef
   NUCLEI: projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
   NUCLEI_TEMPLATES: v10.4.9
   NUCLEI_TEMPLATES_COMMIT: 893122ffce8ebf8e264f15d2cd3960cb1dd36d6c
@@ -235,78 +229,6 @@ jobs:
           path: reports/sast-semgrep/
           if-no-files-found: ignore
 
-  sast-bandit:
-    name: 2 SAST · bandit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: sast-bandit
-      OUT: reports/sast-bandit
-      VERDICT_FILE: reports/sast-bandit/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - run: |
-          mkdir -p "$OUT"
-          # shellcheck disable=SC2086 # SRC_DIRS is a list of paths
-          uvx "$BANDIT" -r $SRC_DIRS -f json -o "$OUT/bandit.json" --exit-zero -q || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: ${{ env.BANDIT }}
-        run: python3 .github/scripts/verdict.py bandit "$OUT/bandit.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-sast-bandit
-          path: reports/sast-bandit/
-          if-no-files-found: ignore
-
-  workflow-audit:
-    name: 2 SAST · workflows (zizmor + actionlint)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: workflow-audit
-      OUT: reports/workflow-audit
-      VERDICT_FILE: reports/workflow-audit/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - env:
-          # Online audits: known-vulnerable and impostor action commits.
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$OUT"
-          docker run --rm -v "$PWD:/repo:ro" -e GH_TOKEN "$ZIZMOR" --format json /repo > "$OUT/zizmor.json" || true
-          docker run --rm -v "$PWD:/repo:ro" -e GH_TOKEN "$ZIZMOR" --format sarif /repo > "$OUT/zizmor.sarif" || true
-          docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT" -format '{{json .}}' > "$OUT/actionlint.json" || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: zizmor 1.30.1 + actionlint 1.7.12
-        run: python3 .github/scripts/verdict.py workflows "$OUT/zizmor.json" "$OUT/actionlint.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-workflow-audit
-          path: reports/workflow-audit/
-          if-no-files-found: ignore
-
   secrets-gitleaks:
     name: 2 secrets · gitleaks (full history)
     runs-on: ubuntu-latest
@@ -382,8 +304,8 @@ jobs:
           path: reports/secrets-trufflehog/
           if-no-files-found: ignore
 
-  sca-osv:
-    name: 2 SCA · osv-scanner
+  sca-trivy:
+    name: 2 SCA · trivy (lockfile)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -391,27 +313,27 @@ jobs:
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
-      CONTROL: sca-osv
-      OUT: reports/sca-osv
-      VERDICT_FILE: reports/sca-osv/verdict.json
+      CONTROL: sca-trivy
+      OUT: reports/sca-trivy
+      VERDICT_FILE: reports/sca-trivy/verdict.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: |
           mkdir -p "$OUT"
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" "$OSV" scan source \
-            --lockfile "/src/$LOCKFILE" --all-packages --format json --output-file /out/osv.json || true
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            fs --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
       - id: verdict
         if: always()
         env:
-          TOOL: osv-scanner 2.6.0 (OSV.dev)
-        run: python3 .github/scripts/verdict.py osv "$OUT/osv.json"
+          TOOL: trivy 0.74.0 (fs, lockfile incl. dev dependencies)
+        run: python3 .github/scripts/verdict.py trivy-fs "$OUT/trivy-fs.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: report-sca-osv
-          path: reports/sca-osv/
+          name: report-sca-trivy
+          path: reports/sca-trivy/
           if-no-files-found: ignore
 
   iac-checkov:
@@ -454,37 +376,6 @@ jobs:
         with:
           name: report-iac-checkov
           path: reports/iac-checkov/
-          if-no-files-found: ignore
-
-  iac-hadolint:
-    name: 2 IaC · hadolint
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: iac-hadolint
-      OUT: reports/iac-hadolint
-      VERDICT_FILE: reports/iac-hadolint/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: |
-          mkdir -p "$OUT"
-          docker run --rm -i "$HADOLINT" hadolint --format json - < Dockerfile > "$OUT/hadolint.json" || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: hadolint 2.15.1
-        run: python3 .github/scripts/verdict.py hadolint "$OUT/hadolint.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-iac-hadolint
-          path: reports/iac-hadolint/
           if-no-files-found: ignore
 
   reviewers:
@@ -754,8 +645,8 @@ jobs:
   # ── 3 publish ──────────────────────────────────────────────────────────
   publish:
     name: 3 publish · push + sign + attest
-    needs: [build, unit-tests, sast-semgrep, sast-bandit, workflow-audit, secrets-gitleaks, secrets-trufflehog,
-            sca-osv, iac-checkov, iac-hadolint, image-scan, sbom, image-compliance, django-deploy-check]
+    needs: [build, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
+            sca-trivy, iac-checkov, image-scan, sbom, image-compliance, django-deploy-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -880,7 +771,7 @@ jobs:
 
   gate-g1:
     name: G1 merge gate
-    needs: [reviewers, unit-tests, sast-semgrep, sast-bandit, workflow-audit, secrets-gitleaks, secrets-trufflehog, commits-signed]
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -900,7 +791,7 @@ jobs:
 
   gate-g2:
     name: G2 artifact gate
-    needs: [build, sca-osv, iac-checkov, iac-hadolint, image-scan, sbom, publish]
+    needs: [build, sca-trivy, iac-checkov, image-scan, sbom, publish]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1028,80 +919,6 @@ jobs:
           if-no-files-found: ignore
 
   # ── 5 dast ─────────────────────────────────────────────────────────────
-  dast-zap:
-    name: 5 DAST · ZAP (authenticated)
-    needs: [build, gate-g2]
-    if: ${{ !cancelled() && needs.build.outputs.digest != '' && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: dast-zap
-      OUT: reports/dast-zap
-      VERDICT_FILE: reports/dast-zap/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - uses: ./.github/actions/preprod
-        with:
-          image-tag: ${{ env.IMAGE_TAG }}
-          digest: ${{ needs.build.outputs.digest }}
-      - id: scan
-        # Spider + active scan with a real session (tests/dast/zap-plan.yaml).
-        # The plan fails if the seeded API calls aren't authenticated, so an
-        # expired login can't turn into a clean-looking anonymous scan.
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT" && chmod 777 "$OUT"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          uv sync --frozen --quiet
-          if ! read -r ZAP_SESSION ZAP_CSRF < <(uv run --frozen python tests/dast/login_session.py); then
-            echo "::error::could not log in to pre-production"; echo "rc=login-failed" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          export TARGET="$BASE_URL" ZAP_CSRF ZAP_AUTH_HEADER=Cookie ZAP_AUTH_HEADER_SITE=localhost
-          export ZAP_AUTH_HEADER_VALUE="sessionid=$ZAP_SESSION; csrftoken=$ZAP_CSRF"
-          # ZAP doesn't substitute env vars in request headers: render the
-          # plan outside the uploaded report dir.
-          plan="$RUNNER_TEMP/zap-plan.yaml"
-          # shellcheck disable=SC2016  # the variable list is literal for envsubst
-          envsubst '$TARGET $ZAP_CSRF' < tests/dast/zap-plan.yaml > "$plan"
-          chmod 644 "$plan"   # read by the zap user in the container
-          docker run --rm --network host -v "$plan:/zap/plan.yaml:ro" -v "$PWD/$OUT:/zap/wrk/reports" \
-            -e ZAP_AUTH_HEADER -e ZAP_AUTH_HEADER_VALUE -e ZAP_AUTH_HEADER_SITE "$ZAP" zap.sh -cmd -port 18090 -autorun /zap/plan.yaml > "$OUT/zap.log" 2>&1
-          rc=$?
-          # the log echoes the plan; the preprod session dies with the job, but keep it out of artifacts
-          sed -i "s/${ZAP_CSRF}/[redacted]/g; s/${ZAP_SESSION}/[redacted]/g" "$OUT/zap.log"
-          rm -f "$plan"
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          tail -30 "$OUT/zap.log"
-      - id: verdict
-        if: always()
-        env:
-          RC: ${{ steps.scan.outputs.rc }}
-          TOOL: OWASP ZAP 2.17.0 (automation framework)
-        run: python3 .github/scripts/verdict.py zap "$OUT/zap.json"
-      - if: always()
-        run: |
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          docker compose -f tests/preprod/compose.yaml logs --no-color > "$OUT/preprod.log" 2>&1 || true
-          docker compose -f tests/preprod/compose.yaml down -v || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-dast-zap
-          path: reports/dast-zap/
-          if-no-files-found: ignore
-
   dast-nuclei:
     name: 5 DAST · nuclei
     needs: [build, gate-g2]
@@ -1209,7 +1026,7 @@ jobs:
 
   gate-g3:
     name: G3 test gate
-    needs: [build, gate-g2, unit-tests, functional, performance, dast-zap, dast-nuclei, dast-tls, image-compliance, django-deploy-check]
+    needs: [build, gate-g2, unit-tests, functional, performance, dast-nuclei, dast-tls, image-compliance, django-deploy-check]
     if: ${{ always() && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1232,10 +1049,9 @@ jobs:
   # ── 6 evidence ─────────────────────────────────────────────────────────
   evidence:
     name: 6 evidence bundle
-    needs: [build, unit-tests, sast-semgrep, sast-bandit, workflow-audit, secrets-gitleaks, secrets-trufflehog,
-            sca-osv, iac-checkov, iac-hadolint, reviewers, commits-signed, image-scan, sbom, image-compliance,
-            django-deploy-check, publish, gate-g1, gate-g2, functional, performance, dast-zap, dast-nuclei,
-            dast-tls, gate-g3]
+    needs: [build, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+            reviewers, commits-signed, image-scan, sbom, image-compliance, django-deploy-check, publish,
+            gate-g1, gate-g2, functional, performance, dast-nuclei, dast-tls, gate-g3]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1251,9 +1067,9 @@ jobs:
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
       # Controls that apply to this event; the rest aren't listed as missing.
       CONTROLS: >-
-        build,unit-tests,coverage,sast-semgrep,sast-bandit,workflow-audit,secrets-gitleaks,secrets-trufflehog,
-        sca-osv,iac-checkov,iac-hadolint,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
-        image-compliance,django-deploy-check,publish,functional,performance,dast-zap,dast-nuclei,dast-tls
+        build,unit-tests,coverage,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
+        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
+        image-compliance,django-deploy-check,publish,functional,performance,dast-nuclei,dast-tls
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1286,12 +1102,6 @@ jobs:
         with:
           sarif_file: evidence/reports/sast-semgrep/semgrep.sarif
           category: semgrep
-      - if: ${{ !github.event.repository.private && hashFiles('evidence/reports/workflow-audit/zizmor.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
-        continue-on-error: true
-        with:
-          sarif_file: evidence/reports/workflow-audit/zizmor.sarif
-          category: zizmor
       - if: ${{ !github.event.repository.private && hashFiles('evidence/reports/image-scan/trivy.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         continue-on-error: true

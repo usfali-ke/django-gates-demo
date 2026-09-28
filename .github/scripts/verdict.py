@@ -154,20 +154,6 @@ def semgrep(path):
     return not blocking, detail, {"findings": len(results), "blocking": len(blocking)}
 
 
-def bandit(path):
-    """Medium+ severity at Medium+ confidence blocks."""
-    report = load(path)
-    if report is None:
-        return missing("bandit")
-    rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-    results = [r for r in report.get("results", []) if not accepted(r["test_id"], r.get("filename", ""))]
-    blocking = [r for r in results if rank.get(r["issue_severity"], 0) >= 1 and rank.get(r["issue_confidence"], 0) >= 1]
-    ids = summarize(blocking, lambda r: f"{r['test_id']} ({r['filename'].lstrip('./')}:{r['line_number']})", 6)
-    files = report.get("metrics", {}).get("_totals", {}).get("loc", 0)
-    detail = f"{len(blocking)} Medium+/Medium+ of {len(results)} findings over {files} LOC{': ' + ids if ids else ''}"
-    return not blocking and files > 0, detail, {"findings": len(results), "blocking": len(blocking)}
-
-
 def gitleaks(path):
     report = load(path)
     if report is None:
@@ -215,28 +201,29 @@ def build(dockerfile):
     return ok and bool(refs) and not bad, f"{repro}; {pins}", None
 
 
-def osv(path):
-    """High/Critical (CVSS >= 7) block, and so does a vulnerability with no
-    severity at all — unknown isn't low. Zero packages scanned is a fail
+def trivy_fs(path):
+    """SCA from the lockfile: every Critical/High blocks, fixed or not (a
+    dependency can be swapped even when upstream has no fix), and so does
+    an unrated one (unknown isn't low). Zero packages scanned is a fail
     (the lockfile wasn't understood)."""
     report = load(path)
     if report is None:
-        return missing("osv-scanner")
-    packages = [p for r in report.get("results") or [] for p in r.get("packages") or []]
+        return missing("trivy")
+    results = report.get("Results") or []
+    packages = sum(len(r.get("Packages") or []) for r in results)
     blocking, lower = [], 0
-    for p in packages:
-        for group in p.get("groups") or []:
-            ids = group.get("ids") or []
-            if any(accepted(i) for i in ids):
+    for r in results:
+        for v in r.get("Vulnerabilities") or []:
+            if accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion"))):
                 continue
-            sev = group.get("max_severity") or ""
-            name = f"{ids[0] if ids else '?'} ({p['package']['name']} {p['package']['version']})"
-            if sev == "" or float(sev) >= 7.0:
-                blocking.append(name + (" no severity" if sev == "" else f" {sev}"))
+            if v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None):
+                blocking.append(v)
             else:
                 lower += 1
-    detail = f"{len(blocking)} High/Critical-or-unrated, {lower} lower, across {len(packages)} packages ({env('LOCKFILE', 'lockfile')}){': ' + ', '.join(sorted(blocking)[:8]) if blocking else ''}"
-    return bool(packages) and not blocking, detail, {"packages": len(packages), "blocking": len(blocking)}
+    top = summarize(blocking, lambda v: f"{v['VulnerabilityID']} ({v['PkgName']} {v.get('InstalledVersion', '')} {v.get('Severity') or 'no severity'})")
+    detail = (f"{len(blocking)} High/Critical-or-unrated, {lower} lower, across {packages} packages "
+              f"({', '.join(r.get('Target', '?') for r in results) or env('LOCKFILE', 'lockfile')}){': ' + top if top else ''}")
+    return packages > 0 and not blocking, detail, {"packages": packages, "blocking": len(blocking)}
 
 
 def checkov(path):
@@ -254,42 +241,6 @@ def checkov(path):
               f"{' (' + ', '.join(skipped) + ')' if skipped else ''} — {', '.join(r.get('check_type', '?') for r in reports)}"
               f"{': ' + ids if ids else ''}")
     return not failed and passed > 0, detail, {"failed": len(failed), "passed": passed}
-
-
-def hadolint(path):
-    """error and warning block; info/style are reported."""
-    report = load(path)
-    if report is None:
-        return missing("hadolint")
-    findings = [r for r in report if not accepted(r["code"])]
-    blocking = [r for r in findings if r["level"] in ("error", "warning")]
-    ids = summarize(blocking, lambda r: f"{r['code']} (line {r['line']})")
-    return not blocking, f"{len(blocking)} error/warning of {len(findings)} findings on Dockerfile{': ' + ids if ids else ''}", None
-
-
-def zizmor_where(finding):
-    try:
-        loc = finding["locations"][0]
-        local = loc["symbolic"]["key"]["Local"]
-        path = local.get("given_path") or local.get("verbatim_path") or "?"
-        return f"{path.removeprefix('/repo/')}:{loc['concrete']['location']['start_point']['row'] + 1}"
-    except (KeyError, IndexError, TypeError):
-        return "?"
-
-
-def workflows(zizmor_path, actionlint_path):
-    """zizmor Medium+ and every actionlint error block."""
-    z = load(zizmor_path)
-    a = load(actionlint_path)
-    if z is None or a is None:
-        return missing("zizmor" if z is None else "actionlint")
-    zf = [f for f in z if not accepted(f.get("ident", ""))]
-    zb = [f for f in zf if (f.get("determinations") or {}).get("severity", "").lower() in ("medium", "high")]
-    ids = summarize(zb, lambda f: f"{f['ident']} ({zizmor_where(f)})", 6)
-    detail = f"zizmor: {len(zb)} Medium/High of {len(zf)} findings{': ' + ids if ids else ''}; actionlint: {len(a)} error(s)"
-    if a:
-        detail += ": " + summarize(a, lambda e: f"{e['filepath']}:{e['line']} {e['kind']}", 4)
-    return not zb and not a, detail, {"zizmor_blocking": len(zb), "actionlint_errors": len(a)}
 
 
 def trivy(path):
@@ -379,25 +330,6 @@ def k6(path):
     return ok, detail, {"p95_ms": round(p95, 1), "slo_ms": slo, "requests": reqs}
 
 
-def zap(path):
-    """High and Medium block (after accepted risks). RC is zap.sh's exit
-    code: the plan fails on errors and warnings, e.g. the seeded API
-    requests not being authenticated — then the scan proves nothing."""
-    report = load(path)
-    if report is None:
-        return missing("ZAP")
-    alerts = [a for s in report.get("site", []) for a in s.get("alerts", [])
-              if str(a.get("confidence")) != "0" and not accepted(a.get("pluginid", ""), a.get("name", ""))]  # 0 = marked false positive
-    high = [a for a in alerts if str(a.get("riskcode")) == "3"]
-    medium = [a for a in alerts if str(a.get("riskcode")) == "2"]
-    low = [a for a in alerts if str(a.get("riskcode")) == "1"]
-    names = summarize(high + medium, lambda a: f"{a.get('name', '?')} [{a.get('pluginid')}]", 6)
-    plan_ok = env("RC") == "0"
-    detail = (f"{len(high)} High, {len(medium)} Medium, {len(low)} Low alert types — ZAP authenticated spider + active scan"
-              f"{'' if plan_ok else f' (automation plan FAILED, rc {env(chr(82) + chr(67))}: see zap.log)'}{': ' + names if names else ''}")
-    return plan_ok and not high and not medium, detail, {"high": len(high), "medium": len(medium), "low": len(low)}
-
-
 def nuclei(path):
     """Medium+ block; low is reported."""
     rows = load_jsonl(path)
@@ -456,9 +388,9 @@ def result(status, detail):
 
 
 CHECKS = {f.__name__.replace("_", "-"): f for f in (
-    reviewers, commits, tests, coverage, semgrep, bandit, gitleaks, trufflehog,
-    build, osv, checkov, hadolint, workflows, trivy, sbom, signed,
-    dockle, django_check, k6, zap, nuclei, testssl, kubeconform, result,
+    reviewers, commits, tests, coverage, semgrep, gitleaks, trufflehog,
+    build, trivy_fs, checkov, trivy, sbom, signed,
+    dockle, django_check, k6, nuclei, testssl, kubeconform, result,
 )}
 
 

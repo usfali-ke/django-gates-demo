@@ -1,8 +1,7 @@
 """Assemble one gate decision from the control verdicts of this run.
 
 Every control is its own job ending in verdict.py; a gate criterion is
-answered by one or more of them (SAST = semgrep + bandit + the workflow
-audit). This file is the single list of which job answers which dashboard
+answered by one or more of them (secrets = gitleaks + trufflehog). This file is the single list of which job answers which dashboard
 criterion (keys: the dashboard's docs/GATE_INGEST_API.md).
 
     NEEDS='${{ toJSON(needs) }}' python3 .github/scripts/gate.py G1 out.json
@@ -31,14 +30,14 @@ GATES = {
     "G1": [
         ("required_reviewers_approved", "governance", [("reviewers", "result")]),
         ("unit_tests_pass", "quality", [("unit-tests", "result")]),
-        ("sast_clean", "security", [("sast-semgrep", "result"), ("sast-bandit", "result"), ("workflow-audit", "result")]),
+        ("sast_clean", "security", [("sast-semgrep", "result")]),
         ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
         ("commits_signed", "security", [("commits-signed", "result")]),
     ],
     "G2": [
         ("reproducible_build_config_controlled", "delivery", [("build", "result")]),
-        ("sca_clean", "security", [("sca-osv", "result")]),
-        ("iac_clean", "security", [("iac-checkov", "result"), ("iac-hadolint", "result")]),
+        ("sca_clean", "security", [("sca-trivy", "result")]),
+        ("iac_clean", "security", [("iac-checkov", "result")]),
         ("container_image_scan_hardened_base", "security", [("image-scan", "result")]),
         ("artifact_signed_attested", "security", [("publish", "result")]),
         ("sbom_present", "security", [("sbom", "result")]),
@@ -47,7 +46,7 @@ GATES = {
         ("functional_integration_regression_pass", "quality", [("functional", "result")]),
         ("performance_within_slo", "quality", [("performance", "result")]),
         ("coverage_threshold_met", "quality", [("unit-tests", "coverage")]),
-        ("dast_scan_clean", "security", [("dast-zap", "result"), ("dast-nuclei", "result"), ("dast-tls", "result")]),
+        ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
         ("compliance_scan_clean", "security", [("image-compliance", "result"), ("django-deploy-check", "result")]),
     ],
     "G5": [

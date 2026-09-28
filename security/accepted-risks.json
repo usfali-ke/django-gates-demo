@@ -11,7 +11,7 @@
       "control": "image-compliance",
       "id": "CIS-DI-0010",
       "match": "settings.py",
-      "reason": "Filename heuristic: config/settings.py reads DJANGO_SECRET_KEY from the environment and contains no credential (bandit, semgrep p/secrets, gitleaks and trufflehog scan the file itself).",
+      "reason": "Filename heuristic: config/settings.py reads DJANGO_SECRET_KEY from the environment and contains no credential (semgrep p/secrets, gitleaks and trufflehog scan the file itself).",
       "expires": "2027-03-31"
     },
     {

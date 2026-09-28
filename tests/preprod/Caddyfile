@@ -1,7 +1,7 @@
 {
 	admin off
 	skip_install_trust
-	# Java (ZAP) sends no SNI for a dotless name like localhost.
+	# Clients that send no SNI for a dotless name like localhost still get the cert.
 	default_sni localhost
 }
 
