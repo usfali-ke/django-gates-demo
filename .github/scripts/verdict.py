@@ -321,15 +321,15 @@ def checkov(path):
     failed = [c for r in reports for c in r.get("results", {}).get("failed_checks", [])]
     skipped = sorted({c["check_id"] for r in reports for c in r.get("results", {}).get("skipped_checks", [])})
     for c, status in [(c, "failed") for c in failed] + [(c, "skipped") for r in reports for c in r.get("results", {}).get("skipped_checks", [])]:
-        # Paths are the scan copy (input/); only the Dockerfile is a file in
-        # the repo — the k8s objects come from the kustomize render.
+        # Paths are the scan copy (input/). A copy of a repo file anchors to
+        # it; a render (kustomize) has no file to point at.
         path = (c.get("repo_file_path") or c.get("file_path") or "").split("/input/", 1)[-1]
-        in_repo = path == "Dockerfile"
+        in_repo = os.path.isfile(path)
         inline = {"reason": (c.get("check_result") or {}).get("suppress_comment") or "inline checkov:skip", "expires": None}
         found(c.get("severity"), c["check_id"], c.get("check_name"), blocking=status == "failed", accepted=inline if status == "skipped" else None,
               file=path if in_repo else None, line=(c.get("file_line_range") or [None])[0] if in_repo else None,
               where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/kind)", url=c.get("guideline"),
-              fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if in_repo else "`checkov.io/skipN` annotation"))
+              fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if path.endswith("Dockerfile") else "`checkov.io/skipN` annotation"))
     ids = summarize(failed, lambda c: f"{c['check_id']} ({c['resource']})")
     detail = (f"{len(failed)} failed, {passed} passed, {len(skipped)} skipped with inline justification"
               f"{' (' + ', '.join(skipped) + ')' if skipped else ''} — {', '.join(r.get('check_type', '?') for r in reports)}"
