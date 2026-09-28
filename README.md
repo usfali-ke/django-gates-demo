@@ -85,18 +85,24 @@ that was applied is listed in the verdict and in the manifest.
 ## Releasing (same shape: `devsecops-release.yml`)
 
 ```
+R1 resolve ── the change is an open `change` issue with both approval labels
 R1 verify ─── signature + SBOM + SLSA (this commit) · evidence attestation
               (G2 + G3 passed for this digest) · target config
-R2 G4 ─────── `release-approval` environment + dashboard decision on the change
+R2 G4 ─────── `release-approval` environment (approver ≠ whoever started or
+              re-ran the run) + dashboard decision on the change
 R3 deploy ─── digest committed to deploy/kind → G5 gate
 R4 verify ─── wait for the dashboard's `security-dashboard/G6` (Argo CD)
 R5 evidence ─ `release-evidence` bundle, attested to the digest
 ```
 
-1. Open a **Change request** issue. Someone other than you adds
-   `change-approved` and `readiness-approved`.
-2. Actions → **devsecops-release** → Run workflow, giving the issue number.
-3. Approve the `release-approval` deployment when GitHub asks.
+1. Open a **Change request** issue, with a change window that covers the
+   release. Someone other than you adds `change-approved` and
+   `readiness-approved`.
+2. Actions → **devsecops-release** → Run workflow, giving the issue
+   (`7`, `#7` or `CHG-7`).
+3. Someone other than whoever started the run approves the
+   `release-approval` deployment. If a job needs re-running, the person who
+   started the run re-runs it; otherwise start a new run.
 
 ## One-time cluster setup (run by an operator)
 
