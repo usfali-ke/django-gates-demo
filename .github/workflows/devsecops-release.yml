@@ -326,10 +326,10 @@ jobs:
         id: sod
         env:
           GH_TOKEN: ${{ github.token }}
-        # The environment approval is read back from GitHub. Whoever started
-        # the run or re-ran it can't be its approver. Approvals from earlier
-        # attempts count too: re-run as the person who started it, or start
-        # a new run. The dashboard checks the same thing independently.
+        # The environment approval is read back from GitHub (this attempt's
+        # only). Whoever started the run or re-ran it can't be its approver,
+        # so a re-run of this job needs someone who did neither. The
+        # dashboard checks the same thing independently.
         run: |
           set -euo pipefail
           run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
@@ -340,7 +340,7 @@ jobs:
           if [ "$approved" = "[]" ]; then
             echo "::error::no release-approval approval recorded for this run"; exit 1
           elif [ -n "$self" ]; then
-            echo "::error::approved by ${self}, who also started or re-ran this run — someone else must approve (start a new run)"; exit 1
+            echo "::error::approved by ${self}, who also started or re-ran this run — someone who did neither must approve"; exit 1
           fi
           echo "Started by $(jq -r 'join(", ")' <<<"$started"), approved by $(jq -r 'join(", ")' <<<"$approved")" | tee -a "$GITHUB_STEP_SUMMARY"
           { echo "started=$started"; echo "approved=$approved"; } >> "$GITHUB_OUTPUT"

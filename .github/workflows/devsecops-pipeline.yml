@@ -40,7 +40,9 @@ on:
     types: [submitted, dismissed]
   push:
     branches: [main]
-    # Deploy commits (devsecops-release.yml) change only deploy/**.
+    # Deploy commits (devsecops-release.yml) change only deploy/**. To
+    # release a deploy/-only or docs-only change, run this workflow on
+    # main by hand: it publishes like a push (unless full_scan).
     paths-ignore: ["deploy/**", "**.md"]
   workflow_dispatch:
     inputs:
@@ -664,7 +666,7 @@ jobs:
       VERDICT_FILE: reports/publish/verdict.json
       DIGEST: ${{ needs.build.outputs.digest }}
       REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.build.outputs.digest }}
-      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan)) }}
       # The keyless signature's identity is this file on main — what
       # Kyverno admits and devsecops-release.yml verifies.
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
@@ -756,7 +758,7 @@ jobs:
             python3 .github/scripts/verdict.py signed   # fail: lists the controls that didn't pass
           elif [ "$GO" != true ]; then
             python3 .github/scripts/verdict.py result skipped \
-              "not published: images are pushed and signed only from a push to main (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every stage 1–2 control passed"
+              "not published: images are pushed and signed only from main — a push, or a manual run without full_scan (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every stage 1–2 control passed"
           elif [ "$VERIFY_OUTCOME" = success ]; then
             python3 .github/scripts/verdict.py signed
           else
@@ -811,8 +813,8 @@ jobs:
           needs: ${{ toJSON(needs) }}
           subject: ${{ needs.build.outputs.digest || github.sha }}
           artifact-digest: ${{ needs.build.outputs.digest }}
-          record: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          allow-skipped: ${{ (github.event_name != 'push' || github.ref != 'refs/heads/main') && 'artifact_signed_attested' || '' }}
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan)) }}
+          allow-skipped: ${{ !(github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan))) && 'artifact_signed_attested' || '' }}
 
   # ── 4 preprod ──────────────────────────────────────────────────────────
   functional:
@@ -1044,7 +1046,7 @@ jobs:
           subject: ${{ needs.build.outputs.digest }}
           artifact-digest: ${{ needs.build.outputs.digest }}
           environment: preprod
-          record: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.gate-g2.outputs.status == 'pass' }}
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan)) && needs.gate-g2.outputs.status == 'pass' }}
 
   # ── 6 evidence ─────────────────────────────────────────────────────────
   evidence:

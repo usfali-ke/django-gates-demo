@@ -101,8 +101,11 @@ R5 evidence ─ `release-evidence` bundle, attested to the digest
 2. Actions → **devsecops-release** → Run workflow, giving the issue
    (`7`, `#7` or `CHG-7`).
 3. Someone other than whoever started the run approves the
-   `release-approval` deployment. If a job needs re-running, the person who
-   started the run re-runs it; otherwise start a new run.
+   `release-approval` deployment. If G4 is re-run, it needs a fresh
+   approval from someone who neither started nor re-ran the run.
+4. The release runs on main's HEAD, which needs a published image. Pushes
+   that only touch `deploy/**` or `*.md` don't run the pipeline, so after
+   one, run **devsecops-pipeline** on main by hand before releasing.
 
 ## One-time cluster setup (run by an operator)
 
