@@ -1,7 +1,8 @@
 # The pipeline's scans, locally: same pinned images (read from the
 # workflow, so they can't drift), same arguments, same verdict.py
 # thresholds and accepted-risk register. Reports land in reports/<control>/
-# (findings.json has everything); blocking findings print.
+# (findings.json has everything). The verdict prints first, then the
+# tool's own report where it has one (as in the job summary).
 #
 #   make scan          static controls (no image build)
 #   make scan-image    builds the image, then image-scan · image-compliance · django-deploy-check
@@ -25,6 +26,8 @@ IMAGE_TAG  := django-gates-demo:local
 # As you, so reports aren't root-owned; tools that want a home get /tmp.
 RUN     := docker run --rm --user $(shell id -u):$(shell id -g) -e HOME=/tmp
 VERDICT  = CONTROL=$@ VERDICT_FILE=reports/$@/verdict.json TOOL="$(1) (make)" python3 .github/scripts/verdict.py
+# verdict, then the tool's report ($(1)), exiting with the verdict's status
+SHOW     = ; rc=$$?; python3 .github/scripts/findings.py native reports/$@/$(1); exit $$rc
 
 STATIC := sast-semgrep secrets-gitleaks secrets-trufflehog sca-trivy iac-checkov
 IMAGE  := image-scan image-compliance django-deploy-check
@@ -42,8 +45,8 @@ sast-semgrep:
 	@mkdir -p reports/$@
 	@$(RUN) -v "$(CURDIR):/src:ro" -v "$(CURDIR)/reports/$@:/out" -w /src $(SEMGREP) semgrep scan \
 	  --config p/default --config p/python --config p/django --config p/dockerfile --config p/github-actions \
-	  --metrics=off --json-output=/out/semgrep.json -q || true
-	@$(call VERDICT,semgrep) semgrep reports/$@/semgrep.json
+	  --metrics=off --json-output=/out/semgrep.json --text-output=/out/semgrep.txt -q || true
+	@NATIVE=semgrep.txt $(call VERDICT,semgrep) semgrep reports/$@/semgrep.json $(call SHOW,semgrep.txt)
 
 secrets-gitleaks:
 	@mkdir -p reports/$@
@@ -63,16 +66,19 @@ sca-trivy:
 	@$(RUN) -v "$(CURDIR):/src:ro" -v "$(CURDIR)/reports/$@:/out" -v trivy-cache:/tmp/trivy $(TRIVY) \
 	  fs --cache-dir /tmp/trivy --scanners vuln --list-all-pkgs --include-dev-deps --format json \
 	  --output /out/trivy-fs.json --exit-code 0 -q /src || true
-	@$(call VERDICT,trivy) trivy-fs reports/$@/trivy-fs.json
+	@NATIVE=trivy-fs.txt $(call VERDICT,trivy) trivy-fs reports/$@/trivy-fs.json; rc=$$?; \
+	  $(RUN) -v "$(CURDIR)/reports/$@:/out" $(TRIVY) convert --format table --severity CRITICAL,HIGH,UNKNOWN \
+	  --ignorefile /out/accepted-ids.txt --output /out/trivy-fs.txt /out/trivy-fs.json -q; \
+	  python3 .github/scripts/findings.py native reports/$@/trivy-fs.txt; exit $$rc
 
 iac-checkov:
 	@mkdir -p reports/$@/input
 	@cp Dockerfile reports/$@/input/Dockerfile
 	@kubectl kustomize deploy/kind | uv run -q --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > reports/$@/input/kind.yaml
 	@$(RUN) -v "$(CURDIR)/reports/$@:/work" $(CHECKOV) -f /work/input/kind.yaml -f /work/input/Dockerfile \
-	  --framework kubernetes dockerfile -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
+	  --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
 	@mv reports/$@/results_json.json reports/$@/checkov.json 2>/dev/null || true
-	@$(call VERDICT,checkov) checkov reports/$@/checkov.json
+	@NATIVE=results_cli.txt $(call VERDICT,checkov) checkov reports/$@/checkov.json $(call SHOW,results_cli.txt)
 
 image:
 	docker build -t $(IMAGE_TAG) .
@@ -81,20 +87,26 @@ image-scan:
 	@mkdir -p reports/$@
 	@docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$(CURDIR)/reports/$@:/out" -v trivy-cache:/root/.cache/trivy $(TRIVY) \
 	  image --scanners vuln,secret --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q $(IMAGE_TAG) || true
-	@BASE_IMAGE="$(call pin,BASE_IMAGE)" $(call VERDICT,trivy) trivy reports/$@/trivy.json
+	@NATIVE=trivy.txt BASE_IMAGE="$(call pin,BASE_IMAGE)" $(call VERDICT,trivy) trivy reports/$@/trivy.json; rc=$$?; \
+	  $(RUN) -v "$(CURDIR)/reports/$@:/out" $(TRIVY) convert --format table \
+	  --ignorefile /out/accepted-ids.txt --output /out/trivy.txt /out/trivy.json -q; \
+	  python3 .github/scripts/findings.py native reports/$@/trivy.txt; exit $$rc
 
 image-compliance:
 	@mkdir -p reports/$@
 	@docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$(CURDIR)/reports/$@:/out" $(DOCKLE) \
 	  -f json -o /out/dockle.json --exit-code 0 $(IMAGE_TAG) || true
-	@$(call VERDICT,dockle) dockle reports/$@/dockle.json
+	@NATIVE=dockle.txt $(call VERDICT,dockle) dockle reports/$@/dockle.json; rc=$$?; \
+	  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock $(DOCKLE) --no-color --exit-code 0 \
+	  $$(sed 's/^/-i=/' reports/$@/accepted-ids.txt) $(IMAGE_TAG) > reports/$@/dockle.txt; \
+	  python3 .github/scripts/findings.py native reports/$@/dockle.txt; exit $$rc
 
 django-deploy-check:
 	@mkdir -p reports/$@
 	@DJANGO_SECRET_KEY=$$(python3 -c 'import secrets; print(secrets.token_urlsafe(50))') \
 	  docker run --rm --read-only --tmpfs /tmp -e DJANGO_SECRET_KEY -e DJANGO_ALLOWED_HOSTS=app.example.invalid \
 	  $(IMAGE_TAG) python manage.py check --deploy --fail-level WARNING > reports/$@/check-deploy.txt 2>&1; \
-	  RC=$$? $(call VERDICT,django check --deploy) django-check reports/$@/check-deploy.txt
+	  RC=$$? NATIVE=check-deploy.txt $(call VERDICT,django check --deploy) django-check reports/$@/check-deploy.txt $(call SHOW,check-deploy.txt)
 
 # pre-commit: only what's staged, so it's fast (.pre-commit-config.yaml).
 pre-commit-secrets:

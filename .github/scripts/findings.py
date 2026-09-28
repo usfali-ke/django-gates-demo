@@ -9,6 +9,14 @@ accepted}) and calls `publish()`, which writes, per control:
   job summary      blocking first, by severity, capped; fix, reproduce
                    command, accepted risks with expiry
   annotations      the first blocking findings that have a file and line
+  accepted-ids.txt the ids of accepted findings, so a tool's own report
+                   can leave them out (trivy --ignorefile, dockle -i)
+
+Where the tool has a readable report of its own (trivy's table, checkov's
+markdown, semgrep's text...), the job sets NATIVE to that file: the
+summary then keeps only the verdict, the why, the upgrade plan and the
+accepted risks, and `python3 findings.py native` shows the tool's report
+under it (and in the log).
 
 and `python3 findings.py pr-comment <reports> [<baseline>]` renders one PR
 comment for the whole run from the downloaded report-* artifacts, with
@@ -35,7 +43,7 @@ ANNOTATION_CAP = 9  # GitHub shows 10 errors per step; the verdict's own ::error
 KIND = {
     "tool": "The tool didn't produce a usable result (it crashed, or its report is missing), so nothing was checked. "
             "This is not a clean scan. Read the tool's output (below, or in the scan step's log).",
-    "findings": "Blocking findings. Fix them (see Fix), or, if a finding doesn't apply, add a reviewed entry with "
+    "findings": "Blocking findings. Fix them, or, if a finding doesn't apply, add a reviewed entry with "
                 "a reason and an expiry to `security/accepted-risks.json`.",
     "policy": "Policy not met (see the detail line). No individual findings to list.",
 }
@@ -169,9 +177,15 @@ def summary(control, out, items, kind, log=None):
     plan = upgrade_plan(blocking)
     if plan:
         lines += ["", plan]
-    if blocking:
+    native = env("NATIVE")
+    if native and kind != "tool":
+        lines += ["", f"The tool's own report is below (`{md(os.path.basename(native), 80)}`)"
+                  + (", without the accepted risks." if n["accepted"] else ".")]
+    elif blocking:
         lines += ["", "Blocking findings:", "", table(blocking)]
     for status, title in (("accepted", "Accepted risks"), ("reported", "Reported, not blocking")):
+        if native and status == "reported":
+            continue
         rows = [f for f in items if f["status"] == status]
         if rows:
             lines += ["", f"<details><summary>{title} ({len(rows)})</summary>", "", table(rows, accepted=status == "accepted"), "", "</details>"]
@@ -182,7 +196,10 @@ def summary(control, out, items, kind, log=None):
 
 
 def terminal(control, out, items):
-    """Outside Actions (make): the blocking findings, one line each."""
+    """Outside Actions (make): the blocking findings, one line each, unless
+    the tool's own report follows."""
+    if env("NATIVE"):
+        return
     rows = [f for f in items if f["status"] == "blocking"]
     for f in rows[:25]:
         loc = f.get("file") and f"{f['file']}:{f.get('line') or ''}" or " ".join(filter(None, (f.get("package"), f.get("version")))) or f.get("where") or ""
@@ -252,6 +269,8 @@ def publish(control, check, out, items, kind, folder, log=None):
         if not (out["status"] == "fail" and kind == "tool"):
             with open(os.path.join(folder, "findings.sarif"), "w") as fh:
                 json.dump(sarif(control, out.get("tool"), items), fh, indent=1)
+        with open(os.path.join(folder, "accepted-ids.txt"), "w") as fh:
+            fh.writelines(f"{i}\n" for i in sorted({f["id"] for f in items if f["status"] == "accepted"}))
     if env("GITHUB_STEP_SUMMARY"):
         with open(env("GITHUB_STEP_SUMMARY"), "a") as fh:
             fh.write(summary(control, out, items, kind, log))
@@ -259,6 +278,45 @@ def publish(control, check, out, items, kind, folder, log=None):
         terminal(control, out, items)
     if env("GITHUB_ACTIONS"):
         annotations(control, items)
+
+
+NATIVE_CAP = 200_000  # characters; a step summary can hold 1 MiB
+
+
+def native(path, verdict_path=None):
+    """Show a tool's own report: in full in the log, and in the job summary
+    (capped; collapsed when the control passed). Markdown reports (.md) are
+    embedded as they are, anything else as preformatted text."""
+    try:
+        with open(path, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        print(f"(no tool report at {path})")
+        return
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    print(text)
+    if not env("GITHUB_STEP_SUMMARY"):
+        return
+    status = None
+    try:
+        with open(verdict_path or os.path.join(os.path.dirname(path), "verdict.json")) as fh:
+            status = json.load(fh).get("status")
+    except (OSError, ValueError):
+        pass
+    name = os.path.basename(path)
+    more = ""
+    if len(text) > NATIVE_CAP:
+        text = text[:NATIVE_CAP].rsplit("\n", 1)[0]
+        more = f"\n\n…cut here; the full report is `{name}` in the `report-{env('CONTROL', '')}` artifact."
+    if path.endswith(".md"):
+        body = text.replace("<!--", "&lt;!--")
+    else:
+        body = "```text\n" + text.replace("`" * 3, "` ` `").rstrip() + "\n```"
+    title = f"Tool report: {name}"
+    block = (f"<details><summary>{title}</summary>\n\n{body}{more}\n\n</details>" if status == "pass"
+             else f"#### {title}\n\n{body}{more}")
+    with open(env("GITHUB_STEP_SUMMARY"), "a") as fh:
+        fh.write(block + "\n\n")
 
 
 # --- one PR comment for the whole run -----------------------------------------
@@ -352,5 +410,7 @@ def pr_comment(root, baseline_root=None):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["pr-comment"]:
         print(pr_comment(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
+    elif sys.argv[1:2] == ["native"] and len(sys.argv) > 2:
+        native(sys.argv[2])
     else:
-        sys.exit("usage: findings.py pr-comment <reports-dir> [<baseline-dir>]")
+        sys.exit("usage: findings.py pr-comment <reports-dir> [<baseline-dir>] | native <report-file>")

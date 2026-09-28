@@ -72,12 +72,23 @@ link. `.github/scripts/findings.py` turns those findings into:
   - *tool*: nothing was checked, and the tool's output is shown.
   - *policy*: a threshold such as coverage wasn't met.
 
-  Blocking findings come first, sorted by severity, with the fix and up to
-  50 rows. SCA and image findings also get an upgrade plan with one row per
-  package (the version that fixes all of that package's findings).
-  Accepted risks, with their reason and expiry, and non-blocking findings
-  are in collapsed sections. The summary ends with the `make` command that
-  reproduces the failure.
+  Under the verdict comes **the tool's own report**, as developers know it
+  from running the tool:
+  - trivy's table (SCA and image), rendered from the same JSON with
+    `trivy convert`, without the accepted risks;
+  - checkov's markdown; semgrep's text; dockle's list;
+  - `check --deploy`'s output; testssl.sh's console report.
+
+  The report is also in the step log and in the artifact, and it's
+  collapsed when the control passed. Tools without a readable report of
+  their own (the secret scanners, tests, governance, nuclei) get a table
+  of blocking findings instead, sorted by severity. trufflehog's own
+  output would print the secret. SCA and image findings also get an
+  upgrade plan with one row per package: the version that fixes all of
+  that package's findings. Accepted risks, with their reason and expiry,
+  are in a collapsed section, because the tools don't know about the
+  register. The summary ends with the `make` command that reproduces the
+  failure, which prints the same report.
 - **Annotations**: the first 9 blocking findings that have a file and line
   appear on the PR's Files tab.
 - **Code scanning** (public repos only; private ones need GitHub Advanced
