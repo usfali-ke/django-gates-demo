@@ -6,6 +6,11 @@ criterion (keys: the dashboard's docs/GATE_INGEST_API.md).
 
     NEEDS='${{ toJSON(needs) }}' python3 .github/scripts/gate.py G1 out.json
 
+NEEDS can also be a job's own `toJSON(steps)`: a step's outputs have the
+same shape, so one job that runs several controls (G3 in staging, on a
+single ephemeral runner) names its verdict steps after the controls.
+PROFILE picks another criteria list for the same gate (GATES["G3@staging"]).
+
 A criterion is:
   fail     if any of its controls failed, or didn't leave a verdict (a
            crashed, cancelled or skipped job is never an implicit pass);
@@ -49,10 +54,19 @@ GATES = {
         ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
         ("compliance_scan_clean", "security", [("image-compliance", "result"), ("django-deploy-check", "result")]),
     ],
+    # G3 against the deployed staging environment (devsecops-release.yml).
+    # Coverage and the image compliance checks are properties of the
+    # artifact, already decided by the pipeline's G3 for this digest.
+    "G3@staging": [
+        ("functional_integration_regression_pass", "quality", [("functional", "result")]),
+        ("performance_within_slo", "quality", [("performance", "result")]),
+        ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
+    ],
+    # Before each environment's deploy commit (devsecops-release.yml).
     "G5": [
-        ("artifact_provenance_verified", "security", [("provenance", "result")]),
+        ("artifact_provenance_verified", "security", [("provenance", "result"), ("evidence-check", "result")]),
         ("target_env_config_controlled", "delivery", [("config", "result")]),
-        ("approved_gitops_pipeline_path", "governance", [("deploy", "result")]),
+        ("approved_gitops_pipeline_path", "governance", [("resolve", "promotion")]),
     ],
 }
 
@@ -64,7 +78,7 @@ def verdict(needs, job, output):
     except ValueError:
         v = None
     if not isinstance(v, dict) or v.get("status") not in ("pass", "fail", "skipped"):
-        v = {"status": "fail", "detail": f"control did not complete (job {job}: {j.get('result', 'not run')})"}
+        v = {"status": "fail", "detail": f"control did not complete ({job}: {j.get('result') or j.get('outcome') or 'not run'})"}
     return job, v
 
 
@@ -95,7 +109,8 @@ def main():
     allow_skipped = {k for k in (e("ALLOW_SKIPPED") or "").split(",") if k}
     # Every report is in the run's artifacts (report-<control>, and the
     # signed `evidence` bundle).
-    criteria = [criterion(needs, *c, evidence_url=f"{run_url}#artifacts") for c in GATES[gate]]
+    profile = f"{gate}@{e('PROFILE')}" if e("PROFILE") else gate
+    criteria = [criterion(needs, *c, evidence_url=f"{run_url}#artifacts") for c in GATES[profile]]
     ok = all(c["status"] == "pass" or (c["status"] == "skipped" and c["key"] in allow_skipped) for c in criteria)
     status = "pass" if ok else "fail"
     now = dt.datetime.now(dt.timezone.utc).isoformat()

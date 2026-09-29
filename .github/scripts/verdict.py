@@ -328,7 +328,7 @@ def checkov(path):
         inline = {"reason": (c.get("check_result") or {}).get("suppress_comment") or "inline checkov:skip", "expires": None}
         found(c.get("severity"), c["check_id"], c.get("check_name"), blocking=status == "failed", accepted=inline if status == "skipped" else None,
               file=path if in_repo else None, line=(c.get("file_line_range") or [None])[0] if in_repo else None,
-              where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/kind)", url=c.get("guideline"),
+              where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/prod)", url=c.get("guideline"),
               fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if path.endswith("Dockerfile") else "`checkov.io/skipN` annotation"))
     ids = summarize(failed, lambda c: f"{c['check_id']} ({c['resource']})")
     detail = (f"{len(failed)} failed, {passed} passed, {len(skipped)} skipped with inline justification"
@@ -520,8 +520,9 @@ def kubeconform(path):
     valid = summary.get("valid", 0)
     total = sum(summary.get(k, 0) for k in ("valid", "invalid", "errors", "skipped"))
     changed = (env("CHANGED") or "").split()
-    ok = env("RC") == "0" and total > 0 and valid == total and changed == [env("KUSTOMIZATION", "deploy/kind/kustomization.yaml")]
-    return ok, f"deploy/kind render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)", None
+    kustomization = env("KUSTOMIZATION", "deploy/prod/kustomization.yaml")
+    ok = env("RC") == "0" and total > 0 and valid == total and changed == [kustomization]
+    return ok, f"{os.path.dirname(kustomization)} render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)", None
 
 
 # --- generic ----------------------------------------------------------------

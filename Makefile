@@ -74,8 +74,8 @@ sca-trivy:
 iac-checkov:
 	@mkdir -p reports/$@/input
 	@cp Dockerfile reports/$@/input/Dockerfile
-	@kubectl kustomize deploy/kind | uv run -q --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > reports/$@/input/kind.yaml
-	@$(RUN) -v "$(CURDIR)/reports/$@:/work" $(CHECKOV) -f /work/input/kind.yaml -f /work/input/Dockerfile \
+	@kubectl kustomize deploy/prod | uv run -q --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > reports/$@/input/prod.yaml
+	@$(RUN) -v "$(CURDIR)/reports/$@:/work" $(CHECKOV) -f /work/input/prod.yaml -f /work/input/Dockerfile \
 	  --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
 	@mv reports/$@/results_json.json reports/$@/checkov.json 2>/dev/null || true
 	@NATIVE=results_cli.txt $(call VERDICT,checkov) checkov reports/$@/checkov.json $(call SHOW,results_cli.txt)

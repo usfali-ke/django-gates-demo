@@ -1,0 +1,10 @@
+# What every environment runs. Not synced on its own: Argo CD syncs the
+# overlays deploy/dev, deploy/staging and deploy/prod, which add the
+# namespace, host names, replicas and the promoted image digest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - services.yaml
+  - analysistemplate.yaml
+  - rollout.yaml
