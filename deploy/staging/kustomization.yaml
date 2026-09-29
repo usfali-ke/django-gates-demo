@@ -1,0 +1,37 @@
+# staging: gets only a digest that is running and verified (G6) in dev.
+# devsecops-release.yml (environment: staging) commits it after G5, then
+# runs G3 against this namespace. Argo CD app `django-gates-demo-staging`.
+# One replica: the demo's SQLite lives in each pod, and the staging tests
+# create their users in the pod they test.
+# The only automated edit is the image digest below (set_digest.py).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: django-gates-demo-staging
+
+resources:
+  - ../base
+
+patches:
+  - target: {kind: Rollout, name: django-gates-demo}
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: test
+        path: /spec/template/spec/containers/0/env/1/name
+        value: DJANGO_ALLOWED_HOSTS
+      - op: replace
+        path: /spec/template/spec/containers/0/env/1/value
+        value: localhost,django-gates-demo,django-gates-demo-canary,django-gates-demo-stable,django-gates-demo.django-gates-demo-staging.svc,django-gates-demo-canary.django-gates-demo-staging.svc,django-gates-demo-stable.django-gates-demo-staging.svc
+  - target: {kind: AnalysisTemplate, name: django-gates-demo-canary-health}
+    patch: |
+      - op: replace
+        path: /spec/metrics/0/provider/web/url
+        value: http://django-gates-demo-canary.django-gates-demo-staging.svc/healthz
+
+images:
+  # Never a tag: admission (Kyverno) requires digests. Every environment
+  # starts at the digest prod already ran; promotion replaces it.
+  - name: django-gates-demo
+    newName: ghcr.io/usfali-ke/django-gates-demo
+    digest: sha256:1a41c45ba292744fd608d5c5229fef0ef1009f11d2d3ba449f31713db2ca714d

@@ -1,4 +1,4 @@
-"""Render-for-scanning: reads `kustomize build deploy/kind` on stdin and
+"""Render-for-scanning: reads `kustomize build deploy/<env>` on stdin and
 writes the same manifests with each Argo Rollout re-expressed as a
 Deployment carrying the identical pod template. Checkov and Trivy only
 evaluate native workload kinds, so without this the Rollout — the one

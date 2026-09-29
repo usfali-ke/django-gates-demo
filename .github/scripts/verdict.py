@@ -18,6 +18,11 @@ Accepted risks (security/accepted-risks.json) are applied here and listed
 in the verdict (id, match, reason, expiry), so the evidence says what was
 accepted and why; an expired entry no longer applies, and an
 `"unfixed_only": true` entry stops applying once a fix is released.
+
+Each parser also records its findings in one shape (`found`), which
+findings.py turns into findings.json, SARIF, the job summary and
+annotations, so a failed control says exactly what to fix. Outside Actions
+(`make <control>`) GITHUB_OUTPUT may be unset and the findings print.
 """
 
 import datetime as dt
@@ -33,9 +38,13 @@ import sys
 # risks semgrep's use-defused-xml-parse rule is about.
 import xml.etree.ElementTree as ET  # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
 
+import findings
+
 env = os.environ.get
 CONTROL = env("CONTROL", "")
 _applied = []
+_findings = []
+_state = {"kind": None}
 
 
 def load(path):
@@ -55,13 +64,38 @@ def load_jsonl(path):
 
 
 def missing(tool):
+    tool_broke()
     return False, f"{tool} did not produce a report", None
 
 
-def accepted(finding_id, text="", fixed=False):
-    """True if the register accepts this finding for this control (and the
-    entry hasn't expired, and isn't `unfixed_only` for a finding that now
-    has a fix). Records every entry used."""
+def tool_broke():
+    """The failure is the tool's (no usable output), not the code's."""
+    _state["kind"] = "tool"
+
+
+def found(severity, finding_id, title="", *, blocking, accepted=None, **where):
+    """Record one finding. severity: critical/high/medium/low/info, or
+    unknown (unrated, which is not low). where: file, line, package,
+    version, where (free text), fix, url. Never a secret's value."""
+    severity = (severity or "unknown").lower()
+    _findings.append({
+        "status": "accepted" if accepted else "blocking" if blocking else "reported",
+        "severity": severity if severity in findings.SEVERITIES else "unknown",
+        "id": str(finding_id), "title": title or "",
+        **{k: v for k, v in where.items() if v not in (None, "")},
+        **({"accepted": {k: accepted[k] for k in ("reason", "expires") if k in accepted}} if accepted else {}),
+    })
+
+
+def first_line(text, limit=200):
+    return (str(text or "").strip().splitlines() or [""])[0][:limit]
+
+
+def accepted(finding_id, text="", fixed=False, record=True):
+    """The register entry if it accepts this finding for this control (and
+    the entry hasn't expired, and isn't `unfixed_only` for a finding that
+    now has a fix), else None. Records every entry used (record=False
+    only looks)."""
     register = load(env("ACCEPTED_RISKS", "security/accepted-risks.json")) or {}
     today = dt.date.today().isoformat()
     for entry in register.get("accepted", []):
@@ -74,10 +108,10 @@ def accepted(finding_id, text="", fixed=False):
         if entry.get("unfixed_only") and fixed:
             continue
         used = {k: entry[k] for k in ("id", "match", "unfixed_only", "reason", "expires") if k in entry}
-        if used not in _applied:
+        if record and used not in _applied:
             _applied.append(used)
-        return True
-    return False
+        return used
+    return None
 
 
 def summarize(items, key, limit=8):
@@ -109,6 +143,10 @@ def commits(path):
     with open(path) as f:
         rows = [line.rstrip("\n").split("\t") for line in f if line.strip()]
     unsigned = [f"{sha} ({reason})" for sha, verified, reason in rows if verified != "true"]
+    for sha, verified, reason in rows:
+        if verified != "true":
+            found("high", sha, f"commit not verified by GitHub ({reason})", blocking=True,
+                  fix="sign it with a key registered to your GitHub account (git commit -S), or re-create it via the web UI")
     detail = f"{len(unsigned)} of {len(rows)} commit(s) unsigned/unverified" + (f": {', '.join(unsigned[:6])}" if unsigned else "")
     return bool(rows) and not unsigned, detail, None
 
@@ -125,7 +163,13 @@ def tests(pattern):
                 continue
             total += 1
             passed += not tags & {"failure", "error"}
+            for bad in (c for c in case if c.tag in ("failure", "error")):
+                found("high", f"{case.get('classname', '')}::{case.get('name', '')}".strip(":"),
+                      f"{bad.tag}: {first_line(bad.get('message') or bad.text)}", blocking=True,
+                      file=case.get("file"), line=case.get("line") and int(case.get("line")) + 1)
     ok = env("RC") == "0" and total > 0 and passed == total
+    if not total:
+        tool_broke()
     return ok, f"{passed}/{total} passed ({env('LABEL', pattern)})", {"tests_passed": passed, "tests_total": total}
 
 
@@ -146,7 +190,16 @@ def semgrep(path):
     report = load(path)
     if report is None:
         return missing("semgrep")
-    results = [r for r in report.get("results", []) if not accepted(r["check_id"], r.get("path", ""))]
+    results = []
+    for r in report.get("results", []):
+        extra, a = r["extra"], accepted(r["check_id"], r.get("path", ""))
+        meta = extra.get("metadata") or {}
+        found({"ERROR": "high", "WARNING": "medium", "INFO": "low"}.get(extra.get("severity")), r["check_id"],
+              first_line(extra.get("message")), blocking=extra.get("severity") in ("ERROR", "WARNING"), accepted=a,
+              file=r.get("path"), line=r["start"]["line"], url=meta.get("source"),
+              fix=f"autofix: {first_line(extra['fix'], 120)}" if extra.get("fix") else None)
+        if not a:
+            results.append(r)
     blocking = [r for r in results if r["extra"].get("severity") in ("ERROR", "WARNING")]
     errors = report.get("errors") or []
     rules = summarize(blocking, lambda r: f"{r['check_id'].rsplit('.', 1)[-1]} ({r['path']}:{r['start']['line']})", 6)
@@ -158,7 +211,14 @@ def gitleaks(path):
     report = load(path)
     if report is None:
         return missing("gitleaks")
-    leaks = [r for r in report if not accepted(r.get("RuleID", ""), r.get("File", ""))]
+    leaks = []
+    for r in report:
+        a = accepted(r.get("RuleID", ""), r.get("File", ""))
+        found("high", r.get("RuleID", ""), first_line(r.get("Description")), blocking=True, accepted=a,
+              file=r.get("File"), line=r.get("StartLine"), where=f"commit {r.get('Commit', '')[:7]}",
+              fix="treat it as leaked: rotate/revoke it first (git history keeps it), then load it from the environment")
+        if not a:
+            leaks.append(r)
     where = summarize(leaks, lambda r: f"{r['RuleID']} ({r['File']}:{r['StartLine']} @{r.get('Commit', '')[:7]})", 6)
     return not leaks, f"{len(leaks)} leak(s) in {env('SCOPE', 'the repository')} (values redacted){': ' + where if where else ''}", {"leaks": len(leaks)}
 
@@ -169,10 +229,23 @@ def trufflehog(path):
     rows = load_jsonl(path)
     if rows is None:
         return missing("trufflehog")
-    rows = [r for r in rows if "DetectorName" in r and not accepted(r["DetectorName"])]
+    kept = []
+    for r in (r for r in rows if "DetectorName" in r):
+        a = accepted(r["DetectorName"])
+        git = ((r.get("SourceMetadata") or {}).get("Data") or {}).get("Git") or {}
+        found("critical" if r.get("Verified") else "low", r["DetectorName"],
+              "verified LIVE credential" if r.get("Verified") else "unverified candidate (not confirmed live)",
+              blocking=bool(r.get("Verified")), accepted=a, file=git.get("file"), line=git.get("line"),
+              where=f"commit {str(git.get('commit', ''))[:7]}",
+              fix="revoke it at the provider now, then remove it from the code" if r.get("Verified") else None)
+        if not a:
+            kept.append(r)
+    rows = kept
     verified = [r for r in rows if r.get("Verified")]
     where = summarize(verified, lambda r: f"{r['DetectorName']} ({((r.get('SourceMetadata') or {}).get('Data') or {}).get('Git', {}).get('file', '?')})", 6)
     detail = f"{len(verified)} verified live credential(s), {len(rows) - len(verified)} unverified candidate(s) in full git history{': ' + where if where else ''}"
+    if env("RC") != "0":
+        tool_broke()
     return env("RC") == "0" and not verified, detail, {"verified": len(verified), "unverified": len(rows) - len(verified)}
 
 
@@ -213,16 +286,27 @@ def trivy_fs(path):
     packages = sum(len(r.get("Packages") or []) for r in results)
     blocking, lower = [], 0
     for r in results:
+        # The lockfile line comes from the package, not the vulnerability.
+        lines = {(p.get("Identifier") or {}).get("UID"): (p.get("Locations") or [{}])[0].get("StartLine") for p in r.get("Packages") or []}
         for v in r.get("Vulnerabilities") or []:
-            if accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion"))):
+            a = accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion")))
+            block = v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None)
+            found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")), blocking=block, accepted=a,
+                  package=v["PkgName"], version=v.get("InstalledVersion"), file=r.get("Target"),
+                  line=lines.get((v.get("PkgIdentifier") or {}).get("UID")), url=v.get("PrimaryURL"),
+                  fixed_version=v.get("FixedVersion"),
+                  fix=f"upgrade to {v['FixedVersion']}" if v.get("FixedVersion") else "no fixed release: replace or remove the dependency")
+            if a:
                 continue
-            if v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None):
+            if block:
                 blocking.append(v)
             else:
                 lower += 1
     top = summarize(blocking, lambda v: f"{v['VulnerabilityID']} ({v['PkgName']} {v.get('InstalledVersion', '')} {v.get('Severity') or 'no severity'})")
     detail = (f"{len(blocking)} High/Critical-or-unrated, {lower} lower, across {packages} packages "
               f"({', '.join(r.get('Target', '?') for r in results) or env('LOCKFILE', 'lockfile')}){': ' + top if top else ''}")
+    if not packages:
+        tool_broke()
     return packages > 0 and not blocking, detail, {"packages": packages, "blocking": len(blocking)}
 
 
@@ -236,10 +320,22 @@ def checkov(path):
     passed = sum(r.get("summary", {}).get("passed", 0) for r in reports)
     failed = [c for r in reports for c in r.get("results", {}).get("failed_checks", [])]
     skipped = sorted({c["check_id"] for r in reports for c in r.get("results", {}).get("skipped_checks", [])})
+    for c, status in [(c, "failed") for c in failed] + [(c, "skipped") for r in reports for c in r.get("results", {}).get("skipped_checks", [])]:
+        # Paths are the scan copy (input/). A copy of a repo file anchors to
+        # it; a render (kustomize) has no file to point at.
+        path = (c.get("repo_file_path") or c.get("file_path") or "").split("/input/", 1)[-1]
+        in_repo = os.path.isfile(path)
+        inline = {"reason": (c.get("check_result") or {}).get("suppress_comment") or "inline checkov:skip", "expires": None}
+        found(c.get("severity"), c["check_id"], c.get("check_name"), blocking=status == "failed", accepted=inline if status == "skipped" else None,
+              file=path if in_repo else None, line=(c.get("file_line_range") or [None])[0] if in_repo else None,
+              where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/prod)", url=c.get("guideline"),
+              fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if path.endswith("Dockerfile") else "`checkov.io/skipN` annotation"))
     ids = summarize(failed, lambda c: f"{c['check_id']} ({c['resource']})")
     detail = (f"{len(failed)} failed, {passed} passed, {len(skipped)} skipped with inline justification"
               f"{' (' + ', '.join(skipped) + ')' if skipped else ''} — {', '.join(r.get('check_type', '?') for r in reports)}"
               f"{': ' + ids if ids else ''}")
+    if not failed and not passed:
+        tool_broke()
     return not failed and passed > 0, detail, {"failed": len(failed), "passed": passed}
 
 
@@ -250,15 +346,31 @@ def trivy(path):
     report = load(path)
     if report is None:
         return missing("trivy")
-    vulns = [v for r in report.get("Results") or [] for v in r.get("Vulnerabilities") or []
-             if not accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion")))]
-    secrets = [s for r in report.get("Results") or [] for s in r.get("Secrets") or [] if not accepted(s.get("RuleID", ""))]
     block_unfixed = env("BLOCK_UNFIXED") == "true"
+    vulns, secrets = [], []
+    for r in report.get("Results") or []:
+        for v in r.get("Vulnerabilities") or []:
+            a = accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion")))
+            found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")),
+                  blocking=block_unfixed or bool(v.get("FixedVersion")), accepted=a, package=v["PkgName"],
+                  version=v.get("InstalledVersion"), where=r.get("Target"), url=v.get("PrimaryURL"), fixed_version=v.get("FixedVersion"),
+                  fix=f"upgrade to {v['FixedVersion']} (rebuild on a patched base, or bump the package)" if v.get("FixedVersion") else "no upstream fix yet")
+            if not a:
+                vulns.append(v)
+        for s in r.get("Secrets") or []:
+            a = accepted(s.get("RuleID", ""))
+            found(s.get("Severity"), s.get("RuleID", ""), s.get("Title"), blocking=True, accepted=a,
+                  where=f"{r.get('Target')}:{s.get('StartLine', '')} (in the image)", fix="rotate it, and keep it out of the build context (.dockerignore)")
+            if not a:
+                secrets.append(s)
     blocking = vulns if block_unfixed else [v for v in vulns if v.get("FixedVersion")]
     unfixed = [v for v in vulns if not v.get("FixedVersion")]
     top = summarize(blocking, lambda v: f"{v['VulnerabilityID']} ({v['PkgName']})")
     user = ((report.get("Metadata") or {}).get("ImageConfig") or {}).get("config", {}).get("User", "").strip()
     root = user.split(":")[0] in ("", "0", "root")
+    if root:
+        found("high", "image-runs-as-root", f"image user is {user or 'unset (root)'}", blocking=True, file="Dockerfile",
+              fix="add `USER <non-root uid>` to the final stage")
     detail = (f"{len(blocking)} fixable Critical/High{': ' + top if top else ''}; {len(unfixed)} without an upstream fix "
               f"({'blocking' if block_unfixed else 'reported, not blocking'}); {len(secrets)} embedded secret(s); "
               f"runs as {user or 'root (no USER)'}; base {env('BASE_IMAGE', '?')[:40]}")
@@ -295,7 +407,17 @@ def dockle(path):
     if report is None:
         return missing("dockle")
     details = report.get("details") or []
-    kept = [d for d in details if not all(accepted(d["code"], a) for a in (d.get("alerts") or [""]))]
+    kept = []
+    for d in details:
+        # Accepted only if every alert is; only then are the entries "applied".
+        hits = [accepted(d["code"], a, record=False) for a in (d.get("alerts") or [""])]
+        if all(hits):
+            hits = [accepted(d["code"], a) for a in (d.get("alerts") or [""])]
+        found({"FATAL": "high", "WARN": "medium", "INFO": "low"}.get(d["level"], "info"), d["code"], d.get("title"),
+              blocking=d["level"] in ("FATAL", "WARN"), accepted=hits[0] if all(hits) else None,
+              where="; ".join(d.get("alerts") or [])[:300], url=f"https://github.com/goodwithtech/dockle#{d['code'].lower()}")
+        if not all(hits):
+            kept.append(d)
     blocking = [d for d in kept if d["level"] in ("FATAL", "WARN")]
     ids = summarize(blocking, lambda d: f"{d['code']} {d['title']}")
     return not blocking, f"{len(blocking)} FATAL/WARN of {len(kept)} findings (CIS Docker Benchmark + dockle checks){': ' + ids if ids else ''}", None
@@ -310,6 +432,12 @@ def django_check(path):
     except OSError:
         return missing("django check --deploy")
     issues = re.findall(r"^\?: \((\S+)\)|^\S+: \((\S+)\)", out, re.M)
+    for obj, check_id, msg in re.findall(r"^(\S+): \((\S+)\) (.*)$", out, re.M):
+        found("high" if ".E" in check_id else "medium", check_id, msg, blocking=True, where=None if obj == "?" else obj,
+              url="https://docs.djangoproject.com/en/stable/ref/checks/#security", fix="set it in config/settings.py (production settings)")
+    if "System check identified" not in out:
+        tool_broke()
+        _state["log"] = out
     ids = sorted({a or b for a, b in issues})
     ok = env("RC") == "0" and "System check identified no issues" in out
     return ok, f"{len(ids)} deployment check issue(s){': ' + ', '.join(ids[:8]) if ids else ''} (manage.py check --deploy --fail-level WARNING, production settings, in the image)", None
@@ -335,9 +463,18 @@ def nuclei(path):
     rows = load_jsonl(path)
     if rows is None:
         return missing("nuclei")
-    rows = [r for r in rows if not accepted(r.get("template-id", ""))]
+    kept = []
+    for r in rows:
+        a, info = accepted(r.get("template-id", "")), r.get("info") or {}
+        found(info.get("severity"), r.get("template-id", ""), info.get("name"), blocking=info.get("severity") in ("medium", "high", "critical"),
+              accepted=a, where=r.get("matched-at"), url=r.get("template-url"), fix=first_line(info.get("remediation"), 160) or None)
+        if not a:
+            kept.append(r)
+    rows = kept
     blocking = [r for r in rows if (r.get("info") or {}).get("severity") in ("medium", "high", "critical")]
     ids = summarize(blocking, lambda r: f"{r['template-id']} ({r['info']['severity']})")
+    if env("RC") != "0":
+        tool_broke()
     detail = f"{len(blocking)} Medium+ of {len(rows)} findings — nuclei {env('TEMPLATES', '')} (dos/fuzz/intrusive excluded){': ' + ids if ids else ''}"
     return env("RC") == "0" and not blocking, detail, {"findings": len(rows), "blocking": len(blocking)}
 
@@ -355,11 +492,21 @@ def testssl(path):
             if isinstance(items, list):
                 findings += [i for i in items if isinstance(i, dict) and "severity" in i]
     # Per-certificate ids carry a suffix ("intermediate_cert_notAfter <#1>").
-    kept = [f for f in findings if not accepted(re.sub(r"\s*<#\d+>$", "", f.get("id", "")))]
+    kept = []
+    for f in findings:
+        a = accepted(re.sub(r"\s*<#\d+>$", "", f.get("id", "")))
+        if f["severity"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL", "FATAL"):
+            found("high" if f["severity"] == "FATAL" else f["severity"], f.get("id", ""),
+                  ("testssl.sh could not test this: " if f["severity"] == "FATAL" else "") + first_line(f.get("finding")),
+                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where="https://localhost (preprod TLS proxy)")
+        if not a:
+            kept.append(f)
     blocking = [f for f in kept if f["severity"] in ("HIGH", "CRITICAL")]
     fatal = [f for f in kept if f["severity"] == "FATAL"]
     ids = summarize(blocking + fatal, lambda f: f"{f['id']} ({f['severity']})")
     detail = f"{len(blocking)} High/Critical of {len(findings)} TLS checks (testssl.sh: protocols, ciphers, vulnerabilities, headers){': ' + ids if ids else ''}"
+    if not scans or not findings or fatal:
+        tool_broke()
     return bool(scans) and bool(findings) and not blocking and not fatal, detail, {"checks": len(findings), "blocking": len(blocking)}
 
 
@@ -373,8 +520,9 @@ def kubeconform(path):
     valid = summary.get("valid", 0)
     total = sum(summary.get(k, 0) for k in ("valid", "invalid", "errors", "skipped"))
     changed = (env("CHANGED") or "").split()
-    ok = env("RC") == "0" and total > 0 and valid == total and changed == [env("KUSTOMIZATION", "deploy/kind/kustomization.yaml")]
-    return ok, f"deploy/kind render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)", None
+    kustomization = env("KUSTOMIZATION", "deploy/prod/kustomization.yaml")
+    ok = env("RC") == "0" and total > 0 and valid == total and changed == [kustomization]
+    return ok, f"{os.path.dirname(kustomization)} render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)", None
 
 
 # --- generic ----------------------------------------------------------------
@@ -400,6 +548,7 @@ def main():
         ok, detail, metrics = CHECKS[check](*args)
     except (OSError, ValueError, KeyError, TypeError, IndexError, ET.ParseError) as exc:
         ok, detail, metrics = False, f"{check}: could not evaluate ({type(exc).__name__}: {exc})", None
+        tool_broke()
     out = {"status": "skipped" if ok == "skipped" else "pass" if ok else "fail", "detail": detail[:1000]}
     if env("TOOL"):
         out["tool"] = env("TOOL")
@@ -411,8 +560,11 @@ def main():
         listed = ", ".join(ids) if len(ids) <= 5 else f"{len(ids)} ids, listed in `accepted`"
         out["detail"] = (out["detail"] + f"; accepted risks applied: {listed}")[:1000]
     print(f"{out['status']}: {out['detail']}")
-    with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-        f.write(f"{env('OUTPUT', 'result')}={json.dumps(out)}\n")
+    if env("GITHUB_OUTPUT"):
+        with open(env("GITHUB_OUTPUT"), "a") as f:
+            f.write(f"{env('OUTPUT', 'result')}={json.dumps(out)}\n")
+    kind = _state["kind"] or ("findings" if any(f["status"] == "blocking" for f in _findings) else "policy")
+    findings.publish(CONTROL or check, check, out, _findings, kind, os.path.dirname(env("VERDICT_FILE", "")), log=_state.get("log"))
     if env("VERDICT_FILE"):
         os.makedirs(os.path.dirname(env("VERDICT_FILE")) or ".", exist_ok=True)
         with open(env("VERDICT_FILE"), "w") as f:

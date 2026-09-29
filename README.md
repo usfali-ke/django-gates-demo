@@ -61,6 +61,66 @@ they appear as `gate-preview-*`). The `evidence` bundle also feeds
 DefectDojo: the dashboard's collector reimports every report listed in
 `manifest.json`.
 
+### When a control fails
+
+verdict.py records every finding in the same shape, whatever the tool:
+severity, id, title, file and line or package and version, the fix, and a
+link. `.github/scripts/findings.py` turns those findings into:
+
+- **The job summary** (open the red job). It says why the control failed:
+  - *findings*: the tool reported something that blocks.
+  - *tool*: nothing was checked, and the tool's output is shown.
+  - *policy*: a threshold such as coverage wasn't met.
+
+  Under the verdict comes **the tool's own report**, as developers know it
+  from running the tool:
+  - trivy's table (SCA and image), rendered from the same JSON with
+    `trivy convert`, without the accepted risks;
+  - checkov's markdown; semgrep's text; dockle's list;
+  - `check --deploy`'s output; testssl.sh's console report.
+
+  The report is also in the step log and in the artifact, and it's
+  collapsed when the control passed. Tools without a readable report of
+  their own (the secret scanners, tests, governance, nuclei) get a table
+  of blocking findings instead, sorted by severity. trufflehog's own
+  output would print the secret. SCA and image findings also get an
+  upgrade plan with one row per package: the version that fixes all of
+  that package's findings. Accepted risks, with their reason and expiry,
+  are in a collapsed section, because the tools don't know about the
+  register. The summary ends with the `make` command that reproduces the
+  failure, which prints the same report.
+- **Annotations**: the first 9 blocking findings that have a file and line
+  appear on the PR's Files tab.
+- **Code scanning** (public repos only; private ones need GitHub Advanced
+  Security). Each control uploads its own `findings.sarif` (semgrep,
+  gitleaks, trivy SCA, checkov) or trivy's SARIF (image scan), so alerts
+  open and close per control. A control whose tool failed uploads nothing,
+  so that failure can't close real alerts.
+- **One PR comment**, edited in place on every run. It lists every control
+  and marks the blocking findings that are new compared with the latest
+  `main` run. A finding counts as the same if the control, id and file or
+  package match; line numbers are ignored. Fork PRs get no comment,
+  because their token is read-only. Their job summaries carry the same
+  information.
+- **`findings.json`** in each `report-<control>` artifact: every finding,
+  uncapped. It is also part of the evidence bundle.
+
+The same scans run locally with the pipeline's pinned images, arguments
+and thresholds. The Makefile reads the image pins from the workflow, so
+the two can't drift:
+
+```
+make scan            # semgrep · gitleaks · trufflehog · trivy SCA · checkov
+make scan-image      # docker build, then trivy image · dockle · check --deploy
+make sca-trivy       # any single control, by its pipeline name
+pre-commit install --hook-type pre-commit --hook-type pre-push
+```
+
+The pre-commit hooks are defined in `.pre-commit-config.yaml`:
+- On commit: gitleaks on the staged changes; trivy when `uv.lock` or
+  `pyproject.toml` changes; checkov when `Dockerfile` or `deploy/` changes.
+- On push: semgrep.
+
 ### Checking the evidence later
 
 ```
@@ -82,37 +142,106 @@ Each entry names the control, the finding id and a reason, and has an
 expiry date. Once it expires, the finding blocks again. Every acceptance
 that was applied is listed in the verdict and in the manifest.
 
-## Releasing (same shape: `devsecops-release.yml`)
+## Promoting (`devsecops-release.yml`, one run per environment)
+
+The digest the pipeline built and signed moves dev → staging → prod. It is
+never rebuilt. Each environment gets its gates around its own deploy:
 
 ```
-R1 resolve ── the change is an open `change` issue with both approval labels
-R1 verify ─── signature + SBOM + SLSA (this commit) · evidence attestation
-              (G2 + G3 passed for this digest) · target config
-R2 G4 ─────── `release-approval` environment (approver ≠ whoever started or
-              re-ran the run) + dashboard decision on the change
-R3 deploy ─── digest committed to deploy/kind → G5 gate
-R4 verify ─── wait for the dashboard's `security-dashboard/G6` (Argo CD)
-R5 evidence ─ `release-evidence` bundle, attested to the digest
+dev ───── R1 this commit's image → G5(dev) → deploy/dev → G6(dev)
+staging ─ R1 the digest G6 verified in dev → G5(staging) → deploy/staging
+          → G6(staging) → G3 against staging (functional · k6 · nuclei · testssl)
+prod ──── R1 the digest G6 verified in staging → G4 → G5(prod)
+          → deploy/prod (canary) → G6(prod)
 ```
 
-1. Open a **Change request** issue, with a change window that covers the
+- **R1** for every environment: signature + SBOM + SLSA provenance for the
+  commit that built the digest; the evidence attestation (the pipeline's G2
+  and preprod G3 passed); the target overlay is schema-valid and
+  checkov-clean, and only its digest changes.
+- **G4** (prod only): the `release-approval` environment (approver ≠
+  whoever started or re-ran the run), and the dashboard's decision on the
+  change. That decision includes *G3 passed in staging for this digest*.
+- **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
+  trailers (`Environment`, `Image-Digest`, `Source-Commit`) are what the
+  next environment's R1 reads, together with the `security-dashboard/G6`
+  status on that commit.
+- **Evidence:** every run leaves a `release-evidence` bundle, attested to
+  the digest once something was deployed.
+
+How to promote:
+
+1. Push to main and let **devsecops-pipeline** publish. A push that only
+   touches `deploy/**` or `*.md` doesn't build, so after one, run the
+   pipeline on main by hand.
+2. Actions → **devsecops-release** → `environment: dev`.
+3. Once dev's G6 is green: `environment: staging`. The staging G3 needs the
+   self-hosted runner (below).
+4. For prod, open a **Change request** issue whose change window covers the
    release. Someone other than you adds `change-approved` and
-   `readiness-approved`.
-2. Actions → **devsecops-release** → Run workflow, giving the issue
-   (`7`, `#7` or `CHG-7`).
-3. Someone other than whoever started the run approves the
-   `release-approval` deployment. If G4 is re-run, it needs a fresh
-   approval from someone who neither started nor re-ran the run.
-4. The release runs on main's HEAD, which needs a published image. Pushes
-   that only touch `deploy/**` or `*.md` don't run the pipeline, so after
-   one, run **devsecops-pipeline** on main by hand before releasing.
+   `readiness-approved`. Then run with `environment: prod` and the issue
+   (`7`, `#7` or `CHG-7`). Someone who neither started nor re-ran the run
+   approves `release-approval`.
+
+A promotion refuses to run when:
+- the previous environment's last deploy wasn't made by this workflow;
+- that deploy's G6 isn't green;
+- `deploy/base` or the target overlay changed on main after the run started.
 
 ## One-time cluster setup (run by an operator)
 
 The Rollout reads `DJANGO_SECRET_KEY` from a Secret, which this repo never
-contains:
+contains. Each environment needs its own:
 
 ```
-kubectl -n django-gates-demo create secret generic django-gates-demo \
-  --from-literal=secret-key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(50))')"
+for ns in django-gates-demo-dev django-gates-demo-staging django-gates-demo; do
+  kubectl -n "$ns" create secret generic django-gates-demo \
+    --from-literal=secret-key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(50))')"
+done
 ```
+
+The namespaces, the Argo CD Applications (`django-gates-demo-{dev,staging,prod}`)
+and the staging tester's RBAC are in the security dashboard's
+`pipeline/k8s/kind/platform`.
+
+### Staging test runner
+
+The staging G3 runs on a self-hosted runner, because GitHub-hosted runners
+can't reach the cluster. The job:
+- finds the pod running the promoted digest;
+- port-forwards it to `127.0.0.1:18000`;
+- creates two random-password users in it (`manage.py ensure_user`, with
+  the password on stdin);
+- puts a Caddy TLS proxy on `https://localhost:8443` in front of it
+  (`tests/staging/Caddyfile`).
+
+The runner needs docker, kubectl, git, jq, python3 and curl. `uv` is
+installed by the job.
+
+1. Give the runner a short-lived kubeconfig for the `staging-tester`
+   ServiceAccount. It can list pods, port-forward and exec in
+   `django-gates-demo-staging`, and nothing else. For example:
+
+   ```
+   token=$(kubectl -n django-gates-demo-staging create token staging-tester --duration=2h)
+   kubectl config view --minify --raw -o json \
+     | jq --arg t "$token" '.users[0].user = {token: $t} | .contexts[0].context.namespace = "django-gates-demo-staging"' \
+     > ~/.kube/staging-tester.json && chmod 600 ~/.kube/staging-tester.json
+   unset token
+   ```
+
+   Start the runner with `KUBECONFIG=~/.kube/staging-tester.json`.
+2. Register it as **ephemeral**, so one registration serves one job:
+
+   ```
+   ./config.sh --url https://github.com/usfali-ke/django-gates-demo --ephemeral \
+     --labels django-gates-demo-staging --token <registration token from Settings → Actions → Runners>
+   KUBECONFIG=~/.kube/staging-tester.json ./run.sh
+   ```
+
+This repo is public, so a pull request from a fork could try to run on a
+self-hosted runner. To prevent that:
+- keep the runner registered only while a staging promotion runs;
+- keep *Settings → Actions → Fork pull request workflows → Require
+  approval for all external contributors* on. The pipeline itself never
+  targets this label.

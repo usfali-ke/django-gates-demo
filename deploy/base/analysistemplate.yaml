@@ -7,6 +7,10 @@
 # security_control (job provider): the canary still sends its security
 # headers and still refuses anonymous access and anonymous writes — the
 # controls the pipeline tested, checked again on the pods taking traffic.
+#
+# The web provider runs in the Argo Rollouts controller's namespace, so
+# its URL needs the namespace: each overlay replaces it (metric 0). The job
+# runs in the app's namespace and uses the short name.
 apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
 metadata:
@@ -21,7 +25,7 @@ spec:
       successCondition: result.status == 'ok'
       provider:
         web:
-          url: http://django-gates-demo-canary.django-gates-demo.svc/healthz
+          url: http://django-gates-demo-canary.NAMESPACE.svc/healthz
           jsonPath: "{$}"
           timeoutSeconds: 10
     - name: security-control
@@ -60,7 +64,7 @@ spec:
                         memory: 64Mi
                     env:
                       - name: BASE
-                        value: http://django-gates-demo-canary.django-gates-demo.svc
+                        value: http://django-gates-demo-canary
                     command: ["/bin/sh", "-c"]
                     args:
                       - |
