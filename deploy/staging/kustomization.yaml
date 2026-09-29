@@ -1,12 +1,12 @@
 # staging: gets only a digest that is running and verified (G6) in dev.
 # devsecops-release.yml (environment: staging) commits it after G5, then
-# runs G3 against this namespace. Argo CD app `django-gates-demo-staging`.
+# runs G3 against this namespace. Argo CD app `django-gates-demo-stg`.
 # One replica: the demo's SQLite lives in each pod, and the staging tests
 # create their users in the pod they test.
 # The only automated edit is the image digest below (set_digest.py).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: django-gates-demo-staging
+namespace: django-gates-demo-stg
 
 resources:
   - ../base
@@ -22,12 +22,12 @@ patches:
         value: DJANGO_ALLOWED_HOSTS
       - op: replace
         path: /spec/template/spec/containers/0/env/1/value
-        value: localhost,django-gates-demo,django-gates-demo-canary,django-gates-demo-stable,django-gates-demo.django-gates-demo-staging.svc,django-gates-demo-canary.django-gates-demo-staging.svc,django-gates-demo-stable.django-gates-demo-staging.svc
+        value: localhost,django-gates-demo,django-gates-demo-canary,django-gates-demo-stable,django-gates-demo.django-gates-demo-stg.svc,django-gates-demo-canary.django-gates-demo-stg.svc,django-gates-demo-stable.django-gates-demo-stg.svc
   - target: {kind: AnalysisTemplate, name: django-gates-demo-canary-health}
     patch: |
       - op: replace
         path: /spec/metrics/0/provider/web/url
-        value: http://django-gates-demo-canary.django-gates-demo-staging.svc/healthz
+        value: http://django-gates-demo-canary.django-gates-demo-stg.svc/healthz
 
 images:
   # Never a tag: admission (Kyverno) requires digests. Every environment

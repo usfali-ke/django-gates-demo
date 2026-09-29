@@ -645,12 +645,12 @@ jobs:
     # namespace; the repo holds no cluster credential.
     needs: [resolve, post-deploy]
     if: inputs.environment == 'staging' && needs.post-deploy.result == 'success'
-    runs-on: [self-hosted, linux, django-gates-demo-staging]
+    runs-on: [self-hosted, linux, django-gates-demo-stg]
     timeout-minutes: 45
     permissions:
       contents: read
     env:
-      NS: django-gates-demo-staging
+      NS: django-gates-demo-stg
       DIGEST: ${{ needs.resolve.outputs.digest }}
       OUT: reports/staging
     steps:
