@@ -32,4 +32,6 @@ cd "$dir"
 ./config.sh --unattended --replace --ephemeral --url "https://github.com/${repo}" \
   --name "env-$(hostname -s)" --labels django-gates-demo-env --token "$registration"
 unset registration
-exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" ./run.sh
+# IPv4 first: on a host whose DNS hands out NAT64 addresses without a
+# route, the runner's Node actions (artifact upload) time out otherwise.
+exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" NODE_OPTIONS=--dns-result-order=ipv4first ./run.sh

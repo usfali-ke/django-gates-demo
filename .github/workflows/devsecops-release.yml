@@ -1049,14 +1049,17 @@ jobs:
               kubectl -n "$NS" exec -i "$pod" -- sh -c 'read -r ENSURE_USER_PASSWORD; export ENSURE_USER_PASSWORD; exec python manage.py ensure_user "$0"' "${!user}" <<<"${!pw}"
             done
           fi
-          docker run -d --name "env-proxy-${GITHUB_RUN_ID}" --network host --cap-drop ALL \
+          # caddy carries a file capability (cap_net_bind_service): without
+          # it in the bounding set the binary can't even exec.
+          docker run -d --name "env-proxy-${GITHUB_RUN_ID}" --network host --cap-drop ALL --cap-add NET_BIND_SERVICE \
             -v "$PWD/tests/env/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY" > /dev/null
           for _ in $(seq 30); do
             docker cp "env-proxy-${GITHUB_RUN_ID}:/data/caddy/pki/authorities/local/root.crt" "$RUNNER_TEMP/env-ca.crt" 2>/dev/null \
               && curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz && break
             sleep 2
           done
-          curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz
+          curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz \
+            || { docker logs "env-proxy-${GITHUB_RUN_ID}" 2>&1 | tail -20; tail -5 "$OUT/port-forward.log"; exit 1; }
           cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/env-ca.crt" > "$RUNNER_TEMP/env-bundle.crt"
           chmod 644 "$RUNNER_TEMP/env-ca.crt" "$RUNNER_TEMP/env-bundle.crt"   # read by tool containers running as other uids
       - name: functional / integration tests
