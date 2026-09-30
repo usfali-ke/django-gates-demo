@@ -8,8 +8,8 @@
 	admin off
 	skip_install_trust
 	default_sni localhost
-	http_port 8480
-	https_port 8443
+	http_port 18480
+	https_port 18443
 }
 
 localhost {

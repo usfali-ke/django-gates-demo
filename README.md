@@ -212,7 +212,7 @@ can't reach the cluster. The job:
 - port-forwards it to `127.0.0.1:18000`;
 - creates two random-password users in it (`manage.py ensure_user`, with
   the password on stdin);
-- puts a Caddy TLS proxy on `https://localhost:8443` in front of it
+- puts a Caddy TLS proxy on `https://localhost:18443` in front of it
   (`tests/staging/Caddyfile`).
 
 The runner needs docker, kubectl, git, jq, python3 and curl. `uv` is

@@ -699,7 +699,7 @@ jobs:
           (umask 077; {
             echo "USER_A=staging-alice"; echo "PASSWORD_A=$(rand)"
             echo "USER_B=staging-bob"; echo "PASSWORD_B=$(rand)"
-            echo "BASE_URL=https://localhost:8443"; echo "HTTP_URL=http://localhost:8480"
+            echo "BASE_URL=https://localhost:18443"; echo "HTTP_URL=http://localhost:18480"
             echo "REQUESTS_CA_BUNDLE=$RUNNER_TEMP/staging-bundle.crt"
             echo "SSL_CERT_FILE=$RUNNER_TEMP/staging-bundle.crt"; } > "$env_file")
           # shellcheck source=/dev/null
@@ -713,10 +713,10 @@ jobs:
             -v "$PWD/tests/staging/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY" > /dev/null
           for _ in $(seq 30); do
             docker cp "staging-proxy-${GITHUB_RUN_ID}:/data/caddy/pki/authorities/local/root.crt" "$RUNNER_TEMP/staging-ca.crt" 2>/dev/null \
-              && curl -fsS --cacert "$RUNNER_TEMP/staging-ca.crt" -o /dev/null https://localhost:8443/healthz && break
+              && curl -fsS --cacert "$RUNNER_TEMP/staging-ca.crt" -o /dev/null https://localhost:18443/healthz && break
             sleep 2
           done
-          curl -fsS --cacert "$RUNNER_TEMP/staging-ca.crt" -o /dev/null https://localhost:8443/healthz
+          curl -fsS --cacert "$RUNNER_TEMP/staging-ca.crt" -o /dev/null https://localhost:18443/healthz
           cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/staging-ca.crt" > "$RUNNER_TEMP/staging-bundle.crt"
           chmod 644 "$RUNNER_TEMP/staging-ca.crt" "$RUNNER_TEMP/staging-bundle.crt"   # read by tool containers running as other uids
       - name: functional tests
@@ -768,7 +768,7 @@ jobs:
           [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
           touch "$OUT/dast-nuclei/nuclei.jsonl"
           docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT/dast-nuclei:/out" "$NUCLEI" \
-            -u https://localhost:8443 -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
+            -u https://localhost:18443 -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
             -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
           echo "rc=$?" >> "$GITHUB_OUTPUT"
       - id: dast-nuclei
@@ -788,7 +788,7 @@ jobs:
           mkdir -p "$OUT/dast-tls" && chmod 777 "$OUT/dast-tls"
           docker run --rm --network host -v "$PWD/$OUT/dast-tls:/out" -v "$RUNNER_TEMP/staging-ca.crt:/ca.crt:ro" "$TESTSSL" \
             --quiet --color 0 --warnings off --add-ca /ca.crt \
-            --jsonfile-pretty /out/testssl.json https://localhost:8443 > "$OUT/dast-tls/testssl.log" 2>&1 || true
+            --jsonfile-pretty /out/testssl.json https://localhost:18443 > "$OUT/dast-tls/testssl.log" 2>&1 || true
       - id: dast-tls
         if: ${{ !cancelled() }}
         env:
