@@ -16,12 +16,13 @@ kubeconfig=$HOME/.kube/env-tester.json
 
 [ -x "$dir/config.sh" ] || { echo "no actions runner in $dir" >&2; exit 1; }
 
-umask 077
 mkdir -p "$(dirname "$kubeconfig")"
 token=$(kubectl -n django-gates-demo-tools create token env-tester --duration=2h)
-kubectl config view --minify --raw -o json \
+# umask in a subshell only: the runner's checkouts must stay readable by
+# the tool containers (cap-drop ALL: root there can't override modes).
+(umask 077; kubectl config view --minify --raw -o json \
   | jq --arg t "$token" '.users[0].user = {token: $t} | .contexts[0].context.namespace = "django-gates-demo-tools"' \
-  > "$kubeconfig"
+  > "$kubeconfig")
 unset token
 
 registration=$(curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is not set}" \
@@ -32,6 +33,8 @@ cd "$dir"
 ./config.sh --unattended --replace --ephemeral --url "https://github.com/${repo}" \
   --name "env-$(hostname -s)" --labels django-gates-demo-env --token "$registration"
 unset registration
-# IPv4 first: on a host whose DNS hands out NAT64 addresses without a
-# route, the runner's Node actions (artifact upload) time out otherwise.
-exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" NODE_OPTIONS=--dns-result-order=ipv4first ./run.sh
+# Node tries each address of a host for only 250 ms by default (happy
+# eyeballs). On a slow link, or with DNS handing out an unroutable NAT64
+# address, every attempt times out and the artifact upload fails with
+# ETIMEDOUT; 2 s per address still falls back between IPv6 and IPv4.
+exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" NODE_OPTIONS=--network-family-autoselection-attempt-timeout=2000 ./run.sh

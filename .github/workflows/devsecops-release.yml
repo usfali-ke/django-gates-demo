@@ -1051,8 +1051,11 @@ jobs:
           fi
           # caddy carries a file capability (cap_net_bind_service): without
           # it in the bounding set the binary can't even exec.
+          # A 0644 copy: the checkout's modes follow the runner's umask, and
+          # root in a cap-drop ALL container can't read past them.
+          install -m 644 tests/env/Caddyfile "$RUNNER_TEMP/Caddyfile"
           docker run -d --name "env-proxy-${GITHUB_RUN_ID}" --network host --cap-drop ALL --cap-add NET_BIND_SERVICE \
-            -v "$PWD/tests/env/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY" > /dev/null
+            -v "$RUNNER_TEMP/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY" > /dev/null
           for _ in $(seq 30); do
             docker cp "env-proxy-${GITHUB_RUN_ID}:/data/caddy/pki/authorities/local/root.crt" "$RUNNER_TEMP/env-ca.crt" 2>/dev/null \
               && curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz && break
@@ -1126,6 +1129,7 @@ jobs:
           set -uo pipefail
           mkdir -p "$OUT/dast-nuclei" && chmod 777 "$OUT/dast-nuclei"
           rm -rf "$RUNNER_TEMP/templates"
+          umask 022   # the nuclei container reads them as another uid
           git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES" https://github.com/projectdiscovery/nuclei-templates.git "$RUNNER_TEMP/templates"
           got=$(git -C "$RUNNER_TEMP/templates" rev-parse HEAD)
           [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
