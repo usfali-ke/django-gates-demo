@@ -1,4 +1,4 @@
-# The staging test job's self-hosted runner (README: "Staging test runner").
+# The environment test job's self-hosted runner (README: "Environment test runner").
 self-hosted-runner:
   labels:
-    - django-gates-demo-staging
+    - django-gates-demo-env

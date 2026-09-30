@@ -31,6 +31,14 @@ import os
 import sys
 
 # gate → [(criterion key, category, [(job id, output name)])]
+_G5 = [
+    ("artifact_provenance_verified", "security", [("provenance", "result"), ("evidence-check", "result")]),
+    ("target_env_config_controlled", "delivery", [("config", "result")]),
+    ("approved_gitops_pipeline_path", "governance", [("resolve", "promotion")]),
+    # The digest to return to if this one fails: still signed and pullable.
+    ("rollback_plan_ready", "delivery", [("rollback-plan", "result")]),
+]
+
 GATES = {
     "G1": [
         ("required_reviewers_approved", "governance", [("reviewers", "result")]),
@@ -41,6 +49,7 @@ GATES = {
     ],
     "G2": [
         ("reproducible_build_config_controlled", "delivery", [("build", "result")]),
+        ("code_quality_threshold_met", "quality", [("code-quality", "result")]),
         ("sca_clean", "security", [("sca-trivy", "result")]),
         ("iac_clean", "security", [("iac-checkov", "result")]),
         ("container_image_scan_hardened_base", "security", [("image-scan", "result")]),
@@ -54,19 +63,41 @@ GATES = {
         ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
         ("compliance_scan_clean", "security", [("image-compliance", "result"), ("django-deploy-check", "result")]),
     ],
-    # G3 against the deployed staging environment (devsecops-release.yml).
-    # Coverage and the image compliance checks are properties of the
-    # artifact, already decided by the pipeline's G3 for this digest.
+    # G3 against the deployed environments (devsecops-release.yml, job
+    # env-tests). Coverage and the image compliance checks are properties
+    # of the artifact, already decided by the pipeline's G3 for this digest.
+    # dev: integration tests, DAST, and the deployed image's dependencies
+    # re-scanned against today's vulnerability data.
+    "G3@dev": [
+        ("functional_integration_regression_pass", "quality", [("functional", "result")]),
+        ("dast_scan_clean", "security", [("dast-nuclei", "result")]),
+        ("dependency_check_clean", "security", [("dependency-check", "result")]),
+    ],
     "G3@staging": [
         ("functional_integration_regression_pass", "quality", [("functional", "result")]),
         ("performance_within_slo", "quality", [("performance", "result")]),
         ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
     ],
+    # prod after the rollout: read-only smoke tests (no test users, no
+    # writes). Argo CD's own G6 (sync, canary analysis, admission) is
+    # recorded separately by the dashboard.
+    "G6@prod": [
+        ("post_deploy_smoke_pass", "quality", [("smoke", "result")]),
+    ],
     # Before each environment's deploy commit (devsecops-release.yml).
-    "G5": [
-        ("artifact_provenance_verified", "security", [("provenance", "result"), ("evidence-check", "result")]),
-        ("target_env_config_controlled", "delivery", [("config", "result")]),
-        ("approved_gitops_pipeline_path", "governance", [("resolve", "promotion")]),
+    "G5": _G5,
+    "G5@dev": _G5,
+    # Promotion from dev: dev's G3 for this digest, the notes the approver
+    # read, and the staging-approval environment's reviewer.
+    "G5@staging": _G5 + [
+        ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
+        ("release_notes_published", "governance", [("release-notes", "result")]),
+        ("promotion_approved_by_other", "governance", [("approve-staging", "result")]),
+    ],
+    # The approval for prod is G4 (recorded by the dashboard).
+    "G5@prod": _G5 + [
+        ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
+        ("release_notes_published", "governance", [("release-notes", "result")]),
     ],
 }
 

@@ -4,6 +4,7 @@
 # after it.
 #
 #   1 build      build ×2 (reproducible?) → image artifact │ unit tests + coverage
+#                │ code quality (ruff: lint + complexity threshold)
 #   2 static     semgrep · gitleaks · trufflehog · trivy (SCA, lockfile) · checkov
 #                │ PR: reviewers · signed commits
 #     image      trivy (image) · syft SBOM · dockle · django check --deploy (on the built image)
@@ -15,6 +16,8 @@
 #     ── G3 (test gate) ──
 #   6 evidence   every report + hash manifest → artifact `evidence` (90 days);
 #                on main, attested to the image digest with cosign
+#   7 promote    main, published and G3 passed: starts devsecops-release.yml
+#                for dev with this commit (staging and prod are manual)
 #
 # Rules that make the results trustworthy:
 #  - Tools never decide pass/fail (they run "don't fail on findings");
@@ -195,6 +198,50 @@ jobs:
         with:
           name: report-coverage
           path: reports/coverage/
+          if-no-files-found: ignore
+
+  code-quality:
+    name: 1 code quality · ruff (lint + complexity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: code-quality
+      OUT: reports/code-quality
+      VERDICT_FILE: reports/code-quality/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      # ruff is a locked dev dependency; the rules and the complexity limit
+      # are pyproject.toml [tool.ruff.lint], so the threshold is versioned
+      # with the code it applies to.
+      - run: |
+          mkdir -p "$OUT"
+          # shellcheck disable=SC2086 # SRC_DIRS is a list
+          uv run --frozen ruff check --output-format json $SRC_DIRS tests > "$OUT/ruff.json" || true
+          # shellcheck disable=SC2086
+          uv run --frozen ruff check --output-format concise $SRC_DIRS tests > "$OUT/ruff.txt" || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: ruff (pyproject.toml [tool.ruff.lint])
+        run: python3 .github/scripts/verdict.py ruff "$OUT/ruff.json"
+      - name: tool report
+        if: always()
+        run: python3 .github/scripts/findings.py native "$OUT/ruff.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-code-quality
+          path: reports/code-quality/
           if-no-files-found: ignore
 
   # ── 2 static ───────────────────────────────────────────────────────────
@@ -734,7 +781,7 @@ jobs:
   # ── 3 publish ──────────────────────────────────────────────────────────
   publish:
     name: 3 publish · push + sign + attest
-    needs: [build, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
+    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
             sca-trivy, iac-checkov, image-scan, sbom, image-compliance, django-deploy-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
@@ -880,7 +927,7 @@ jobs:
 
   gate-g2:
     name: G2 artifact gate
-    needs: [build, sca-trivy, iac-checkov, image-scan, sbom, publish]
+    needs: [build, code-quality, sca-trivy, iac-checkov, image-scan, sbom, publish]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1126,12 +1173,15 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: .github
-      - uses: ./.github/actions/gate
+      - id: gate
+        uses: ./.github/actions/gate
         with:
           gate: G3
           needs: ${{ toJSON(needs) }}
@@ -1143,7 +1193,7 @@ jobs:
   # ── 6 evidence ─────────────────────────────────────────────────────────
   evidence:
     name: 6 evidence bundle
-    needs: [build, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
             reviewers, commits-signed, image-scan, sbom, image-compliance, django-deploy-check, publish,
             gate-g1, gate-g2, functional, performance, dast-nuclei, dast-tls, gate-g3]
     if: always()
@@ -1160,7 +1210,7 @@ jobs:
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
       # Controls that apply to this event; the rest aren't listed as missing.
       CONTROLS: >-
-        build,unit-tests,coverage,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
+        build,unit-tests,coverage,code-quality,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
         sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
         image-compliance,django-deploy-check,publish,functional,performance,dast-nuclei,dast-tls
     steps:
@@ -1208,6 +1258,30 @@ jobs:
           cosign verify-attestation --type "$PREDICATE_TYPE" --certificate-identity "$CERT_IDENTITY" \
             --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
           echo "Evidence manifest attested to ${REF} (${PREDICATE_TYPE})" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 7 promote to dev ───────────────────────────────────────────────────
+  # A published, G3-passed, evidence-attested digest goes straight to dev:
+  # devsecops-release.yml for this commit, with every release gate. Staging
+  # and prod stay manual.
+  promote-dev:
+    name: 7 promote to dev
+    needs: [publish, gate-g2, gate-g3, evidence]
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.publish.outputs.published == 'true'
+      && needs.gate-g2.outputs.status == 'pass' && needs.gate-g3.outputs.status == 'pass'
+      && needs.evidence.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f environment=dev -f kind=planned -f commit="$GITHUB_SHA"
+          echo "Started devsecops-release (dev) for ${GITHUB_SHA:0:7}: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
 
   # ── PR comment ─────────────────────────────────────────────────────────
   # One comment per PR, edited in place: every control, what's new compared

@@ -6,6 +6,10 @@
 
 Two real users, so object-level authorization is exercised across
 accounts, not just by unit tests.
+
+`-m smoke` runs only the read-only checks that need no test users and
+write nothing — what the release runs against prod after a rollout
+(BASE_URL alone).
 """
 
 import os
@@ -65,11 +69,13 @@ def create(s, text):
     return r.json()
 
 
+@pytest.mark.smoke
 def test_healthz():
     r = requests.get(BASE + "/healthz", timeout=TIMEOUT)
     assert r.status_code == 200 and r.json() == {"status": "ok"}
 
 
+@pytest.mark.smoke
 def test_plain_http_redirects_to_https():
     parts = urlsplit(BASE)
     if parts.scheme != "https":
@@ -80,6 +86,7 @@ def test_plain_http_redirects_to_https():
     assert r.headers["Location"].startswith("https://")
 
 
+@pytest.mark.smoke
 def test_transport_security_headers():
     r = requests.get(BASE + "/accounts/login/", timeout=TIMEOUT)
     assert "max-age=31536000" in r.headers.get("Strict-Transport-Security", "")
@@ -89,6 +96,7 @@ def test_transport_security_headers():
     assert csrf.secure
 
 
+@pytest.mark.smoke
 def test_static_assets_served():
     r = requests.get(BASE + "/accounts/login/", timeout=TIMEOUT)
     href = re.search(r'href="(/static/[^"]+\.css)"', r.text).group(1)
@@ -98,10 +106,17 @@ def test_static_assets_served():
     assert "Access-Control-Allow-Origin" not in asset.headers
 
 
+@pytest.mark.smoke
 def test_anonymous_access_is_refused():
     r = requests.get(BASE + "/notes/", allow_redirects=False, timeout=TIMEOUT)
     assert r.status_code == 302 and "/accounts/login/" in r.headers["Location"]
     assert requests.get(BASE + "/api/notes/", timeout=TIMEOUT).status_code == 401
+
+
+@pytest.mark.smoke
+def test_anonymous_write_is_refused():
+    r = new_session().post(BASE + "/api/notes/", json={"text": "x"}, timeout=TIMEOUT)
+    assert r.status_code in (401, 403)
 
 
 def test_wrong_password_is_refused():

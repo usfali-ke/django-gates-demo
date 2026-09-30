@@ -30,6 +30,7 @@ CONTROLS = {
     "build": ("1-build", None, None),
     "unit-tests": ("1-build", None, None),
     "coverage": ("1-build", None, None),
+    "code-quality": ("1-build", None, None),
     "sast-semgrep": ("2-static", "semgrep.json", "Semgrep JSON Report"),
     "secrets-gitleaks": ("2-static", "gitleaks.json", "Gitleaks Scan"),
     "secrets-trufflehog": ("2-static", "trufflehog.jsonl", "Trufflehog Scan"),
@@ -50,8 +51,14 @@ CONTROLS = {
     "provenance": ("R1-verify", None, None),
     "evidence-check": ("R1-verify", None, None),
     "config": ("R1-verify", "checkov/results_json.json", "Checkov Scan"),
+    "previous-env-tests": ("R1-verify", None, None),
+    "release-notes": ("R1-verify", None, None),
+    "rollback-plan": ("R1-verify", None, None),
+    "approve-staging": ("R2-approve", None, None),
     "deploy": ("R3-deploy", None, None),
     "post-deploy": ("R4-verify", None, None),
+    "dependency-check": ("R5-test", None, None),
+    "smoke": ("R5-test", None, None),
 }
 
 

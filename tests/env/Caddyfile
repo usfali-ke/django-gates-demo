@@ -1,0 +1,19 @@
+# The environments' stand-in ingress, run by the release's env-tests job
+# on the self-hosted runner: TLS (a throwaway internal CA, as in preprod)
+# in front of a `kubectl port-forward` to the pod under test on
+# 127.0.0.1:18000. The kind cluster has no ingress of its own, so this is
+# what the functional and smoke tests, k6, nuclei and testssl.sh talk to.
+# High ports: it runs on the runner's host network, next to whatever else
+# the host serves.
+{
+	admin off
+	skip_install_trust
+	default_sni localhost
+	http_port 18480
+	https_port 18443
+}
+
+localhost {
+	tls internal
+	reverse_proxy 127.0.0.1:18000
+}

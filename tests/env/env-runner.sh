@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Registers and runs the environment test runner for one job
+# (README: "Environment test runner"):
+#
+#     GH_TOKEN=... bash tests/env/env-runner.sh [runner dir]
+#
+# The runner dir holds an unpacked actions/runner release (default
+# ~/actions-runner-env). The runner runs as the env-tester ServiceAccount,
+# with a 2-hour token in a kubeconfig only this user can read; GH_TOKEN
+# (repo admin) is used for the registration token and not passed on.
+set -euo pipefail
+
+repo=usfali-ke/django-gates-demo
+dir=${1:-$HOME/actions-runner-env}
+kubeconfig=$HOME/.kube/env-tester.json
+
+[ -x "$dir/config.sh" ] || { echo "no actions runner in $dir" >&2; exit 1; }
+
+umask 077
+mkdir -p "$(dirname "$kubeconfig")"
+token=$(kubectl -n django-gates-demo-tools create token env-tester --duration=2h)
+kubectl config view --minify --raw -o json \
+  | jq --arg t "$token" '.users[0].user = {token: $t} | .contexts[0].context.namespace = "django-gates-demo-tools"' \
+  > "$kubeconfig"
+unset token
+
+registration=$(curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is not set}" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/${repo}/actions/runners/registration-token" | jq -r .token)
+
+cd "$dir"
+./config.sh --unattended --replace --ephemeral --url "https://github.com/${repo}" \
+  --name "env-$(hostname -s)" --labels django-gates-demo-env --token "$registration"
+unset registration
+exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" ./run.sh

@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import tomllib
 
 # The only XML parsed here is JUnit/coverage output from this job's own
 # pytest run. The runner's Python links expat >= 2.4.1, so ElementTree
@@ -42,6 +43,10 @@ import findings
 
 env = os.environ.get
 CONTROL = env("CONTROL", "")
+# The control whose accepted-risk entries apply: another run of the same
+# scan (e.g. the release's dependency re-check of image-scan's image)
+# takes the same exceptions, not a register of its own.
+RISK_CONTROL = env("RISK_CONTROL") or CONTROL
 _applied = []
 _findings = []
 _state = {"kind": None}
@@ -99,7 +104,7 @@ def accepted(finding_id, text="", fixed=False, record=True):
     register = load(env("ACCEPTED_RISKS", "security/accepted-risks.json")) or {}
     today = dt.date.today().isoformat()
     for entry in register.get("accepted", []):
-        if entry.get("control") != CONTROL or entry.get("id") != finding_id:
+        if entry.get("control") != RISK_CONTROL or entry.get("id") != finding_id:
             continue
         if entry.get("match") and entry["match"] not in text:
             continue
@@ -525,6 +530,32 @@ def kubeconform(path):
     return ok, f"{os.path.dirname(kustomization)} render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)", None
 
 
+# --- code quality -----------------------------------------------------------
+
+
+def ruff(path):
+    """Every finding blocks: the threshold is the rule set and mccabe
+    max-complexity in pyproject.toml [tool.ruff.lint], quoted in the detail
+    so the evidence says what "met" meant."""
+    report = load(path)
+    if report is None:
+        return missing("ruff")
+    with open(env("PYPROJECT", "pyproject.toml"), "rb") as f:
+        lint = tomllib.load(f).get("tool", {}).get("ruff", {}).get("lint", {})
+    limit = lint.get("mccabe", {}).get("max-complexity")
+    root = os.getcwd() + os.sep
+    worst = 0
+    for r in report:
+        file = r["filename"].removeprefix(root)
+        m = re.search(r"\((\d+) > \d+\)", r["message"]) if r["code"] == "C901" else None
+        worst = max(worst, int(m.group(1))) if m else worst
+        found("medium", r["code"], r["message"], blocking=True, file=file, line=r["location"]["row"], url=r.get("url"))
+    rules = summarize(report, lambda r: f"{r['code']} ({r['filename'].removeprefix(root)}:{r['location']['row']})", 6)
+    detail = (f"{len(report)} finding(s) vs threshold 0 (rules {','.join(lint.get('select', []))}; "
+              f"function complexity <= {limit}){': ' + rules if rules else ''}")
+    return not report, detail, {"findings": len(report), "max_complexity_allowed": limit, "worst_complexity_over": worst or None}
+
+
 # --- generic ----------------------------------------------------------------
 
 
@@ -538,7 +569,7 @@ def result(status, detail):
 CHECKS = {f.__name__.replace("_", "-"): f for f in (
     reviewers, commits, tests, coverage, semgrep, gitleaks, trufflehog,
     build, trivy_fs, checkov, trivy, sbom, signed,
-    dockle, django_check, k6, nuclei, testssl, kubeconform, result,
+    dockle, django_check, k6, nuclei, testssl, kubeconform, ruff, result,
 )}
 
 

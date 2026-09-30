@@ -148,44 +148,68 @@ The digest the pipeline built and signed moves dev → staging → prod. It is
 never rebuilt. Each environment gets its gates around its own deploy:
 
 ```
-dev ───── R1 this commit's image → G5(dev) → deploy/dev → G6(dev)
-staging ─ R1 the digest G6 verified in dev → G5(staging) → deploy/staging
-          → G6(staging) → G3 against staging (functional · k6 · nuclei · testssl)
-prod ──── R1 the digest G6 verified in staging → G4 → G5(prod)
-          → deploy/prod (canary) → G6(prod)
+Build & unit tests (devsecops-pipeline, every push)
+  G1 build · unit tests · SAST · code quality (ruff) · package
+  G2/G3 on the image → publish → evidence → dispatches the dev release
+dev ───── R1 this commit's image · rollback plan → G5(dev) → deploy/dev
+          → G6(dev) → G3 in dev (integration · nuclei · dependency re-check)
+staging ─ R1 the digest G6 verified in dev · dev's G3 passed · release notes
+          · rollback plan → staging-approval → G5(staging) → deploy/staging
+          → G6(staging) → G3 in staging (functional · k6 · nuclei · testssl)
+prod ──── R1 the digest G6 verified in staging · staging's G3 passed
+          · release notes · rollback plan → G4 (release-approval · change
+          window · UAT sign-off · Go/No-Go) → G5(prod) → deploy/prod
+          (canary) → G6(prod) + smoke tests
 ```
 
 - **R1** for every environment: signature + SBOM + SLSA provenance for the
   commit that built the digest; the evidence attestation (the pipeline's G2
   and preprod G3 passed); the target overlay is schema-valid and
-  checkov-clean, and only its digest changes.
-- **G4** (prod only): the `release-approval` environment (approver ≠
-  whoever started or re-ran the run), and the dashboard's decision on the
-  change. That decision includes *G3 passed in staging for this digest*.
+  checkov-clean, and only its digest changes. Also:
+  - *previous environment's tests*: staging and prod verify the release
+    record the previous environment's run attested to the digest, and
+    need its G3 to have passed;
+  - *release notes*: the pull requests and commits since the digest the
+    target environment runs now (job summary and `release-notes.md`);
+  - *rollback plan*: the digest running now (or, on a redeploy, the one it
+    replaced) is still signed and still in the registry. The deploy
+    commit records it as `Rollback-Digest`.
+- **Staging approval**: the `staging-approval` environment. The approver
+  can't be whoever started or re-ran the run.
+- **G4** (prod only): the `release-approval` environment (same rule), and
+  the dashboard's decision on the change. That decision includes *G3
+  passed in staging for this digest* and *UAT signed off after it*.
 - **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
-  trailers (`Environment`, `Image-Digest`, `Source-Commit`) are what the
-  next environment's R1 reads, together with the `security-dashboard/G6`
-  status on that commit.
+  trailers (`Environment`, `Image-Digest`, `Source-Commit`,
+  `Rollback-Digest`, `Rollback-Source`) are what the next environment's R1
+  reads, together with the `security-dashboard/G6/<env>` status on that
+  commit.
 - **Evidence:** every run leaves a `release-evidence` bundle, attested to
   the digest once something was deployed.
 
 How to promote:
 
-1. Push to main and let **devsecops-pipeline** publish. A push that only
-   touches `deploy/**` or `*.md` doesn't build, so after one, run the
-   pipeline on main by hand.
-2. Actions → **devsecops-release** → `environment: dev`.
-3. Once dev's G6 is green: `environment: staging`. The staging G3 needs the
-   self-hosted runner (below).
-4. For prod, open a **Change request** issue whose change window covers the
-   release. Someone other than you adds `change-approved` and
-   `readiness-approved`. Then run with `environment: prod` and the issue
-   (`7`, `#7` or `CHG-7`). Someone who neither started nor re-ran the run
-   approves `release-approval`.
+1. Push to main. When **devsecops-pipeline** publishes, it starts the dev
+   release for that commit. A push that only touches `deploy/**` or `*.md`
+   doesn't build; after one, run the pipeline on main by hand. To redeploy
+   an older published commit to dev, run the release with
+   `environment: dev` and `commit: <sha>`.
+2. Once dev's G6 and G3 are green: `environment: staging`. Someone who
+   neither started nor re-ran the run approves `staging-approval`.
+3. For prod, open a **Change request** issue whose change window covers the
+   release. Once staging's tests passed, the tester adds `uat-approved`.
+   Someone other than you adds `change-approved` and `readiness-approved`
+   (Go/No-Go). Then run with `environment: prod` and the issue (`7`, `#7`
+   or `CHG-7`). Someone who neither started nor re-ran the run approves
+   `release-approval`.
+
+To roll back, run with `kind: rollback`. It deploys the environment's
+recorded `Rollback-Digest` through the same gates (and, for prod, the same
+change and approval). The dashboard counts it as a rollback.
 
 A promotion refuses to run when:
 - the previous environment's last deploy wasn't made by this workflow;
-- that deploy's G6 isn't green;
+- that deploy's G6 isn't green, or its G3 didn't pass;
 - `deploy/base` or the target overlay changed on main after the run started.
 
 ## One-time cluster setup (run by an operator)
@@ -194,54 +218,43 @@ The Rollout reads `DJANGO_SECRET_KEY` from a Secret, which this repo never
 contains. Each environment needs its own:
 
 ```
-for ns in django-gates-demo-dev django-gates-demo-staging django-gates-demo; do
+for ns in django-gates-demo-dev django-gates-demo-stg django-gates-demo-prod; do
   kubectl -n "$ns" create secret generic django-gates-demo \
     --from-literal=secret-key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(50))')"
 done
 ```
 
 The namespaces, the Argo CD Applications (`django-gates-demo-{dev,staging,prod}`)
-and the staging tester's RBAC are in the security dashboard's
+and the environment tester's RBAC are in the security dashboard's
 `pipeline/k8s/kind/platform`.
 
-### Staging test runner
+### Environment test runner
 
-The staging G3 runs on a self-hosted runner, because GitHub-hosted runners
-can't reach the cluster. The job:
+The tests after each deploy (G3 in dev and staging, the smoke tests in
+prod) run on a self-hosted runner, because GitHub-hosted runners can't
+reach the cluster. The job:
 - finds the pod running the promoted digest;
 - port-forwards it to `127.0.0.1:18000`;
-- creates two random-password users in it (`manage.py ensure_user`, with
-  the password on stdin);
+- outside prod, creates two random-password users in it
+  (`manage.py ensure_user`, with the password on stdin);
 - puts a Caddy TLS proxy on `https://localhost:18443` in front of it
-  (`tests/staging/Caddyfile`).
+  (`tests/env/Caddyfile`).
 
 The runner needs docker, kubectl, git, jq, python3 and curl. `uv` is
-installed by the job.
+installed by the job. It runs as the `env-tester` ServiceAccount
+(`django-gates-demo-tools`), which can list pods and port-forward in
+`django-gates-demo-{dev,stg,prod}` and exec only in dev and stg.
 
-1. Give the runner a short-lived kubeconfig for the `staging-tester`
-   ServiceAccount. It can list pods, port-forward and exec in
-   `django-gates-demo-staging`, and nothing else. For example:
-
-   ```
-   token=$(kubectl -n django-gates-demo-staging create token staging-tester --duration=2h)
-   kubectl config view --minify --raw -o json \
-     | jq --arg t "$token" '.users[0].user = {token: $t} | .contexts[0].context.namespace = "django-gates-demo-staging"' \
-     > ~/.kube/staging-tester.json && chmod 600 ~/.kube/staging-tester.json
-   unset token
-   ```
-
-   Start the runner with `KUBECONFIG=~/.kube/staging-tester.json`.
-2. Register it as **ephemeral**, so one registration serves one job:
-
-   ```
-   ./config.sh --url https://github.com/usfali-ke/django-gates-demo --ephemeral \
-     --labels django-gates-demo-staging --token <registration token from Settings → Actions → Runners>
-   KUBECONFIG=~/.kube/staging-tester.json ./run.sh
-   ```
+`bash tests/env/env-runner.sh [runner dir]` does the setup: it mints a 2-hour
+token for `env-tester`, writes a kubeconfig with it (mode 0600), registers
+the runner as **ephemeral** (one registration serves one job) with the
+label `django-gates-demo-env`, and runs it. It needs `GH_TOKEN` with
+admin rights on the repo, for the registration token. Start it before each
+release run, or keep it in a loop while you promote.
 
 This repo is public, so a pull request from a fork could try to run on a
 self-hosted runner. To prevent that:
-- keep the runner registered only while a staging promotion runs;
+- keep the runner registered only while a promotion runs;
 - keep *Settings → Actions → Fork pull request workflows → Require
   approval for all external contributors* on. The pipeline itself never
   targets this label.

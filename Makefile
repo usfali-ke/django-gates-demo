@@ -22,6 +22,7 @@ TRIVY      := $(call pin,TRIVY)
 CHECKOV    := $(call pin,CHECKOV)
 DOCKLE     := $(call pin,DOCKLE)
 IMAGE_TAG  := django-gates-demo:local
+SRC_DIRS   := $(call pin,SRC_DIRS)
 
 # As you, so reports aren't root-owned; tools that want a home get /tmp.
 RUN     := docker run --rm --user $(shell id -u):$(shell id -g) -e HOME=/tmp
@@ -29,7 +30,7 @@ VERDICT  = CONTROL=$@ VERDICT_FILE=reports/$@/verdict.json TOOL="$(1) (make)" py
 # verdict, then the tool's report ($(1)), exiting with the verdict's status
 SHOW     = ; rc=$$?; python3 .github/scripts/findings.py native reports/$@/$(1); exit $$rc
 
-STATIC := sast-semgrep secrets-gitleaks secrets-trufflehog sca-trivy iac-checkov
+STATIC := code-quality sast-semgrep secrets-gitleaks secrets-trufflehog sca-trivy iac-checkov
 IMAGE  := image-scan image-compliance django-deploy-check
 
 .PHONY: scan scan-image image pre-commit-secrets $(STATIC) $(IMAGE)
@@ -40,6 +41,12 @@ scan:
 
 scan-image: image
 	@rc=0; for t in $(IMAGE); do $(MAKE) --no-print-directory $$t || rc=1; done; exit $$rc
+
+code-quality:
+	@mkdir -p reports/$@
+	@uv run --frozen ruff check --output-format json $(SRC_DIRS) tests > reports/$@/ruff.json || true
+	@uv run --frozen ruff check --output-format concise $(SRC_DIRS) tests > reports/$@/ruff.txt || true
+	@NATIVE=ruff.txt $(call VERDICT,ruff) ruff reports/$@/ruff.json $(call SHOW,ruff.txt)
 
 sast-semgrep:
 	@mkdir -p reports/$@
