@@ -491,6 +491,10 @@ jobs:
     # The only write path to the cluster: a commit on main that Argo CD
     # syncs. [skip ci] + paths-ignore keep it from re-running the pipeline.
     needs: [resolve, gate-g5]
+    # A status function is required: g4 (prod only) is skipped for dev and
+    # staging, and the implicit success() also fails on a skipped ancestor,
+    # which would skip the deploy for every non-prod environment.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.gate-g5.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -586,6 +590,8 @@ jobs:
     # in the description. A GitHub-hosted runner can't see the cluster, so
     # this is how the promotion learns the outcome.
     needs: [deploy]
+    # Same as deploy: the skipped g4 ancestor must not skip this job.
+    if: ${{ !cancelled() && needs.deploy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
@@ -644,7 +650,7 @@ jobs:
     # supplies KUBECONFIG, scoped to port-forward and exec in the staging
     # namespace; the repo holds no cluster credential.
     needs: [resolve, post-deploy]
-    if: inputs.environment == 'staging' && needs.post-deploy.result == 'success'
+    if: ${{ !cancelled() && inputs.environment == 'staging' && needs.post-deploy.result == 'success' }}
     runs-on: [self-hosted, linux, django-gates-demo-stg]
     timeout-minutes: 45
     permissions:
