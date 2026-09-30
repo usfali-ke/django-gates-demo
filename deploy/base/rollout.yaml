@@ -57,6 +57,11 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+              # The API server defaults this to TCP. Left out of git, the live
+              # Rollout always differs from the render, so every Argo CD app
+              # stays OutOfSync and re-syncs on every commit to main - one
+              # deploy commit then yields a G6 for all three environments.
+              protocol: TCP
           env:
             - name: DJANGO_SECRET_KEY
               valueFrom:
