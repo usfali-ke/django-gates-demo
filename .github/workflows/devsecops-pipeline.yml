@@ -981,6 +981,9 @@ jobs:
           pattern: gate-*
           path: ${{ runner.temp }}/in
       - name: Bundle + hash manifest
+        env:
+          # G2's `record` (a lone gate artifact downloads without its folder)
+          GATE_RECORDED: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         run: |
           set -euo pipefail
           CONTROLS=$(tr -d ' \n' <<<"$CONTROLS") python3 .github/scripts/evidence.py "$RUNNER_TEMP/in" evidence

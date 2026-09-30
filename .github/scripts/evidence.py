@@ -7,6 +7,11 @@ reports: a release stage names them `report-<env>-<control>`, because one
 release run deploys to dev, staging and prod and every environment runs
 the same controls.
 
+download-artifact extracts an artifact into its own folder only when a
+pattern matches several; a lone gate artifact lands as <dir>/gate-result.json.
+GATE_RECORDED ('true'/'false', default 'true') says whether that one was
+uploaded as gate-result-* (recorded) or gate-preview-*.
+
 Writes into <out dir>:
   manifest.json  what ran, what it decided, and the sha256 of every report
                  file — the predicate cosign attests to the image digest,
@@ -107,11 +112,12 @@ def main():
         controls.append(entry)
 
     gates = {}
-    for folder in sorted(src.glob("gate-*-G*")):
-        path = folder / "gate-result.json"
+    found = [(f / "gate-result.json", f.name.startswith("gate-result-")) for f in sorted(src.glob("gate-*-G*"))]
+    found.append((src / "gate-result.json", (e("GATE_RECORDED") or "true") == "true"))
+    for path, recorded in found:
         if path.is_file():
             g = json.loads(path.read_text())
-            gates[g["gate"]] = {"status": g["status"], "recorded": folder.name.startswith("gate-result-"), "criteria": {c["key"]: c["status"] for c in g["criteria"]}}
+            gates[g["gate"]] = {"status": g["status"], "recorded": recorded, "criteria": {c["key"]: c["status"] for c in g["criteria"]}}
             shutil.copy(path, out / f"gate-result-{g['gate']}.json")
 
     run_url = f"{e('GITHUB_SERVER_URL')}/{e('GITHUB_REPOSITORY')}/actions/runs/{e('GITHUB_RUN_ID')}"
