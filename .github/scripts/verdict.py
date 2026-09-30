@@ -503,7 +503,7 @@ def testssl(path):
         if f["severity"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL", "FATAL"):
             found("high" if f["severity"] == "FATAL" else f["severity"], f.get("id", ""),
                   ("testssl.sh could not test this: " if f["severity"] == "FATAL" else "") + first_line(f.get("finding")),
-                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where="https://localhost (preprod TLS proxy)")
+                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where=os.environ.get("TARGET_URL") or "https://localhost:18443 (environment TLS proxy)")
         if not a:
             kept.append(f)
     blocking = [f for f in kept if f["severity"] in ("HIGH", "CRITICAL")]
@@ -556,6 +556,34 @@ def ruff(path):
     return not report, detail, {"findings": len(report), "max_complexity_allowed": limit, "worst_complexity_over": worst or None}
 
 
+def health(path):
+    """The prod health watch after the rollout (devsecops-stage.yml): every
+    /healthz probe answered 200, their p95 latency within SLO_P95_MS, and no
+    container of the app restarted while it was watched."""
+    report = load(path)
+    if report is None:
+        return missing("health watch")
+    probes = report.get("probes") or []
+    if not probes:
+        return False, "health watch recorded no probes", None
+    slo = float(env("SLO_P95_MS", "500"))
+    bad = [p for p in probes if p.get("code") != 200]
+    ms = sorted(float(p.get("ms") or 0) for p in probes)
+    p95 = ms[max(0, round(0.95 * len(ms)) - 1)]
+    before, after = report.get("restarts_before") or {}, report.get("restarts_after") or {}
+    restarted = sorted(k for k, n in after.items() if n > before.get(k, n))
+    for p in bad[:20]:
+        found("high", "healthz", f"/healthz answered {p.get('code') or 'no response'} at {p.get('at')}", blocking=True)
+    for k in restarted:
+        found("high", "restart", f"container {k} restarted during the watch ({before.get(k)} → {after.get(k)})", blocking=True)
+    if p95 > slo:
+        found("medium", "latency", f"/healthz p95 {p95:.0f} ms > SLO {slo:.0f} ms", blocking=True)
+    ok = not bad and not restarted and p95 <= slo
+    detail = (f"{len(probes) - len(bad)}/{len(probes)} probes healthy over {report.get('seconds')} s, p95 {p95:.0f} ms "
+              f"(SLO {slo:.0f} ms), {len(restarted)} restart(s) across {len(after)} container(s)")
+    return ok, detail, {"probes": len(probes), "failed_probes": len(bad), "p95_ms": round(p95), "restarts": len(restarted)}
+
+
 # --- generic ----------------------------------------------------------------
 
 
@@ -569,7 +597,7 @@ def result(status, detail):
 CHECKS = {f.__name__.replace("_", "-"): f for f in (
     reviewers, commits, tests, coverage, semgrep, gitleaks, trufflehog,
     build, trivy_fs, checkov, trivy, sbom, signed,
-    dockle, django_check, k6, nuclei, testssl, kubeconform, ruff, result,
+    dockle, django_check, k6, nuclei, testssl, kubeconform, ruff, health, result,
 )}
 
 

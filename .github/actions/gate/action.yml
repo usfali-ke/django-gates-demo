@@ -3,13 +3,15 @@ description: >
   Combines this run's control verdicts into one gate decision
   (.github/scripts/gate.py lists which control job answers which
   criterion), writes it to the job summary, uploads it as artifact
-  `gate-result-<GATE>` when `record` is true — the security dashboard
+  `gate-result-<GATE>` (release stages: `gate-result-<GATE>-<env>`, since
+  one release run records the same gate in several environments) when
+  `record` is true — the security dashboard
   pulls it, since GitHub-hosted runners can't reach the dashboard — and
   fails unless the gate passed, which stops every later stage.
 
 inputs:
   gate:
-    description: G1 | G2 | G3 | G5
+    description: G1 | G2 | G3 | G5 | G6
     required: true
   needs:
     description: toJSON(needs) of the calling job (or toJSON(steps), see gate.py)
@@ -34,6 +36,9 @@ inputs:
     default: ""
   started-at:
     description: ISO-8601; defaults to now
+    default: ""
+  name-suffix:
+    description: Appended to the artifact name (`-<env>` in a release stage)
     default: ""
 
 outputs:
@@ -60,12 +65,12 @@ runs:
       run: |
         mkdir -p "$RUNNER_TEMP/gate"
         python3 .github/scripts/gate.py "$GATE" "$RUNNER_TEMP/gate/gate-result.json"
-    # Not recorded (e.g. G2/G3 on a pull request, whose image is never
+    # Not recorded (e.g. G2 on a pull request, whose image is never
     # published): kept as `gate-preview-<GATE>` for the evidence bundle,
     # a name the dashboard doesn't collect.
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: gate-${{ inputs.record == 'true' && 'result' || 'preview' }}-${{ inputs.gate }}
+        name: gate-${{ inputs.record == 'true' && 'result' || 'preview' }}-${{ inputs.gate }}${{ inputs.name-suffix }}
         path: ${{ runner.temp }}/gate/gate-result.json
         overwrite: true
         retention-days: 90

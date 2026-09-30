@@ -1,1284 +1,224 @@
-# Promotion: one run per environment, the same digest all the way.
+# The release pipeline: every dynamic test runs against an environment
+# AFTER the new digest is deployed to it, never against a build.
 #
-#   dev      the digest devsecops-pipeline.yml built and signed from a main
-#            commit; the pipeline dispatches this for every push to main it
-#            published (input `commit`), so dev follows main
-#   staging  the digest running in dev, once G6 verified it there and G3
-#            passed against it there
-#   prod     the digest running in staging, once G6 verified it and G3
-#            passed against it there, and only after G4
-#   rollback (kind) the digest the environment ran before its last deploy:
-#            that deploy commit's Rollback-Digest trailer
+#   devsecops-pipeline (CI)                   1 Build & unit tests, SAST,
+#     └ Control Gate (G2) ──── starts ──▶       code quality, package
+#   dev      2 Deploy to Dev                  integration tests · DAST ·
+#     │                                       dependency re-check (G3)
+#     ▼ Approval Gate `staging-approval`      test results, security scans,
+#                                             release notes
+#   staging  3 Deploy to Staging              end-to-end · performance ·
+#     │                                       DAST (G3) · UAT
+#     ▼ Approval Gate `release-approval` + G4 UAT sign-off, test results,
+#                                             Go/No-Go, change window
+#   prod     4 Deploy to Production           smoke · health watch (G6) ·
+#                                             rollback plan; a failure after
+#                                             the deploy starts the rollback
+#   feedback Monitoring, logging & feedback   summary, change request + PR
+#                                             comments, rollback command
 #
-# Each run, in order:
+# Each stage is devsecops-stage.yml for one environment (resolve → verify →
+# approve → G5 → deploy → G6 → tests → evidence), and each passes the next
+# the digest it deployed: staging and prod refuse to run if the previous
+# environment has moved on to a newer release since.
 #
-#   R1 resolve   which digest this environment may get (above) → `promotion`
-#   R1 verify    signature + SBOM + SLSA provenance (for the commit that
-#                built it) · evidence attestation (the pipeline's G2 + G3
-#                passed for this digest) · target config (deploy/<env>):
-#                schema-valid, checkov-clean, only the digest changes ·
-#                rollback target (what runs now: still signed and pullable)
-#                staging/prod also: G3 passed in the previous environment
-#                (its signed release record) · release notes (every change
-#                since what the environment runs now)
-#   R2 approve   staging: protected environment `staging-approval` (a
-#                human who didn't start or re-run this run)
-#                prod: G4 — `release-approval` (same rule) AND the security
-#                dashboard's decision on the change record: change + Go/No-Go
-#                (readiness) approved, UAT signed off after staging's G3 for
-#                this digest, inside the change window
-#   G5           deployment gate for this environment, BEFORE anything is
-#                committed: provenance, config, promotion path, rollback
-#                plan (+ previous environment's tests, notes, approval)
-#   R3 deploy    the digest committed to deploy/<env> (GitOps)
-#   R4 verify    wait for the dashboard's `security-dashboard/G6/<env>`
-#                status on the deploy commit (Argo CD sync + canary analysis
-#                + Kyverno)
-#   R5 test      against the deployed environment, on the self-hosted runner
-#                (a GitHub-hosted runner can't reach the cluster):
-#                dev G3 · integration tests, nuclei, dependency re-check
-#                staging G3 · functional, k6, nuclei, testssl.sh
-#                prod G6 · read-only smoke tests
-#   R6 evidence  every report + hash manifest → artifact `release-evidence`
-#                (90 days); after a deploy, attested to the image digest
+# The pipeline starts a run at dev for every main commit it published.
+# Start one by hand at any stage (Actions → devsecops-release → Run
+# workflow): `start: staging` promotes what dev runs, `start: prod` what
+# staging runs; `kind: rollback` redeploys the start environment's previous
+# digest and stops there. prod needs the change request (input `change`,
+# or the one whose Release field names the commit), and whoever started,
+# re-ran or authored the change can't approve a stage.
 #
-# Start staging and prod from main: Actions → devsecops-release → Run
-# workflow. prod also needs the change request (7, #7 or CHG-7), and
-# whoever starts (or re-runs) a staging or prod run can't be the one who
-# approves it. Nothing here talks to the cluster except the environment
-# tests: a deploy is a commit that Argo CD syncs.
+# Waiting at an Approval Gate holds nothing up: a newer run's deploy to the
+# same environment waits for this one's (concurrency per environment in
+# devsecops-stage.yml), and if a newer run is already waiting there too,
+# GitHub cancels the older waiting run's deploy.
 
 name: devsecops-release
+run-name: >-
+  release ${{ inputs.commit && format('{0} ', inputs.commit) || '' }}from ${{ inputs.start }} (${{ inputs.kind }})
 
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: Environment to promote to
+      start:
+        description: Stage to start from (dev = a main commit's image; staging/prod = what the previous environment runs)
         required: true
         type: choice
         options: [dev, staging, prod]
-      change:
-        description: prod only — change request being released (issue 7, #7 or CHG-7)
-        required: false
-        type: string
+        default: dev
       kind:
-        description: Deployment kind (rollback = back to the digest before this environment's last deploy)
+        description: Deployment kind (rollback = the start environment's digest before its last deploy, that stage only)
         required: true
         type: choice
         options: [planned, hotfix, fix_forward, rollback]
         default: planned
       commit:
-        description: dev only — the main commit whose image to deploy (default the commit this runs on)
+        description: start dev only — the main commit whose image to deploy (default the commit this runs on)
+        required: false
+        type: string
+      change:
+        description: prod — change request being released (7, #7 or CHG-7); default the one whose Release field names this release
         required: false
         type: string
 
 permissions: {}
 
-# One promotion per environment at a time (a staging run waiting for its
-# approval doesn't hold up dev). Each ends in a push to main, retried if
-# another environment's deploy commit landed first.
-concurrency:
-  group: devsecops-release-${{ inputs.environment }}
-  cancel-in-progress: false
-
-env:
-  IMAGE: ghcr.io/usfali-ke/django-gates-demo
-  TARGET_ENV: ${{ inputs.environment }}
-  KUSTOMIZATION: deploy/${{ inputs.environment }}/kustomization.yaml
-  KIND: ${{ inputs.kind }}
-  # Only the pipeline on main signs releasable images.
-  CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
-  CERT_ISSUER: https://token.actions.githubusercontent.com
-  EVIDENCE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
-  RELEASE_EVIDENCE_TYPE: https://github.com/${{ github.repository }}/release-evidence/v1
-  RELEASE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-release.yml@refs/heads/main
-  CHECKOV: bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
-  KUBECONFORM: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
-  UV_VERSION: "0.12.19"
-
 jobs:
-  resolve:
-    name: R1 resolve the digest for ${{ inputs.environment }}
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      packages: read
-      issues: read
-      statuses: read
-    outputs:
-      change-id: ${{ steps.change.outputs.id }}
-      digest: ${{ steps.digest.outputs.digest }}
-      source-sha: ${{ steps.digest.outputs.source }}
-      started-at: ${{ steps.digest.outputs.at }}
-      promotion: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: promotion
-      OUT: reports/promotion
-      VERDICT_FILE: reports/promotion/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: change
-        if: inputs.environment == 'prod'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CHANGE: ${{ inputs.change }}
-        # Fails before anyone is asked to approve. The dashboard's G4 still
-        # decides (approver ≠ author, UAT after staging's G3, change
-        # window); this only refuses a request that can't pass.
-        run: |
-          set -euo pipefail
-          n=$(sed -E 's/^[[:space:]]*(#|[Cc][Hh][Gg]-)?//; s/[[:space:]]*$//' <<<"$CHANGE")
-          [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::prod needs a change request: '${CHANGE}' isn't an issue number (7, #7 or CHG-7)"; exit 1; }
-          if ! issue=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${n}" 2>/dev/null); then
-            echo "::error::CHG-${n}: issue #${n} doesn't exist — open one with the Change request form"; exit 1
-          fi
-          problems=$(jq -r '[
-              (if .pull_request then "#\(.number) is a pull request, not a change request" else empty end),
-              (if .state != "open" then "#\(.number) is \(.state)" else empty end),
-              ([.labels[].name] as $l | ("change","change-approved","readiness-approved","uat-approved") | select(. as $x | $l | index($x) | not) | "missing label \(.)")
-            ] | join("; ")' <<<"$issue")
-          [ -z "$problems" ] || { echo "::error::CHG-${n}: ${problems}"; exit 1; }
-          echo "id=CHG-${n}" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: digest
-        env:
-          GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ inputs.commit }}
-        # dev takes a main commit's image. staging and prod take what the
-        # previous environment runs: the digest in its kustomization, and
-        # the commit that built it from the deploy commit's Source-Commit
-        # trailer (provenance and evidence-check verify both against the
-        # signatures, so a hand-edited trailer can't pass). That deploy
-        # commit must carry a successful G6 for the previous environment.
-        # A rollback takes the digest this environment ran before its last
-        # deploy (Rollback-Digest/-Source, recorded by that deploy).
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT"
-          at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          fail() { { echo "status=fail"; echo "detail=$1"; echo "at=$at"; } >> "$GITHUB_OUTPUT"; exit 0; }
-          last_deploy() { deploy_sha=$(git log -1 --format=%H -- "deploy/$1/kustomization.yaml"); }
-          trailer() { git log -1 --format="%(trailers:key=$1,valueonly)" "$deploy_sha" | head -1 | tr -d '[:space:]'; }
-          [ -z "$COMMIT" ] || [ "$TARGET_ENV" = dev ] || fail "input commit is for dev only; ${TARGET_ENV} takes what the previous environment runs"
-          if [ "$KIND" = rollback ]; then
-            last_deploy "$TARGET_ENV"
-            [ "$(trailer Environment)" = "$TARGET_ENV" ] \
-              || fail "${KUSTOMIZATION} was last changed by ${deploy_sha:0:7}, which isn't a ${TARGET_ENV} deploy by this workflow: nothing to roll back"
-            digest=$(trailer Rollback-Digest)
-            source=$(trailer Rollback-Source)
-            [ -n "$digest" ] && [ -n "$source" ] || fail "${deploy_sha:0:7} records no rollback target (no Rollback-Digest/Rollback-Source trailer)"
-            git cat-file -e "${source}^{commit}" 2>/dev/null || fail "Rollback-Source ${source:0:7} of ${deploy_sha:0:7} isn't in this repository"
-            detail="rollback: ${TARGET_ENV} gets ${digest:0:19}… (built from ${source:0:7}) back, the digest it ran before ${deploy_sha:0:7}"
-          else
-            case "$TARGET_ENV" in
-              dev)
-                source=${COMMIT:-$GITHUB_SHA}
-                [[ "$source" =~ ^[0-9a-f]{40}$ ]] || fail "commit '${source}' isn't a full commit SHA"
-                git merge-base --is-ancestor "$source" "$GITHUB_SHA" 2>/dev/null || fail "${source:0:12} isn't a commit on main"
-                digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE}:sha-${source}" 2>/dev/null) || digest=""
-                [ -n "$digest" ] || fail "no image ${IMAGE}:sha-${source}: devsecops-pipeline didn't publish that commit (a gate failed, or it hasn't finished)"
-                detail="dev gets the digest devsecops-pipeline built from ${source:0:7}" ;;
-              staging|prod)
-                prev=$([ "$TARGET_ENV" = staging ] && echo dev || echo staging)
-                file="deploy/${prev}/kustomization.yaml"
-                last_deploy "$prev"
-                digest=$(git show "${deploy_sha}:${file}" | sed -nE 's/^    digest: (sha256:[0-9a-f]{64})$/\1/p')
-                source=$(trailer Source-Commit)
-                [ "$(trailer Environment)" = "$prev" ] && [ -n "$source" ] && [ "$(trailer Image-Digest)" = "$digest" ] \
-                  || fail "${file} was last changed by ${deploy_sha:0:7}, which isn't a ${prev} deploy by this workflow: promote to ${prev} first"
-                git cat-file -e "${source}^{commit}" 2>/dev/null || fail "Source-Commit ${source:0:7} of ${deploy_sha:0:7} isn't in this repository"
-                # Each environment has its own context: one deploy commit
-                # can carry G6 for several (they all track main).
-                g6=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${deploy_sha}/statuses?per_page=100" \
-                       --jq "[.[] | select(.context == \"security-dashboard/G6/${prev}\")][0] // empty" 2>/dev/null) || g6=""
-                state=$(jq -r '.state // empty' <<<"${g6:-null}")
-                desc=$(jq -r '.description // ""' <<<"${g6:-null}")
-                [ "$state" = success ] || fail "${digest:0:19}… isn't verified in ${prev}: security-dashboard/G6/${prev} on ${deploy_sha:0:7} is '${state:-missing}' ${desc}"
-                detail="${TARGET_ENV} gets ${digest:0:19}… (built from ${source:0:7}), running in ${prev} since ${deploy_sha:0:7} with G6 verified (${desc})" ;;
-            esac
-          fi
-          detail="$detail; deploys only as a GitOps commit to deploy/${TARGET_ENV} by devsecops-release.yml on main (Argo CD django-gates-demo-${TARGET_ENV})"
-          { echo "status=pass"; echo "detail=$detail"; echo "digest=$digest"; echo "source=$source"; echo "at=$at"; } >> "$GITHUB_OUTPUT"
-          echo "Promoting \`${IMAGE}@${digest}\` to **${TARGET_ENV}** (built from ${source:0:7}, ${KIND})" >> "$GITHUB_STEP_SUMMARY"
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.digest.outputs.status }}
-          DETAIL: ${{ steps.digest.outputs.detail || 'resolve did not run' }}
-          TOOL: git + GitHub commit statuses
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-promotion
-          path: reports/promotion/
-          if-no-files-found: ignore
-
-  provenance:
-    name: R1 verify · signature, SBOM, SLSA provenance
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
-      attestations: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: provenance
-      OUT: reports/provenance
-      VERDICT_FILE: reports/provenance/verdict.json
-      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: v2.6.5
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # The provenance must name the commit that built this digest — a
-        # valid attestation for some other build of main isn't enough.
-        run: |
-          mkdir -p "$OUT"
-          fail=""
-          id=(--certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER")
-          cosign verify "${id[@]}" "$REF" > "$OUT/signature.json" || fail="$fail signature"
-          cosign verify-attestation "${id[@]}" --type cyclonedx "$REF" > /dev/null || fail="$fail sbom-attestation"
-          if cosign verify-attestation "${id[@]}" --type slsaprovenance1 "$REF" > "$OUT/slsa.jsonl"; then
-            jq -r '.payload | @base64d | fromjson | .predicate.buildDefinition.resolvedDependencies[]?.digest.gitCommit // empty' "$OUT/slsa.jsonl" \
-              | grep -qx "$SOURCE_SHA" || fail="$fail slsa-commit-mismatch"
-          else
-            fail="$fail slsa-attestation"
-          fi
-          gh attestation verify "oci://${REF}" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/devsecops-pipeline.yml" --format json > "$OUT/gh-attestation.json" \
-            || fail="$fail gh-attestation"
-          if [ -z "$fail" ]; then
-            { echo "status=pass"; echo "detail=cosign signature + CycloneDX SBOM + SLSA v1 (commit ${SOURCE_SHA:0:7}) verified for devsecops-pipeline.yml@refs/heads/main; gh attestation verify passed"; } >> "$GITHUB_OUTPUT"
-          else
-            { echo "status=fail"; echo "detail=verification failed:${fail}"; } >> "$GITHUB_OUTPUT"
-          fi
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.check.outputs.status }}
-          DETAIL: ${{ steps.check.outputs.detail || 'verification did not run' }}
-          TOOL: cosign 2.6.5 + gh attestation
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-provenance
-          path: reports/provenance/
-          if-no-files-found: ignore
-
-  evidence-check:
-    name: R1 verify · pipeline evidence (G2 + G3 passed)
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: evidence-check
-      OUT: reports/evidence-check
-      VERDICT_FILE: reports/evidence-check/verdict.json
-      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: v2.6.5
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: check
-        # The signed manifest is the pipeline's own record of this digest:
-        # built from its source commit, every control passed, G2 and G3
-        # (preprod) recorded.
-        run: |
-          mkdir -p "$OUT"
-          if ! cosign verify-attestation --type "$EVIDENCE_TYPE" --certificate-identity "$CERT_IDENTITY" \
-                 --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > "$OUT/attestation.jsonl"; then
-            { echo "status=fail"; echo "detail=no verified evidence attestation ($EVIDENCE_TYPE) on ${DIGEST:0:19}"; } >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          # The newest attestation wins if the pipeline was re-run.
-          jq -s 'map(.payload | @base64d | fromjson | .predicate) | sort_by(.generated_at) | last' "$OUT/attestation.jsonl" > "$OUT/manifest.json"
-          problems=$(jq -r --arg sha "$SOURCE_SHA" --arg digest "$DIGEST" '[
-              (if .commit_sha != $sha then "built from \(.commit_sha[0:7]), not \($sha[0:7])" else empty end),
-              (if .artifact_digest != $digest then "manifest is for \(.artifact_digest)" else empty end),
-              (if .result != "pass" then "pipeline result \(.result) (\(.counts.fail) failed, \(.counts.missing) missing)" else empty end),
-              (.gates as $g | ("G2","G3") | select(($g[.].status // "") != "pass" or ($g[.].recorded // false) != true) | "\(.) not passed+recorded")
-            ] | join("; ")' "$OUT/manifest.json")
-          if [ -z "$problems" ]; then
-            summary=$(jq -r '"\(.counts.pass) controls passed, \(.counts.skipped) skipped; G2 + G3 passed; run \(.run_url)"' "$OUT/manifest.json")
-            { echo "status=pass"; echo "detail=evidence attestation verified: $summary"; } >> "$GITHUB_OUTPUT"
-          else
-            { echo "status=fail"; echo "detail=evidence attestation verified but: $problems"; } >> "$GITHUB_OUTPUT"
-          fi
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.check.outputs.status }}
-          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
-          TOOL: cosign verify-attestation
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-evidence-check
-          path: reports/evidence-check/
-          if-no-files-found: ignore
-
-  config:
-    name: R1 verify · target config (deploy/${{ inputs.environment }})
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: config
-      OUT: reports/config
-      VERDICT_FILE: reports/config/verdict.json
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - id: check
-        # Schema-valid (-strict rejects unknown fields; Rollout and
-        # AnalysisTemplate schemas from the CRDs catalog), no checkov
-        # failures, and the only change vs git is the image digest.
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT"
-          python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST" || exit 0
-          kubectl kustomize "deploy/${TARGET_ENV}" > "$OUT/${TARGET_ENV}.yaml" || exit 0
-          grep -q "image: ${IMAGE}@${DIGEST}" "$OUT/${TARGET_ENV}.yaml" || { echo "::error::render does not reference the promoted digest"; exit 0; }
-          docker run --rm -v "$PWD/$OUT:/render:ro" "$KUBECONFORM" \
-            -strict -summary -output json -schema-location default \
-            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-            "/render/${TARGET_ENV}.yaml" > "$OUT/kubeconform.json"
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
-          mkdir -p "$OUT/checkov"
-          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/${TARGET_ENV}.yaml" > "$OUT/checkov/scan-view.yaml"
-          docker run --rm -v "$PWD/$OUT/checkov:/work" "$CHECKOV" -f /work/scan-view.yaml --framework kubernetes \
-            -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
-          echo "changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
-      - id: verdict
-        if: always()
-        env:
-          RC: ${{ steps.check.outputs.rc }}
-          CHANGED: ${{ steps.check.outputs.changed }}
-          TOOL: kubeconform 0.8.0 + checkov 3.3.20
-        run: |
-          rc=0
-          CONTROL=config-schema OUTPUT=schema VERDICT_FILE="$OUT/kubeconform.verdict.json" \
-            python3 .github/scripts/verdict.py kubeconform "$OUT/kubeconform.json" || rc=1
-          CONTROL=config-checkov OUTPUT=checkov VERDICT_FILE="$OUT/checkov.verdict.json" \
-            python3 .github/scripts/verdict.py checkov "$OUT/checkov/results_json.json" || rc=1
-          status=$([ $rc = 0 ] && echo pass || echo fail)
-          detail="$(jq -r .detail "$OUT/kubeconform.verdict.json" 2>/dev/null) | checkov: $(jq -r .detail "$OUT/checkov.verdict.json" 2>/dev/null)"
-          python3 .github/scripts/verdict.py result "$status" "$detail"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-config
-          path: reports/config/
-          if-no-files-found: ignore
-
-  previous-env-tests:
-    name: R1 verify · G3 passed in the previous environment
-    # staging needs dev's G3 for this digest, prod needs staging's. The
-    # previous environment's run attested its release record (with the G3
-    # it ran against the deployed digest) to the digest, signed by this
-    # workflow on main: a record nobody can write by hand.
-    needs: resolve
-    if: inputs.environment != 'dev'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: previous-env-tests
-      OUT: reports/previous-env-tests
-      VERDICT_FILE: reports/previous-env-tests/verdict.json
-      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: v2.6.5
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: check
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT"
-          prev=$([ "$TARGET_ENV" = staging ] && echo dev || echo staging)
-          res() { { echo "status=$1"; echo "detail=$2"; } >> "$GITHUB_OUTPUT"; exit 0; }
-          [ "$KIND" != rollback ] || res skipped "rollback to a digest ${TARGET_ENV} already ran: it passed ${prev}'s tests when it was first promoted"
-          cosign verify-attestation --type "$RELEASE_EVIDENCE_TYPE" --certificate-identity "$RELEASE_IDENTITY" \
-            --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > "$OUT/attestation.jsonl" 2> "$OUT/cosign.log" \
-            || res fail "no verified release record on ${DIGEST:0:19}…: it hasn't been deployed and tested in ${prev} by this workflow"
-          # The newest record for the previous environment wins (a re-test).
-          jq -s --arg env "$prev" 'map(.payload | @base64d | fromjson | .predicate | select(.environment == $env))
-            | sort_by(.generated_at) | last // {}' "$OUT/attestation.jsonl" > "$OUT/record.json"
-          g3=$(jq -r '.gates.G3.status // empty' "$OUT/record.json")
-          run=$(jq -r '.run_url // empty' "$OUT/record.json")
-          [ -n "$g3" ] || res fail "no ${prev} release record with a G3 on ${DIGEST:0:19}…: promote it to ${prev} and let its tests finish"
-          criteria=$(jq -r '[.gates.G3.criteria | to_entries[] | "\(.key) \(.value)"] | join(", ")' "$OUT/record.json")
-          [ "$g3" = pass ] && [ "$(jq -r '.gates.G3.recorded' "$OUT/record.json")" = true ] \
-            || res fail "G3 in ${prev} for this digest: ${g3} (${criteria}) — ${run}"
-          res pass "G3 passed in ${prev} for this digest (${criteria}) — ${run}"
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.check.outputs.status }}
-          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
-          TOOL: cosign verify-attestation (release record)
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-previous-env-tests
-          path: reports/previous-env-tests/
-          if-no-files-found: ignore
-
-  release-notes:
-    name: R1 release notes (${{ inputs.environment }})
-    # What the approver approves: every change between the source running
-    # in this environment now and the one being promoted, in the run
-    # summary (read before approving) and as evidence.
-    needs: resolve
-    if: inputs.environment != 'dev'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: release-notes
-      OUT: reports/release-notes
-      VERDICT_FILE: reports/release-notes/verdict.json
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-      CHANGE_ID: ${{ needs.resolve.outputs.change-id }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: notes
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT"
-          notes="$OUT/release-notes.md"
-          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
-          deploy_sha=$(git log -1 --format=%H -- "$KUSTOMIZATION")
-          current=$(git log -1 --format='%(trailers:key=Source-Commit,valueonly)' "$deploy_sha" | head -1 | tr -d '[:space:]')
-          running=$(git show "${deploy_sha}:${KUSTOMIZATION}" | sed -nE 's/^    digest: (sha256:[0-9a-f]{64})$/\1/p')
-          {
-            echo "## Release notes: ${TARGET_ENV} (${KIND})"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            [ -z "$CHANGE_ID" ] || echo "| Change request | [${CHANGE_ID}](${repo_url}/issues/${CHANGE_ID#CHG-}) |"
-            echo "| Deploying | \`${DIGEST}\` built from [${SOURCE_SHA:0:7}](${repo_url}/commit/${SOURCE_SHA}) |"
-            echo "| Replacing | \`${running:-nothing}\`${current:+ built from [${current:0:7}](${repo_url}/commit/${current})} |"
-            echo
-          } > "$notes"
-          range=""
-          if [ -z "$current" ] || ! git cat-file -e "${current}^{commit}" 2>/dev/null; then
-            echo "First release to ${TARGET_ENV} by this workflow: the changes below are the last 30 up to ${SOURCE_SHA:0:7}." >> "$notes"
-            range="$SOURCE_SHA"
-          elif [ "$current" = "$SOURCE_SHA" ]; then
-            echo "No code changes: the source ${TARGET_ENV} runs (${SOURCE_SHA:0:7}) is deployed again." >> "$notes"
-          elif git merge-base --is-ancestor "$current" "$SOURCE_SHA"; then
-            range="${current}..${SOURCE_SHA}"
-          else
-            echo "**Going back in history: ${SOURCE_SHA:0:7} doesn't contain ${current:0:7}.** The changes below leave ${TARGET_ENV}." >> "$notes"
-            range="${SOURCE_SHA}..${current}"
-          fi
-          prs=0; commits=0
-          if [ -n "$range" ]; then
-            echo -e "\n### Pull requests\n" >> "$notes"
-            for m in $(git rev-list --merges --first-parent --max-count=30 "$range"); do
-              if [[ "$(git show -s --format=%s "$m")" =~ ^Merge\ pull\ request\ \#([0-9]+) ]]; then
-                n=${BASH_REMATCH[1]}
-                echo "- [#${n}](${repo_url}/pull/${n}) $(git show -s --format=%b "$m" | sed -n 1p)" >> "$notes"
-                prs=$((prs + 1))
-              fi
-            done
-            [ "$prs" -gt 0 ] || echo "_none_" >> "$notes"
-            # Deploy commits only move digests between environments.
-            echo -e "\n### Commits\n" >> "$notes"
-            git log --no-merges --invert-grep --grep='^deploy(' --max-count=30 --format="- [%h](${repo_url}/commit/%H) %s (%an)" "$range" >> "$notes"
-            commits=$(git log --no-merges --invert-grep --grep='^deploy(' --format=%H "$range" | wc -l)
-          fi
-          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
-          { echo "status=pass"
-            echo "detail=release notes for ${TARGET_ENV}: ${prs} pull request(s), ${commits} commit(s) since ${current:0:7}${current:-no earlier release} (run summary; release-notes.md)"; } >> "$GITHUB_OUTPUT"
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.notes.outputs.status }}
-          DETAIL: ${{ steps.notes.outputs.detail || 'release notes were not generated' }}
-          TOOL: git log (deploy trailers)
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-release-notes
-          path: reports/release-notes/
-          if-no-files-found: ignore
-
-  rollback-plan:
-    name: R1 rollback plan (${{ inputs.environment }})
-    # What a failed deploy goes back to: the digest the environment runs
-    # now (for a redeploy of that digest, the target its deploy recorded).
-    # The deploy commit records it (Rollback-Digest/-Source) and kind
-    # rollback redeploys it. It must still verify and pull, or it's no plan.
-    # Argo Rollouts already aborts a canary that fails its analysis; this
-    # is for a problem found after the rollout completed.
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-      digest: ${{ steps.check.outputs.digest }}
-      source: ${{ steps.check.outputs.source }}
-    env:
-      CONTROL: rollback-plan
-      OUT: reports/rollback-plan
-      VERDICT_FILE: reports/rollback-plan/verdict.json
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: v2.6.5
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: check
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT"
-          res() { { echo "status=$1"; echo "detail=$2"; } >> "$GITHUB_OUTPUT"; exit 0; }
-          deploy_sha=$(git log -1 --format=%H -- "$KUSTOMIZATION")
-          trailer() { git log -1 --format="%(trailers:key=$1,valueonly)" "$deploy_sha" | head -1 | tr -d '[:space:]'; }
-          running=$(git show "${deploy_sha}:${KUSTOMIZATION}" | sed -nE 's/^    digest: (sha256:[0-9a-f]{64})$/\1/p')
-          [ "$(trailer Environment)" = "$TARGET_ENV" ] && [ "$(trailer Image-Digest)" = "$running" ] && [ -n "$(trailer Source-Commit)" ] \
-            || res skipped "${TARGET_ENV} has no deploy by this workflow yet (${KUSTOMIZATION} last changed by ${deploy_sha:0:7}): nothing to roll back to"
-          if [ "$running" != "$DIGEST" ]; then
-            target=$running; source=$(trailer Source-Commit)
-          else
-            target=$(trailer Rollback-Digest); source=$(trailer Rollback-Source)
-            [ -n "$target" ] || res skipped "${DIGEST:0:19}… already runs in ${TARGET_ENV} and its deploy ${deploy_sha:0:7} recorded no earlier digest"
-          fi
-          ref="${IMAGE}@${target}"
-          cosign verify --certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER" "$ref" > "$OUT/signature.json" 2> "$OUT/cosign.log" \
-            || res fail "rollback target ${target:0:19}… no longer verifies (${CERT_IDENTITY##*/}): $(tail -1 "$OUT/cosign.log")"
-          skopeo inspect --raw "docker://${ref}" > "$OUT/manifest.json" 2> "$OUT/skopeo.log" \
-            || res fail "rollback target ${target:0:19}… can't be pulled: $(tail -1 "$OUT/skopeo.log")"
-          { echo "digest=$target"; echo "source=$source"; } >> "$GITHUB_OUTPUT"
-          { echo "### Rollback plan (${TARGET_ENV})"
-            echo
-            echo "If ${TARGET_ENV} misbehaves after this deploy: Actions → devsecops-release → environment \`${TARGET_ENV}\`, kind \`rollback\`."
-            echo "That redeploys \`${target}\` (built from ${source:0:7}) through the same gates${TARGET_ENV/#prod/, G4 included}."; } >> "$GITHUB_STEP_SUMMARY"
-          res pass "rollback target ${target:0:19}… (built from ${source:0:7}): signature verified, image pullable; recorded on the deploy commit"
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.check.outputs.status }}
-          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
-          TOOL: cosign verify + skopeo
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-rollback-plan
-          path: reports/rollback-plan/
-          if-no-files-found: ignore
-
-  approve-staging:
-    name: R2 staging approval
-    # Asked only once everything above passed: the approver reads dev's
-    # test results and the release notes in this run's summary.
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
-    if: inputs.environment == 'staging'
-    environment: staging-approval
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: approve-staging
-      OUT: reports/approve-staging
-      VERDICT_FILE: reports/approve-staging/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - id: sod
-        name: Separation of duties
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/approvals.sh staging-approval
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.sod.outcome == 'success' && 'pass' || 'fail' }}
-          DETAIL: ${{ steps.sod.outputs.detail || 'approval check did not run' }}
-          TOOL: GitHub environment review (staging-approval)
-        run: |
-          mkdir -p "$OUT"
-          python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-approve-staging
-          path: reports/approve-staging/
-          if-no-files-found: ignore
-
-  g4:
-    name: R2 G4 release approval (prod)
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
-    if: inputs.environment == 'prod'
-    environment: release-approval
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      statuses: read
-      actions: read
-    env:
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      CHANGE_ID: ${{ needs.resolve.outputs.change-id }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - name: Separation of duties
-        id: sod
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # The dashboard checks the same thing independently.
-        run: bash .github/scripts/approvals.sh release-approval
-      - env:
-          STARTED: ${{ steps.sod.outputs.started }}
-          APPROVED: ${{ steps.sod.outputs.approved }}
-        # commit_sha is this run's commit (the dashboard only answers on
-        # it); source_commit is the commit that built the digest.
-        run: |
-          mkdir -p "$RUNNER_TEMP/release-request"
-          jq -n --arg change "$CHANGE_ID" --arg subject "$DIGEST" --arg sha "$GITHUB_SHA" --arg source "$SOURCE_SHA" \
-            --argjson started "$STARTED" --argjson approved "$APPROVED" \
-            '{change_id: $change, subject: $subject, commit_sha: $sha, source_commit: $source, environment: "prod",
-              started_by: $started, approved_by: $approved}' \
-            | tee "$RUNNER_TEMP/release-request/release-request.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-request
-          path: ${{ runner.temp }}/release-request/release-request.json
-          if-no-files-found: error
-          retention-days: 90
-      - name: Wait for the dashboard's G4 decision
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        # Only a status pointing at this run answers this request; an older
-        # G4 status on the same commit belongs to another release.
-        run: |
-          set -uo pipefail
-          for _ in $(seq 60); do
-            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/statuses?per_page=100" \
-                  --jq "[.[] | select(.context == \"security-dashboard/G4\" and .target_url == \"${RUN_URL}\")][0] // empty" 2>/dev/null)
-            case "$(jq -r '.state // empty' <<<"${s:-null}")" in
-              success) echo "G4: $(jq -r .description <<<"$s")" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0 ;;
-              failure|error) echo "::error::$(jq -r '.description // "G4 blocked"' <<<"$s")"; exit 1 ;;
-            esac
-            sleep 20
-          done
-          echo "::error::dashboard collector did not answer within 20 minutes (no security-dashboard/G4 status for this run)"
-          exit 1
-
-  gate-g5:
-    name: G5 deployment gate (${{ inputs.environment }})
-    # Before the deploy commit: nothing reaches an environment unless G5
-    # passed for it. staging also needs its approval first, prod G4.
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging, g4]
-    if: >-
-      always() && needs.resolve.result == 'success' &&
-      (needs.g4.result == 'success' || (inputs.environment != 'prod' && needs.g4.result == 'skipped')) &&
-      (needs.approve-staging.result == 'success' || (inputs.environment != 'staging' && needs.approve-staging.result == 'skipped'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - uses: ./.github/actions/gate
-        with:
-          gate: G5
-          profile: ${{ inputs.environment }}
-          needs: ${{ toJSON(needs) }}
-          subject: ${{ needs.resolve.outputs.digest }}
-          commit-sha: ${{ needs.resolve.outputs.source-sha }}
-          artifact-digest: ${{ needs.resolve.outputs.digest }}
-          environment: ${{ inputs.environment }}
-          started-at: ${{ needs.resolve.outputs.started-at }}
-          # dev and staging may have no earlier deploy to return to (prod
-          # always has one); a rollback's target was tested when first
-          # promoted.
-          allow-skipped: >-
-            ${{ inputs.environment != 'prod' && 'rollback_plan_ready' || '' }},${{ inputs.kind == 'rollback' && 'previous_environment_tests_passed' || '' }}
-
-  deploy:
-    name: R3 deploy to ${{ inputs.environment }} (GitOps commit)
-    # The only write path to the cluster: a commit on main that Argo CD
-    # syncs. [skip ci] + paths-ignore keep it from re-running the pipeline.
-    needs: [resolve, gate-g5, rollback-plan]
-    # A status function is required: g4 (prod only) is skipped for dev and
-    # staging, and the implicit success() also fails on a skipped ancestor,
-    # which would skip the deploy for every non-prod environment.
-    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.gate-g5.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  dev:
+    name: 2 Deploy to Dev
+    if: github.ref == 'refs/heads/main' && inputs.start == 'dev'
+    uses: ./.github/workflows/devsecops-stage.yml
     permissions:
       contents: write
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-      gitops-sha: ${{ steps.commit.outputs.gitops_sha }}
-    env:
-      CONTROL: deploy
-      OUT: reports/deploy
-      VERDICT_FILE: reports/deploy/verdict.json
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-      CHANGE_ID: ${{ needs.resolve.outputs.change-id }}
-      ROLLBACK_DIGEST: ${{ needs.rollback-plan.outputs.digest }}
-      ROLLBACK_SOURCE: ${{ needs.rollback-plan.outputs.source }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: true # zizmor: ignore[artipacked] this job pushes the deploy commit
-          fetch-depth: 0
-      - id: commit
-        # On main as it is now (another promotion may have pushed since
-        # this run started), but only if what config verified — the base
-        # and this environment's overlay — hasn't changed since. A push
-        # that loses the race to another environment's deploy commit is
-        # rebuilt on the new main and retried.
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # The trailers are what the next environment's resolve reads, and
-          # Rollback-* what this environment's next rollback redeploys.
-          trailers=(--trailer "Environment: ${TARGET_ENV}" --trailer "Image-Digest: ${DIGEST}" --trailer "Source-Commit: ${SOURCE_SHA}")
-          [ -z "$ROLLBACK_DIGEST" ] || trailers+=(--trailer "Rollback-Digest: ${ROLLBACK_DIGEST}" --trailer "Rollback-Source: ${ROLLBACK_SOURCE}")
-          kind=$([ "$KIND" = planned ] || echo " ${KIND}")
-          for attempt in 1 2 3; do
-            git fetch -q origin main
-            if ! git diff --quiet "$GITHUB_SHA" origin/main -- deploy/base "deploy/${TARGET_ENV}"; then
-              echo "::error::deploy/base or deploy/${TARGET_ENV} changed on main since ${GITHUB_SHA:0:7}; start a new run"; exit 1
-            fi
-            git checkout -q -B main origin/main
-            python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST"
-            git add "$KUSTOMIZATION"
-            git commit -q -m "deploy(${TARGET_ENV}): django-gates-demo ${DIGEST:7:12}${CHANGE_ID:+ ${CHANGE_ID}}${kind} [skip ci]" \
-              -m "Promoted ${IMAGE}@${DIGEST} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-              "${trailers[@]}"
-            git push -q origin HEAD:main && break
-            [ "$attempt" -lt 3 ] || { echo "::error::push to main failed 3 times"; exit 1; }
-            sleep $((attempt * 5))
-          done
-          echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - id: verdict
-        if: always()
-        env:
-          SHA: ${{ steps.commit.outputs.gitops_sha }}
-          TOOL: git (GitOps) → Argo CD
-        run: |
-          mkdir -p "$OUT"
-          if [ -n "$SHA" ]; then
-            python3 .github/scripts/verdict.py result pass "GitOps commit ${SHA:0:7} on main → Argo CD app django-gates-demo-${TARGET_ENV} (automated sync)"
-          else
-            python3 .github/scripts/verdict.py result fail "GitOps commit/push to main failed"
-          fi
-      - name: Build deployment-event
-        if: steps.commit.outputs.gitops_sha != ''
-        env:
-          GITOPS_SHA: ${{ steps.commit.outputs.gitops_sha }}
-          KIND: ${{ inputs.kind }}
-        # in_progress: the commit is only the start. Argo CD notifications
-        # report the sync/canary outcome under the same external_id
-        # (deploy-<dashboard.environment>-<revision>). commit_sha is the
-        # commit that built the digest, so lead time runs from there.
-        run: |
-          mkdir -p "$RUNNER_TEMP/deployment-event"
-          jq -n \
-            --arg id "deploy-${TARGET_ENV}-${GITOPS_SHA}" --arg env "$TARGET_ENV" --arg change "$CHANGE_ID" --arg sha "$SOURCE_SHA" \
-            --arg digest "$DIGEST" --arg commit_at "$(git show -s --format=%cI "$SOURCE_SHA")" \
-            --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg kind "$KIND" \
-            --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            '{external_id: $id, environment: $env, change_id: (if $change == "" then null else $change end), commit_sha: $sha,
-              artifact_digest: $digest, commit_at: $commit_at, started_at: $started,
-              status: "in_progress", kind: $kind, via_approved_path: true, break_glass: false,
-              run_url: $run}' | tee "$RUNNER_TEMP/deployment-event/deployment.json"
-          cp "$RUNNER_TEMP/deployment-event/deployment.json" "$OUT/"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.commit.outputs.gitops_sha != ''
-        with:
-          name: deployment-event
-          path: ${{ runner.temp }}/deployment-event/deployment.json
-          if-no-files-found: error
-          retention-days: 90
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-deploy
-          path: reports/deploy/
-          if-no-files-found: ignore
-
-  post-deploy:
-    name: R4 verify the rollout in ${{ inputs.environment }} (G6)
-    # Argo CD reports G6 (sync, canary analysis, Kyverno admission) to the
-    # dashboard; the dashboard mirrors it as commit status
-    # `security-dashboard/G6/<env>` on the deploy commit. A GitHub-hosted
-    # runner can't see the cluster, so this is how the promotion learns the
-    # outcome.
-    needs: [deploy]
-    # Same as deploy: the skipped g4 ancestor must not skip this job.
-    if: ${{ !cancelled() && needs.deploy.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    permissions:
-      contents: read
+      packages: write
+      id-token: write
+      attestations: read
       statuses: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: post-deploy
-      OUT: reports/post-deploy
-      VERDICT_FILE: reports/post-deploy/verdict.json
-      GITOPS_SHA: ${{ needs.deploy.outputs.gitops-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - id: wait
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT"
-          context="security-dashboard/G6/${TARGET_ENV}"
-          for _ in $(seq 90); do
-            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITOPS_SHA}/statuses?per_page=100" \
-                  --jq "[.[] | select(.context == \"${context}\")][0] // empty" 2>/dev/null)
-            state=$(jq -r '.state // empty' <<<"${s:-null}")
-            desc=$(jq -r '.description // ""' <<<"${s:-null}")
-            if [ "$state" = success ] || [ "$state" = failure ] || [ "$state" = error ]; then
-              jq . <<<"$s" > "$OUT/g6-status.json"
-              { echo "status=$([ "$state" = success ] && echo pass || echo fail)"
-                echo "detail=G6 ${state}: ${desc} ($(jq -r '.target_url // ""' <<<"$s"))"; } >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            sleep 20
-          done
-          { echo "status=fail"; echo "detail=no ${context} status on ${GITOPS_SHA:0:7} within 30 minutes (Argo CD sync or notification didn't reach the dashboard)"; } >> "$GITHUB_OUTPUT"
-      - id: verdict
-        if: always()
-        env:
-          STATUS: ${{ steps.wait.outputs.status }}
-          DETAIL: ${{ steps.wait.outputs.detail || 'wait did not run' }}
-          TOOL: security dashboard (Argo CD notifications)
-        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-post-deploy
-          path: reports/post-deploy/
-          if-no-files-found: ignore
+      actions: read
+      issues: write
+      pull-requests: read
+    with:
+      environment: dev
+      kind: ${{ inputs.kind }}
+      commit: ${{ inputs.commit }}
 
-  env-tests:
-    name: R5 ${{ inputs.environment == 'prod' && 'G6 smoke tests in prod' || format('G3 test gate in {0}', inputs.environment) }}
-    # One job, so one ephemeral self-hosted runner registration covers it
-    # (README: "Environment test runner"). The runner's own environment
-    # supplies KUBECONFIG: the env-tester service account, which may
-    # port-forward in every environment but exec (to create test users)
-    # only in dev and staging. The repo holds no cluster credential.
-    #   dev      integration tests · nuclei · dependency re-check (trivy,
-    #            today's vulnerability data, on the deployed digest)
-    #   staging  functional · k6 · nuclei · testssl.sh
-    #   prod     smoke tests only: read-only, no test users, no writes
-    needs: [resolve, post-deploy]
-    if: ${{ !cancelled() && needs.post-deploy.result == 'success' }}
-    runs-on: [self-hosted, linux, django-gates-demo-env]
-    timeout-minutes: 45
+  staging:
+    name: 3 Deploy to Staging
+    needs: dev
+    # Chained: only after dev deployed AND passed its tests (the stage
+    # fails otherwise). A rollback stays in the environment it started in.
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      (inputs.start == 'staging' || (inputs.start == 'dev' && inputs.kind != 'rollback' && needs.dev.result == 'success'))
+    uses: ./.github/workflows/devsecops-stage.yml
     permissions:
-      contents: read
-      packages: read
-    env:
-      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      OUT: reports/env-tests
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Tool pins (the pipeline's)
-        # Same scanners and thresholds as the preprod G3, read from the
-        # pipeline so the two can't drift.
-        run: |
-          set -euo pipefail
-          for k in K6 NUCLEI NUCLEI_TEMPLATES NUCLEI_TEMPLATES_COMMIT TESTSSL TRIVY SLO_P95_MS; do
-            v=$(sed -nE "s/^  ${k}: \"?([^\"]+)\"?$/\1/p" .github/workflows/devsecops-pipeline.yml)
-            [ -n "$v" ] || { echo "::error::no ${k} in devsecops-pipeline.yml"; exit 1; }
-            echo "${k}=${v}" >> "$GITHUB_ENV"
-          done
-          echo "CADDY=$(sed -nE 's/^    image: (caddy:.*)$/\1/p' tests/preprod/compose.yaml)" >> "$GITHUB_ENV"
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - name: Reach ${{ inputs.environment }}
-        id: up
-        # The pod under test must run the promoted digest. Outside prod, two
-        # fresh random-password users, created in that pod (the demo's
-        # SQLite is per pod) with the password on stdin, never in argv.
-        # Secrets go to a 0600 file, as in the preprod action.
-        run: |
-          set -euo pipefail
-          mkdir -p "$OUT"
-          pods=$(kubectl -n "$NS" get pods -l app=django-gates-demo -o json)
-          pod=$(jq -r --arg d "$DIGEST" '[.items[] | select(.status.phase == "Running")
-                 | select(any((.status.containerStatuses // [])[]; .ready and (.imageID | endswith($d))))][0].metadata.name // empty' <<<"$pods")
-          [ -n "$pod" ] || { echo "::error::no ready pod in ${NS} runs ${DIGEST}"; jq -r '.items[] | "\(.metadata.name) \(.status.containerStatuses[0].imageID)"' <<<"$pods"; exit 1; }
-          echo "Testing pod ${pod} (${DIGEST:0:19}…) in ${NS}" | tee -a "$GITHUB_STEP_SUMMARY"
-          nohup kubectl -n "$NS" port-forward "pod/${pod}" 18000:8000 > "$OUT/port-forward.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/port-forward.pid"
-          rand() { python3 -c 'import secrets; print(secrets.token_urlsafe(24))'; }
-          env_file="$RUNNER_TEMP/env-tests.env"
-          (umask 077; {
-            echo "BASE_URL=https://localhost:18443"; echo "HTTP_URL=http://localhost:18480"
-            echo "REQUESTS_CA_BUNDLE=$RUNNER_TEMP/env-bundle.crt"
-            echo "SSL_CERT_FILE=$RUNNER_TEMP/env-bundle.crt"
-            if [ "$TARGET_ENV" != prod ]; then
-              echo "USER_A=${TARGET_ENV}-alice"; echo "PASSWORD_A=$(rand)"
-              echo "USER_B=${TARGET_ENV}-bob"; echo "PASSWORD_B=$(rand)"
-            fi; } > "$env_file")
-          set -a
-          # shellcheck source=/dev/null
-          . "$env_file"
-          set +a
-          if [ "$TARGET_ENV" != prod ]; then
-            for u in A B; do
-              user="USER_$u"; pw="PASSWORD_$u"
-              # shellcheck disable=SC2016 # $0 expands in the pod's shell
-              kubectl -n "$NS" exec -i "$pod" -- sh -c 'read -r ENSURE_USER_PASSWORD; export ENSURE_USER_PASSWORD; exec python manage.py ensure_user "$0"' "${!user}" <<<"${!pw}"
-            done
-          fi
-          # caddy carries a file capability (cap_net_bind_service): without
-          # it in the bounding set the binary can't even exec.
-          # A 0644 copy: the checkout's modes follow the runner's umask, and
-          # root in a cap-drop ALL container can't read past them.
-          install -m 644 tests/env/Caddyfile "$RUNNER_TEMP/Caddyfile"
-          docker run -d --name "env-proxy-${GITHUB_RUN_ID}" --network host --cap-drop ALL --cap-add NET_BIND_SERVICE \
-            -v "$RUNNER_TEMP/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY" > /dev/null
-          for _ in $(seq 30); do
-            docker cp "env-proxy-${GITHUB_RUN_ID}:/data/caddy/pki/authorities/local/root.crt" "$RUNNER_TEMP/env-ca.crt" 2>/dev/null \
-              && curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz && break
-            sleep 2
-          done
-          curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz \
-            || { docker logs "env-proxy-${GITHUB_RUN_ID}" 2>&1 | tail -20; tail -5 "$OUT/port-forward.log"; exit 1; }
-          cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/env-ca.crt" > "$RUNNER_TEMP/env-bundle.crt"
-          chmod 644 "$RUNNER_TEMP/env-ca.crt" "$RUNNER_TEMP/env-bundle.crt"   # read by tool containers running as other uids
-      - name: functional / integration tests
-        id: functional-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
-        run: |
-          mkdir -p "$OUT/functional"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
-          rc=0
-          uv sync --frozen || rc=$?
-          uv run --frozen pytest tests/functional -p no:cacheprovider --junitxml="$OUT/functional/junit.xml" || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-      - id: functional
-        if: ${{ !cancelled() && inputs.environment != 'prod' }}
-        env:
-          CONTROL: functional
-          VERDICT_FILE: reports/env-tests/functional/verdict.json
-          RC: ${{ steps.functional-run.outputs.rc }}
-          LABEL: tests/functional against ${{ inputs.environment }} (${{ env.NS }})
-          TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/functional/junit.xml"
-      - name: smoke tests
-        id: smoke-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'prod' }}
-        run: |
-          mkdir -p "$OUT/smoke"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
-          rc=0
-          uv sync --frozen || rc=$?
-          uv run --frozen pytest tests/functional -m smoke -p no:cacheprovider --junitxml="$OUT/smoke/junit.xml" || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-      - id: smoke
-        if: ${{ !cancelled() && inputs.environment == 'prod' }}
-        env:
-          CONTROL: smoke
-          VERDICT_FILE: reports/env-tests/smoke/verdict.json
-          RC: ${{ steps.smoke-run.outputs.rc }}
-          LABEL: tests/functional -m smoke against prod (${{ env.NS }}), read-only
-          TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
-      - name: k6 load
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'staging' }}
-        run: |
-          mkdir -p "$OUT/performance" && chmod 777 "$OUT/performance"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
-          docker run --rm --network host --user "$(id -u):$(id -g)" \
-            -v "$PWD/tests/perf:/perf:ro" -v "$PWD/$OUT/performance:/out" -v "$SSL_CERT_FILE:/ca.crt:ro" \
-            -e SSL_CERT_FILE=/ca.crt -e BASE_URL -e USER_A -e PASSWORD_A -e SUMMARY_OUT=/out/k6-summary.json \
-            "$K6" run --quiet /perf/load.js || true
-      - id: performance
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
-        env:
-          CONTROL: performance
-          VERDICT_FILE: reports/env-tests/performance/verdict.json
-          TOOL: k6 (10 VUs, 30 s) against staging
-        run: python3 .github/scripts/verdict.py k6 "$OUT/performance/k6-summary.json"
-      - name: nuclei
-        id: nuclei-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT/dast-nuclei" && chmod 777 "$OUT/dast-nuclei"
-          rm -rf "$RUNNER_TEMP/templates"
-          umask 022   # the nuclei container reads them as another uid
-          git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES" https://github.com/projectdiscovery/nuclei-templates.git "$RUNNER_TEMP/templates"
-          got=$(git -C "$RUNNER_TEMP/templates" rev-parse HEAD)
-          [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
-          touch "$OUT/dast-nuclei/nuclei.jsonl"
-          docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT/dast-nuclei:/out" "$NUCLEI" \
-            -u https://localhost:18443 -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
-            -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
-      - id: dast-nuclei
-        if: ${{ !cancelled() && inputs.environment != 'prod' }}
-        env:
-          CONTROL: dast-nuclei
-          VERDICT_FILE: reports/env-tests/dast-nuclei/verdict.json
-          RC: ${{ steps.nuclei-run.outputs.rc }}
-          TOOL: nuclei against ${{ inputs.environment }}
-          TEMPLATES: ${{ env.NUCLEI_TEMPLATES }}
-        run: python3 .github/scripts/verdict.py nuclei "$OUT/dast-nuclei/nuclei.jsonl"
-      - name: testssl.sh
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'staging' }}
-        # The TLS endpoint is the runner's stand-in ingress
-        # (tests/env/Caddyfile), the same proxy config preprod tests.
-        run: |
-          mkdir -p "$OUT/dast-tls" && chmod 777 "$OUT/dast-tls"
-          docker run --rm --network host -v "$PWD/$OUT/dast-tls:/out" -v "$RUNNER_TEMP/env-ca.crt:/ca.crt:ro" "$TESTSSL" \
-            --quiet --color 0 --warnings off --add-ca /ca.crt \
-            --jsonfile-pretty /out/testssl.json https://localhost:18443 > "$OUT/dast-tls/testssl.log" 2>&1 || true
-      - id: dast-tls
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
-        env:
-          CONTROL: dast-tls
-          VERDICT_FILE: reports/env-tests/dast-tls/verdict.json
-          TOOL: testssl.sh against staging's stand-in ingress
-        run: python3 .github/scripts/verdict.py testssl "$OUT/dast-tls/testssl.json"
-      - name: testssl.sh report
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
-        run: python3 .github/scripts/findings.py native "$OUT/dast-tls/testssl.log"
-      - name: dependency re-check
-        if: ${{ !cancelled() && inputs.environment == 'dev' }}
-        # The pipeline scanned these bytes when it built them; this scans
-        # the deployed digest again with today's vulnerability data, so a
-        # CVE published since the build is caught before staging.
-        env:
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ github.token }}
-        run: |
-          mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
-          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
-      - id: dependency-check
-        if: ${{ !cancelled() && inputs.environment == 'dev' }}
-        env:
-          CONTROL: dependency-check
-          RISK_CONTROL: image-scan
-          VERDICT_FILE: reports/env-tests/dependency-check/verdict.json
-          TOOL: trivy (deployed digest, current vulnerability DB)
-        run: python3 .github/scripts/verdict.py trivy "$OUT/dependency-check/trivy.json"
-      - uses: ./.github/actions/gate
-        if: ${{ !cancelled() }}
-        with:
-          gate: ${{ inputs.environment == 'prod' && 'G6' || 'G3' }}
-          profile: ${{ inputs.environment }}
-          needs: ${{ toJSON(steps) }}
-          subject: ${{ needs.resolve.outputs.digest }}
-          commit-sha: ${{ needs.resolve.outputs.source-sha }}
-          artifact-digest: ${{ needs.resolve.outputs.digest }}
-          environment: ${{ inputs.environment }}
-      - name: Tear down
-        if: always()
-        run: |
-          [ -f "$RUNNER_TEMP/port-forward.pid" ] && kill "$(cat "$RUNNER_TEMP/port-forward.pid")" 2>/dev/null || true
-          docker logs "env-proxy-${GITHUB_RUN_ID}" > "$OUT/proxy.log" 2>&1 || true
-          docker rm -f "env-proxy-${GITHUB_RUN_ID}" > /dev/null 2>&1 || true
-          rm -f "$RUNNER_TEMP/env-tests.env"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-env-tests
-          path: reports/env-tests/
-          if-no-files-found: ignore
+      contents: write
+      packages: write
+      id-token: write
+      attestations: read
+      statuses: read
+      actions: read
+      issues: write
+      pull-requests: read
+    with:
+      environment: staging
+      kind: ${{ inputs.kind }}
+      expect-digest: ${{ needs.dev.outputs.digest }}
 
-  release-evidence:
-    name: R6 release evidence
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
-            g4, gate-g5, deploy, post-deploy, env-tests]
-    if: always() && needs.resolve.result == 'success'
+  prod:
+    name: 4 Deploy to Production
+    needs: staging
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      (inputs.start == 'prod' || (inputs.start != 'prod' && inputs.kind != 'rollback' && needs.staging.result == 'success'))
+    uses: ./.github/workflows/devsecops-stage.yml
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: read
+      statuses: read
+      actions: read
+      issues: write
+      pull-requests: read
+    with:
+      environment: prod
+      kind: ${{ inputs.kind }}
+      change: ${{ inputs.change }}
+      expect-digest: ${{ needs.staging.outputs.digest }}
+
+  rollback:
+    name: Rollback prod (automatic)
+    # prod deployed and then failed its smoke tests or health watch (or
+    # Argo CD's G6): start the rollback right away. It redeploys the
+    # digest prod ran before (the deploy commit's Rollback-Digest) through
+    # the same gates, so it still waits for a release-approval reviewer:
+    # nothing reaches prod unapproved, but nobody has to work out what to
+    # roll back to. A failed canary never gets here: Argo Rollouts has
+    # already aborted it and prod still runs the old digest.
+    needs: prod
+    if: >-
+      always() && github.ref == 'refs/heads/main' && inputs.kind != 'rollback' &&
+      needs.prod.result == 'failure' && needs.prod.outputs.gitops-sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGE_ID: ${{ needs.prod.outputs.change-id }}
+          GITOPS_SHA: ${{ needs.prod.outputs.gitops-sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f start=prod -f kind=rollback -f change="$CHANGE_ID"
+          echo "prod failed after deploy ${GITOPS_SHA:0:7}: rollback started (devsecops-release, start prod, kind rollback${CHANGE_ID:+, ${CHANGE_ID}}); it waits for release-approval" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  feedback:
+    name: Monitoring, logging & feedback
+    # Every run ends here, whatever happened: where the release got to,
+    # told to the people behind it (change request, pull requests) and, if
+    # a stage failed after it deployed, the rollback that undoes it. The
+    # dashboard gets the same from the artifacts (gate results, deployment
+    # events, release evidence) and Argo CD's notifications.
+    needs: [dev, staging, prod, rollback]
+    if: always() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-      packages: write
-      id-token: write
-    env:
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      CHANGE_ID: ${{ needs.resolve.outputs.change-id }}
-      REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
-      # Controls that apply to this environment; the rest aren't listed as missing.
-      CONTROLS: >-
-        promotion,provenance,evidence-check,config,rollback-plan,${{ inputs.environment != 'dev' && 'previous-env-tests,release-notes,' || '' }}${{ inputs.environment == 'staging' && 'approve-staging,' || '' }}deploy,post-deploy
+      actions: read
+      issues: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: .github
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: report-*
-          path: ${{ runner.temp }}/in
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: gate-*
-          path: ${{ runner.temp }}/in
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: inputs.environment == 'prod'
+      - name: Summary + comments
         continue-on-error: true
-        with:
-          name: release-request
-          path: ${{ runner.temp }}/in/release-request
-      - name: Bundle + hash manifest
         env:
-          G4_RESULT: ${{ needs.g4.result }}
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          KIND: ${{ inputs.kind }}
+          CHANGE: ${{ inputs.change }}
+          ROLLBACK: ${{ needs.rollback.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -euo pipefail
-          python3 .github/scripts/evidence.py "$RUNNER_TEMP/in" release-evidence
-          cp "$RUNNER_TEMP/in/release-request/release-request.json" release-evidence/ 2>/dev/null || true
-          jq --arg change "$CHANGE_ID" --arg g4 "$G4_RESULT" --arg env "$TARGET_ENV" \
-            '. + {environment: $env, change_id: (if $change == "" then null else $change end), g4_job: $g4}' \
-            release-evidence/manifest.json > "$RUNNER_TEMP/m.json" && mv "$RUNNER_TEMP/m.json" release-evidence/manifest.json
-          (cd release-evidence && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-evidence
-          path: release-evidence/
-          retention-days: 90
-          if-no-files-found: error
-      - if: needs.deploy.result == 'success'
-        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: v2.6.5
-      - if: needs.deploy.result == 'success'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - if: needs.deploy.result == 'success'
-        name: Attest the release record to the image digest
-        run: |
-          set -euo pipefail
-          cosign attest --yes --type "$RELEASE_EVIDENCE_TYPE" --predicate release-evidence/manifest.json "$REF"
-          cosign verify-attestation --type "$RELEASE_EVIDENCE_TYPE" --certificate-identity "$RELEASE_IDENTITY" \
-            --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
-          echo "Release record (${TARGET_ENV}) attested to ${REF} (${RELEASE_EVIDENCE_TYPE})" >> "$GITHUB_STEP_SUMMARY"
+          set -uo pipefail
+          icon() { case "$1" in success) echo "✅";; failure) echo "❌";; cancelled) echo "⏹";; *) echo "⏭";; esac; }
+          jobs=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" --jq '.jobs[]' | jq -s .)
+          source=$(jq -r '[.[].outputs["source-sha"] // empty | select(. != "")][0] // empty' <<<"$NEEDS")
+          digest=$(jq -r '[.[].outputs.digest // empty | select(. != "")][-1] // empty' <<<"$NEEDS")
+          rollback=""
+          table="| stage | result | digest | deploy commit | failed step |"$'\n'"|---|---|---|---|---|"
+          for env in dev staging prod; do
+            r=$(jq -r --arg e "$env" '.[$e].result' <<<"$NEEDS")
+            d=$(jq -r --arg e "$env" '.[$e].outputs.digest // ""' <<<"$NEEDS")
+            g=$(jq -r --arg e "$env" '.[$e].outputs["gitops-sha"] // ""' <<<"$NEEDS")
+            name=$(case "$env" in dev) echo "2 Deploy to Dev";; staging) echo "3 Deploy to Staging";; prod) echo "4 Deploy to Production";; esac)
+            failed=$(jq -r --arg n "$name" '[.[] | select((.name | startswith($n + " / ")) and .conclusion == "failure") | .name | sub("^[^/]+/ "; "")] | join(", ")' <<<"$jobs")
+            table+=$'\n'"| ${name} | $(icon "$r") ${r} | ${d:+\`${d:0:19}…\`} | ${g:0:7} | ${failed} |"
+            # Deployed, then failed its checks: say how to go back.
+            if [ "$r" = failure ] && [ -n "$g" ] && [ "$env" = prod ] && [ "$ROLLBACK" = success ]; then
+              rollback+=$'\n'"- **prod** failed after deploy: the rollback run was started automatically and waits for \`release-approval\`"
+            elif [ "$r" = failure ] && [ -n "$g" ]; then
+              rollback+=$'\n'"- **${env}** runs a digest that failed after deploy: \`gh workflow run devsecops-release.yml --ref main -f start=${env} -f kind=rollback\`"
+            fi
+          done
+          body="### Release ${source:+${source:0:7} }(${KIND})${digest:+ · \`${digest:0:19}…\`} — [run](${RUN_URL})"$'\n\n'"${table}"
+          [ -z "$rollback" ] || body+=$'\n\n'"#### Rollback"$'\n'"Argo Rollouts already aborts a canary that fails its analysis. For a problem found after the rollout:${rollback}"
+          echo "$body" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$source" ] || exit 0
+          # The change request (if any names this release) and the pull
+          # requests merged as this commit hear how far it got.
+          SOURCE_SHA=$source CHANGE=$CHANGE GITHUB_OUTPUT="$RUNNER_TEMP/change.out" bash .github/scripts/change.sh || true
+          n=$(sed -n 's/^number=//p' "$RUNNER_TEMP/change.out" 2>/dev/null)
+          [ -z "$n" ] || gh api "repos/${GITHUB_REPOSITORY}/issues/${n}/comments" -f body="$body" > /dev/null
+          for pr in $(gh api "repos/${GITHUB_REPOSITORY}/commits/${source}/pulls" --jq '.[].number' 2>/dev/null); do
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" -f body="$body" > /dev/null || true
+          done

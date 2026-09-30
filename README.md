@@ -1,8 +1,10 @@
 # django-gates-demo
 
 A small Django notes app (login, per-user notes, CSRF, security headers)
-built to go through every DevSecOps gate (G1–G6) for real, in **one
-pipeline run per commit**, keeping the evidence for each decision.
+built to go through every DevSecOps gate (G1–G6) for real: a build
+pipeline (CI) per commit, then a release pipeline that deploys the same
+signed digest to dev, staging and prod and tests each environment **after**
+the new digest is deployed to it. The evidence for each decision is kept.
 
 ```
 GET  /healthz                 {"status": "ok"}
@@ -22,26 +24,28 @@ DJANGO_DEBUG=1 uv run python manage.py runserver
 ```
 
 Run the tests with `uv run pytest tests/unit`. The functional, perf and
-DAST suites run against the preprod stack (`tests/preprod/compose.yaml`:
-the image behind a TLS proxy), which the pipeline starts.
+DAST suites need a deployed environment: the release pipeline runs them
+against dev, staging and prod right after each deploy.
 
-## One run, every gate
+## Build & unit tests (`devsecops-pipeline.yml`, CI)
 
 `.github/workflows/devsecops-pipeline.yml` runs on PRs, reviews, pushes to
-`main` and manual dispatch:
+`main` and manual dispatch. Nothing in it runs the application: every
+dynamic test runs in the release pipeline, against the environment the
+new digest was just deployed to.
 
 ```
-1 build ──────── build twice (reproducible?) · unit tests + coverage
-2 static ─────── semgrep · gitleaks · trufflehog · trivy SCA (uv.lock) · checkov
-                 reviewers · signed commits
+1 build ──────── checkout · build twice (reproducible?) · unit tests + coverage
+                 · code quality (ruff)
+2 static ─────── SAST (semgrep) · gitleaks · trufflehog · trivy SCA (uv.lock)
+                 · checkov · reviewers · signed commits
 2 image ──────── trivy image scan · syft SBOM · dockle · manage.py check --deploy
-3 publish ────── (main only) push by digest · cosign sign · SBOM + SLSA attestations
-   └─ G2 artifact gate ── a failed G2 stops here ──┐
-4 preprod ────── functional · k6 performance       │  (full_scan=true on a
-5 dast ───────── nuclei · testssl                  │   manual run overrides)
-   └─ G3 pre-production gate
-6 evidence ───── bundle + sha256 manifest → artifact `evidence` (90 days);
+3 package ────── (main only) push by digest · cosign sign · SBOM + SLSA attestations
+   └─ G2 Control Gate ── build successful · all tests passed · code quality
+                         threshold met · no blocking findings · signed
+4 evidence ───── bundle + sha256 manifest → artifact `evidence` (90 days);
                  on main, cosign-attested to the image digest
+5 release ────── (main, G2 passed) starts devsecops-release for this commit
 ```
 
 Each control is its own job, and every one of them runs even when another
@@ -56,8 +60,9 @@ never counts as a pass. It is allowed only where the gate explicitly
 permits it: `artifact_signed_attested` on PRs.
 
 Gate results go to the security dashboard as `gate-result-G<n>`
-artifacts. G1 is recorded on PRs; G2 and G3 on pushes to `main` (on PRs
-they appear as `gate-preview-*`). The `evidence` bundle also feeds
+artifacts (`gate-result-G<n>-<env>` from the release pipeline). G1 is
+recorded on PRs and G2 on pushes to `main` (on PRs it appears as
+`gate-preview-G2`). The `evidence` bundle also feeds
 DefectDojo: the dashboard's collector reimports every report listed in
 `manifest.json`.
 
@@ -142,75 +147,104 @@ Each entry names the control, the finding id and a reason, and has an
 expiry date. Once it expires, the finding blocks again. Every acceptance
 that was applied is listed in the verdict and in the manifest.
 
-## Promoting (`devsecops-release.yml`, one run per environment)
+## Release pipeline (`devsecops-release.yml`)
 
-The digest the pipeline built and signed moves dev → staging → prod. It is
-never rebuilt. Each environment gets its gates around its own deploy:
+The digest the build pipeline signed moves dev → staging → prod in **one
+run**, and is never rebuilt. Each stage is `devsecops-stage.yml` for one
+environment, and every test in it runs against that environment after the
+digest is deployed there:
 
 ```
-Build & unit tests (devsecops-pipeline, every push)
-  G1 build · unit tests · SAST · code quality (ruff) · package
-  G2/G3 on the image → publish → evidence → dispatches the dev release
-dev ───── R1 this commit's image · rollback plan → G5(dev) → deploy/dev
-          → G6(dev) → G3 in dev (integration · nuclei · dependency re-check)
-staging ─ R1 the digest G6 verified in dev · dev's G3 passed · release notes
-          · rollback plan → staging-approval → G5(staging) → deploy/staging
-          → G6(staging) → G3 in staging (functional · k6 · nuclei · testssl)
-prod ──── R1 the digest G6 verified in staging · staging's G3 passed
-          · release notes · rollback plan → G4 (release-approval · change
-          window · UAT sign-off · Go/No-Go) → G5(prod) → deploy/prod
-          (canary) → G6(prod) + smoke tests
+1 Build & unit tests (devsecops-pipeline) ── G2 Control Gate ── starts ↓
+
+2 Deploy to Dev ──── R1 verify → G5(dev) → deploy/dev → G6(dev)
+                     → G3 in dev: integration tests · DAST (nuclei)
+                       · dependency re-check of the deployed digest
+   Approval Gate ─── staging-approval: dev's test results + security scans,
+                     release notes (in the run summary)
+3 Deploy to Staging  R1 verify → G5(staging) → deploy/staging → G6(staging)
+                     → G3 in staging: end-to-end · performance (k6)
+                       · DAST (nuclei + testssl.sh) → UAT (change request told)
+   Approval Gate ─── release-approval + G4: UAT sign-off (uat-approved),
+                     test results, Go/No-Go (readiness-approved), change window
+4 Deploy to Prod ─── R1 verify → G5(prod) → deploy/prod (canary) → G6(prod)
+                     → post-deploy smoke tests · health watch (5 min of
+                       /healthz probes, latency SLO, no restarts)
+                     · rollback plan verified before the deploy; a failure
+                       after it starts the rollback automatically
+
+Monitoring, logging & feedback: run summary per stage, a comment on the
+change request and the pull requests, the rollback command if a deployed
+stage failed; gate results, deployment events and release evidence to the
+security dashboard; Argo CD notifications for every sync and canary.
 ```
 
-- **R1** for every environment: signature + SBOM + SLSA provenance for the
-  commit that built the digest; the evidence attestation (the pipeline's G2
-  and preprod G3 passed); the target overlay is schema-valid and
+A stage starts only when the previous one deployed **and passed its
+tests**; a failed stage stops the run there. Staging and prod also refuse
+to run if the previous environment has moved on to a newer release while
+this one waited for approval.
+
+- **R1 verify**, every stage: signature + SBOM + SLSA provenance for the
+  commit that built the digest; the evidence attestation (the pipeline's
+  Control Gate passed); the target overlay is schema-valid and
   checkov-clean, and only its digest changes. Also:
   - *previous environment's tests*: staging and prod verify the release
-    record the previous environment's run attested to the digest, and
-    need its G3 to have passed;
+    record the previous stage attested to the digest, and need its G3 to
+    have passed against the deployed environment;
   - *release notes*: the pull requests and commits since the digest the
     target environment runs now (job summary and `release-notes.md`);
   - *rollback plan*: the digest running now (or, on a redeploy, the one it
     replaced) is still signed and still in the registry. The deploy
     commit records it as `Rollback-Digest`.
-- **Staging approval**: the `staging-approval` environment. The approver
-  can't be whoever started or re-ran the run.
-- **G4** (prod only): the `release-approval` environment (same rule), and
-  the dashboard's decision on the change. That decision includes *G3
-  passed in staging for this digest* and *UAT signed off after it*.
+- **Approval Gates**: `staging-approval` and `release-approval`. The
+  approver can't be whoever started or re-ran the run, nor whoever
+  authored the change (the commit or its pull request). G4 also needs the
+  change request labelled `change-approved`, `readiness-approved` and
+  `uat-approved`, and the dashboard's own decision on it.
 - **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
   trailers (`Environment`, `Image-Digest`, `Source-Commit`,
-  `Rollback-Digest`, `Rollback-Source`) are what the next environment's R1
+  `Rollback-Digest`, `Rollback-Source`) are what the next stage's R1
   reads, together with the `security-dashboard/G6/<env>` status on that
   commit.
-- **Evidence:** every run leaves a `release-evidence` bundle, attested to
-  the digest once something was deployed.
+- **Evidence:** every stage leaves a `release-evidence-<env>` bundle,
+  attested to the digest once it was deployed.
 
-How to promote:
+How to release:
 
-1. Push to main. When **devsecops-pipeline** publishes, it starts the dev
-   release for that commit. A push that only touches `deploy/**` or `*.md`
-   doesn't build; after one, run the pipeline on main by hand. To redeploy
-   an older published commit to dev, run the release with
-   `environment: dev` and `commit: <sha>`.
-2. Once dev's G6 and G3 are green: `environment: staging`. Someone who
-   neither started nor re-ran the run approves `staging-approval`.
-3. For prod, open a **Change request** issue whose change window covers the
-   release. Once staging's tests passed, the tester adds `uat-approved`.
-   Someone other than you adds `change-approved` and `readiness-approved`
-   (Go/No-Go). Then run with `environment: prod` and the issue (`7`, `#7`
-   or `CHG-7`). Someone who neither started nor re-ran the run approves
-   `release-approval`.
+1. Open a **Change request** issue whose change window covers the
+   release. Someone other than you adds `change-approved`.
+2. Merge to main, and put the merge commit's SHA (or the release run's
+   URL) in the change request's **Release** field. When **devsecops-pipeline**'s Control Gate passes, it
+   starts **devsecops-release** for that commit, which deploys to dev and
+   tests it there.
+3. Someone who didn't start the run or write the change approves
+   `staging-approval`. Staging is deployed and tested; the change request
+   gets a comment that UAT can start.
+4. The tester adds `uat-approved`; the Go/No-Go review adds
+   `readiness-approved`. Inside the change window, someone who didn't
+   start the run or write the change approves `release-approval`. Prod is
+   deployed, smoke-tested and watched.
 
-To roll back, run with `kind: rollback`. It deploys the environment's
-recorded `Rollback-Digest` through the same gates (and, for prod, the same
-change and approval). The dashboard counts it as a rollback.
+A run can also start at any stage (Actions → devsecops-release → Run
+workflow): `start: staging` promotes what dev runs, `start: prod` what
+staging runs (pass `change` if no change request names the commit). A
+push that only touches `deploy/**` or `*.md` doesn't build; to deploy an
+older published commit, use `start: dev` and `commit: <sha>`.
 
-A promotion refuses to run when:
+To roll back, run with `start: <env>` and `kind: rollback`. It redeploys
+the environment's recorded `Rollback-Digest` through the same gates (for
+prod, the same change and approval) and stops there. The dashboard counts
+it as a rollback. When prod fails after its deploy (smoke tests, health
+watch or G6), the run starts that rollback itself; it still waits for a
+`release-approval` reviewer. For dev and staging, the feedback job prints
+the command.
+
+A stage refuses to run when:
 - the previous environment's last deploy wasn't made by this workflow;
 - that deploy's G6 isn't green, or its G3 didn't pass;
-- `deploy/base` or the target overlay changed on main after the run started.
+- the previous environment now runs a newer digest than this run deployed
+  there (a newer release overtook it);
+- `deploy/base` or the target overlay changed on main after it verified them.
 
 ## One-time cluster setup (run by an operator)
 
@@ -230,8 +264,8 @@ and the environment tester's RBAC are in the security dashboard's
 
 ### Environment test runner
 
-The tests after each deploy (G3 in dev and staging, the smoke tests in
-prod) run on a self-hosted runner, because GitHub-hosted runners can't
+The tests after each deploy (G3 in dev and staging, the smoke tests and
+health watch in prod) run on a self-hosted runner, because GitHub-hosted runners can't
 reach the cluster. The job:
 - finds the pod running the promoted digest;
 - port-forwards it to `127.0.0.1:18000`;
@@ -249,12 +283,13 @@ installed by the job. It runs as the `env-tester` ServiceAccount
 token for `env-tester`, writes a kubeconfig with it (mode 0600), registers
 the runner as **ephemeral** (one registration serves one job) with the
 label `django-gates-demo-env`, and runs it. It needs `GH_TOKEN` with
-admin rights on the repo, for the registration token. Start it before each
-release run, or keep it in a loop while you promote.
+admin rights on the repo, for the registration token. One release run has
+up to three environment test jobs (one per stage), so keep it in a loop
+while a release is running.
 
 This repo is public, so a pull request from a fork could try to run on a
 self-hosted runner. To prevent that:
-- keep the runner registered only while a promotion runs;
+- keep the runner registered only while a release runs;
 - keep *Settings → Actions → Fork pull request workflows → Require
   approval for all external contributors* on. The pipeline itself never
   targets this label.

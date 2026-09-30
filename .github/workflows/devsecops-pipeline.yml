@@ -1,23 +1,26 @@
-# The whole path from commit to a signed, tested artifact, in ONE run.
-# Every control is its own job and keeps its report as evidence, so the
-# run shows what passed and what failed. A failed gate stops the stages
-# after it.
+# CI — stage 1 of the release pipeline, from commit to a signed artifact,
+# in ONE run. Every control is its own job and keeps its report as
+# evidence, so the run shows what passed and what failed.
 #
 #   1 build      build ×2 (reproducible?) → image artifact │ unit tests + coverage
 #                │ code quality (ruff: lint + complexity threshold)
 #   2 static     semgrep · gitleaks · trufflehog · trivy (SCA, lockfile) · checkov
 #                │ PR: reviewers · signed commits
 #     image      trivy (image) · syft SBOM · dockle · django check --deploy (on the built image)
-#   3 publish    main only, and only if every stage-1/2 control passed: push the
-#                exact built digest, cosign sign + SBOM/SLSA attestations
-#     ── G1 (PR merge gate) · G2 (artifact gate) ──
-#   4 preprod    the image behind a TLS proxy: functional tests · k6 load
-#   5 dast       nuclei · testssl.sh
-#     ── G3 (test gate) ──
-#   6 evidence   every report + hash manifest → artifact `evidence` (90 days);
+#   3 package    main only, and only if every stage-1/2 control passed: push the
+#                exact built digest to the artifact repository (GHCR), cosign
+#                sign + SBOM/SLSA attestations
+#     ── G1 (PR merge gate) · G2 Control Gate: build successful, all tests
+#        passed, code quality threshold met, every scan clean ──
+#   4 evidence   every report + hash manifest → artifact `evidence` (90 days);
 #                on main, attested to the image digest with cosign
-#   7 promote    main, published and G3 passed: starts devsecops-release.yml
-#                for dev with this commit (staging and prod are manual)
+#   5 release    main, published and the Control Gate passed: starts
+#                devsecops-release.yml for this commit (deploy to dev → approval
+#                → staging → approval → prod)
+#
+# Nothing dynamic runs here: integration, end-to-end, performance and DAST
+# tests run in the release pipeline, against each environment after this
+# digest is deployed to it — never against an image nobody deployed.
 #
 # Rules that make the results trustworthy:
 #  - Tools never decide pass/fail (they run "don't fail on findings");
@@ -25,14 +28,12 @@
 #    in the report, and fails the job. A missing report is a fail.
 #  - Exceptions live in security/accepted-risks.json, each with a reason
 #    and an expiry, and every verdict lists the ones it applied.
-#  - Nothing is rebuilt: stages 2–5 test the `image` artifact from build,
-#    checked against its digest, and publish pushes those same bytes.
+#  - Nothing is rebuilt: stage 2 tests the `image` artifact from build,
+#    checked against its digest, and publish pushes those same bytes; the
+#    release deploys that digest.
 #  - Every image and action is pinned by digest/SHA.
-#  - G1 goes to the security dashboard on pull requests, G2/G3 on pushes to
+#  - G1 goes to the security dashboard on pull requests, G2 on pushes to
 #    main (artifact `gate-result-<G>`). Elsewhere they're `gate-preview-<G>`.
-#
-# `workflow_dispatch` with full_scan runs stages 4–5 even when G2 fails —
-# for a full picture of an app that isn't clean yet. It never publishes.
 
 name: devsecops-pipeline
 
@@ -43,16 +44,11 @@ on:
     types: [submitted, dismissed]
   push:
     branches: [main]
-    # Deploy commits (devsecops-release.yml) change only deploy/**. To
+    # Deploy commits (devsecops-stage.yml) change only deploy/**. To
     # release a deploy/-only or docs-only change, run this workflow on
-    # main by hand: it publishes like a push (unless full_scan).
+    # main by hand: it publishes like a push.
     paths-ignore: ["deploy/**", "**.md"]
   workflow_dispatch:
-    inputs:
-      full_scan:
-        description: Run pre-production tests and DAST even if G2 fails (evidence only; never publishes)
-        type: boolean
-        default: false
 
 permissions: {}
 
@@ -67,7 +63,6 @@ env:
   SRC_DIRS: config notes manage.py gunicorn.conf.py
   LOCKFILE: uv.lock
   COVERAGE_THRESHOLD: "90"
-  SLO_P95_MS: "500"
   UV_VERSION: "0.12.19"
   SEMGREP: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
   GITLEAKS: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
@@ -76,11 +71,6 @@ env:
   TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
   SYFT: anchore/syft:v1.52.0@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
   DOCKLE: goodwithtech/dockle:v0.4.15@sha256:eade932f793742de0aa8755406c7677cd7696f8675b6180926f7eeffa7abe6b9
-  K6: grafana/k6:2.3.0@sha256:e66db15b860113878fa74670e31f5e274830b7b6e42c8bff28b2f2d86a257603
-  NUCLEI: projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
-  NUCLEI_TEMPLATES: v10.4.9
-  NUCLEI_TEMPLATES_COMMIT: 893122ffce8ebf8e264f15d2cd3960cb1dd36d6c
-  TESTSSL: drwetter/testssl.sh:3.2.4@sha256:e38206bd09f48e8b4022ee8480ad3be93bfecfc4e5b5e4c5f7aca5c4bec4da52
   CERT_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
@@ -778,9 +768,9 @@ jobs:
           path: reports/django-deploy-check/
           if-no-files-found: ignore
 
-  # ── 3 publish ──────────────────────────────────────────────────────────
+  # ── 3 package ──────────────────────────────────────────────────────────
   publish:
-    name: 3 publish · push + sign + attest
+    name: 3 package · push + sign + attest
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
             sca-trivy, iac-checkov, image-scan, sbom, image-compliance, django-deploy-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
@@ -800,7 +790,7 @@ jobs:
       VERDICT_FILE: reports/publish/verdict.json
       DIGEST: ${{ needs.build.outputs.digest }}
       REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.build.outputs.digest }}
-      PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan)) }}
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
       # The keyless signature's identity is this file on main — what
       # Kyverno admits and devsecops-release.yml verifies.
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
@@ -892,7 +882,7 @@ jobs:
             python3 .github/scripts/verdict.py signed   # fail: lists the controls that didn't pass
           elif [ "$GO" != true ]; then
             python3 .github/scripts/verdict.py result skipped \
-              "not published: images are pushed and signed only from main — a push, or a manual run without full_scan (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every stage 1–2 control passed"
+              "not published: images are pushed and signed only from main — a push or a manual run (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every stage 1–2 control passed"
           elif [ "$VERIFY_OUTCOME" = success ]; then
             python3 .github/scripts/verdict.py signed
           else
@@ -925,9 +915,13 @@ jobs:
           subject: pr-${{ github.event.pull_request.number }}
           commit-sha: ${{ github.event.pull_request.head.sha }}
 
+  # The Control Gate between CI and the release pipeline (gate.py GATES
+  # "G2"): nothing is deployed unless it passed for this digest, which
+  # devsecops-release.yml checks in the signed evidence.
   gate-g2:
-    name: G2 artifact gate
-    needs: [build, code-quality, sca-trivy, iac-checkov, image-scan, sbom, publish]
+    name: G2 Control Gate
+    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+            image-scan, sbom, image-compliance, django-deploy-check, publish]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -947,255 +941,15 @@ jobs:
           needs: ${{ toJSON(needs) }}
           subject: ${{ needs.build.outputs.digest || github.sha }}
           artifact-digest: ${{ needs.build.outputs.digest }}
-          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan)) }}
-          allow-skipped: ${{ !(github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan))) && 'artifact_signed_attested' || '' }}
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          allow-skipped: ${{ !(github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && 'artifact_signed_attested' || '' }}
 
-  # ── 4 preprod ──────────────────────────────────────────────────────────
-  functional:
-    name: 4 preprod · functional tests
-    needs: [build, gate-g2]
-    if: ${{ !cancelled() && needs.build.outputs.digest != '' && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: functional
-      OUT: reports/functional
-      VERDICT_FILE: reports/functional/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - uses: ./.github/actions/preprod
-        with:
-          image-tag: ${{ env.IMAGE_TAG }}
-          digest: ${{ needs.build.outputs.digest }}
-      - id: run
-        run: |
-          mkdir -p "$OUT"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          rc=0
-          uv sync --frozen || rc=$?
-          uv run --frozen pytest tests/functional -p no:cacheprovider --junitxml="$OUT/junit.xml" || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-      - id: verdict
-        if: always()
-        env:
-          RC: ${{ steps.run.outputs.rc }}
-          LABEL: tests/functional against the built image behind TLS
-          TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/junit.xml"
-      - if: always()
-        run: |
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          docker compose -f tests/preprod/compose.yaml logs --no-color > "$OUT/preprod.log" 2>&1 || true
-          docker compose -f tests/preprod/compose.yaml down -v || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-functional
-          path: reports/functional/
-          if-no-files-found: ignore
-
-  performance:
-    name: 4 preprod · k6 load
-    needs: [build, gate-g2]
-    if: ${{ !cancelled() && needs.build.outputs.digest != '' && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: performance
-      OUT: reports/performance
-      VERDICT_FILE: reports/performance/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/preprod
-        with:
-          image-tag: ${{ env.IMAGE_TAG }}
-          digest: ${{ needs.build.outputs.digest }}
-      - run: |
-          mkdir -p "$OUT"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          docker run --rm --network host --user "$(id -u):$(id -g)" \
-            -v "$PWD/tests/perf:/perf:ro" -v "$PWD/$OUT:/out" -v "$SSL_CERT_FILE:/ca.crt:ro" \
-            -e SSL_CERT_FILE=/ca.crt -e BASE_URL -e USER_A -e PASSWORD_A -e SUMMARY_OUT=/out/k6-summary.json \
-            "$K6" run --quiet /perf/load.js || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: k6 2.3.0 (10 VUs, 30 s)
-        run: python3 .github/scripts/verdict.py k6 "$OUT/k6-summary.json"
-      - if: always()
-        run: |
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          docker compose -f tests/preprod/compose.yaml logs --no-color > "$OUT/preprod.log" 2>&1 || true
-          docker compose -f tests/preprod/compose.yaml down -v || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-performance
-          path: reports/performance/
-          if-no-files-found: ignore
-
-  # ── 5 dast ─────────────────────────────────────────────────────────────
-  dast-nuclei:
-    name: 5 DAST · nuclei
-    needs: [build, gate-g2]
-    if: ${{ !cancelled() && needs.build.outputs.digest != '' && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: dast-nuclei
-      OUT: reports/dast-nuclei
-      VERDICT_FILE: reports/dast-nuclei/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/preprod
-        with:
-          image-tag: ${{ env.IMAGE_TAG }}
-          digest: ${{ needs.build.outputs.digest }}
-      - id: scan
-        # Templates pinned to a release commit, not "latest at scan time",
-        # so the same image gets the same verdict on a re-run.
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT" && chmod 777 "$OUT"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES" https://github.com/projectdiscovery/nuclei-templates.git "$RUNNER_TEMP/templates"
-          got=$(git -C "$RUNNER_TEMP/templates" rev-parse HEAD)
-          [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
-          touch "$OUT/nuclei.jsonl"
-          docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT:/out" "$NUCLEI" \
-            -u "$BASE_URL" -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
-            -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/nuclei.log" 2>&1
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
-      - id: verdict
-        if: always()
-        env:
-          RC: ${{ steps.scan.outputs.rc }}
-          TOOL: nuclei 3.11.1
-          TEMPLATES: ${{ env.NUCLEI_TEMPLATES }}
-        run: python3 .github/scripts/verdict.py nuclei "$OUT/nuclei.jsonl"
-      - if: always()
-        run: |
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          docker compose -f tests/preprod/compose.yaml logs --no-color > "$OUT/preprod.log" 2>&1 || true
-          docker compose -f tests/preprod/compose.yaml down -v || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-dast-nuclei
-          path: reports/dast-nuclei/
-          if-no-files-found: ignore
-
-  dast-tls:
-    name: 5 DAST · TLS (testssl.sh)
-    needs: [build, gate-g2]
-    if: ${{ !cancelled() && needs.build.outputs.digest != '' && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: dast-tls
-      OUT: reports/dast-tls
-      VERDICT_FILE: reports/dast-tls/verdict.json
-      NATIVE: reports/dast-tls/testssl.log
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/preprod
-        with:
-          image-tag: ${{ env.IMAGE_TAG }}
-          digest: ${{ needs.build.outputs.digest }}
-      - run: |
-          mkdir -p "$OUT" && chmod 777 "$OUT"
-          # --add-ca: trust the proxy's throwaway CA, so the chain is judged
-          # like a real one; what's left about that CA is in the register.
-          docker run --rm --network host -v "$PWD/$OUT:/out" -v "$RUNNER_TEMP/preprod-ca.crt:/ca.crt:ro" "$TESTSSL" \
-            --quiet --color 0 --warnings off --add-ca /ca.crt \
-            --jsonfile-pretty /out/testssl.json https://localhost > "$OUT/testssl.log" 2>&1 || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: testssl.sh 3.2.4
-        run: python3 .github/scripts/verdict.py testssl "$OUT/testssl.json"
-      # The tool's own report under the verdict (findings.py native).
-      - name: tool report
-        if: always()
-        run: python3 .github/scripts/findings.py native "$NATIVE"
-      - if: always()
-        run: |
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/preprod.env"; set +a
-          docker compose -f tests/preprod/compose.yaml logs --no-color > "$OUT/preprod.log" 2>&1 || true
-          docker compose -f tests/preprod/compose.yaml down -v || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-dast-tls
-          path: reports/dast-tls/
-          if-no-files-found: ignore
-
-  gate-g3:
-    name: G3 test gate
-    needs: [build, gate-g2, unit-tests, functional, performance, dast-nuclei, dast-tls, image-compliance, django-deploy-check]
-    if: ${{ always() && (needs.gate-g2.outputs.status == 'pass' || inputs.full_scan) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      status: ${{ steps.gate.outputs.status }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - id: gate
-        uses: ./.github/actions/gate
-        with:
-          gate: G3
-          needs: ${{ toJSON(needs) }}
-          subject: ${{ needs.build.outputs.digest }}
-          artifact-digest: ${{ needs.build.outputs.digest }}
-          environment: preprod
-          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.full_scan)) && needs.gate-g2.outputs.status == 'pass' }}
-
-  # ── 6 evidence ─────────────────────────────────────────────────────────
+  # ── 4 evidence ─────────────────────────────────────────────────────────
   evidence:
-    name: 6 evidence bundle
+    name: 4 evidence bundle
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
             reviewers, commits-signed, image-scan, sbom, image-compliance, django-deploy-check, publish,
-            gate-g1, gate-g2, functional, performance, dast-nuclei, dast-tls, gate-g3]
+            gate-g1, gate-g2]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1212,7 +966,7 @@ jobs:
       CONTROLS: >-
         build,unit-tests,coverage,code-quality,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
         sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
-        image-compliance,django-deploy-check,publish,functional,performance,dast-nuclei,dast-tls
+        image-compliance,django-deploy-check,publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1259,17 +1013,16 @@ jobs:
             --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
           echo "Evidence manifest attested to ${REF} (${PREDICATE_TYPE})" >> "$GITHUB_STEP_SUMMARY"
 
-  # ── 7 promote to dev ───────────────────────────────────────────────────
-  # A published, G3-passed, evidence-attested digest goes straight to dev:
-  # devsecops-release.yml for this commit, with every release gate. Staging
-  # and prod stay manual.
-  promote-dev:
-    name: 7 promote to dev
-    needs: [publish, gate-g2, gate-g3, evidence]
+  # ── 5 release ──────────────────────────────────────────────────────────
+  # A published, Control-Gate-passed, evidence-attested digest starts the
+  # release pipeline for this commit: deploy to dev and test it there, then
+  # staging and prod, each behind its approval gate.
+  release:
+    name: 5 start the release pipeline
+    needs: [publish, gate-g2, evidence]
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.publish.outputs.published == 'true'
-      && needs.gate-g2.outputs.status == 'pass' && needs.gate-g3.outputs.status == 'pass'
-      && needs.evidence.result == 'success' }}
+      && needs.gate-g2.outputs.status == 'pass' && needs.evidence.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -1280,8 +1033,8 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            -f environment=dev -f kind=planned -f commit="$GITHUB_SHA"
-          echo "Started devsecops-release (dev) for ${GITHUB_SHA:0:7}: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
+            -f start=dev -f kind=planned -f commit="$GITHUB_SHA"
+          echo "Started devsecops-release for ${GITHUB_SHA:0:7} (dev → staging → prod): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
 
   # ── PR comment ─────────────────────────────────────────────────────────
   # One comment per PR, edited in place: every control, what's new compared

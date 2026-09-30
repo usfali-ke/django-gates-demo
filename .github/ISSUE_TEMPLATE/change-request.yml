@@ -11,10 +11,13 @@ body:
   - type: markdown
     attributes:
       value: |
-        Release with **Actions → devsecops-release → Run workflow**, passing this issue's number.
-        G4 approves only when this change carries `change-approved` and `readiness-approved`
-        (plus `client-approved` if ticked below), applied by someone other than you, and the
-        release falls inside the change window.
+        Every published commit on main starts a devsecops-release run: dev, then staging after
+        `staging-approval`, then prod after `release-approval` and G4. Name that commit (or the
+        release run) under **Release** and the run finds this request by itself: staging tells
+        you here when UAT can start, and the prod approval uses it.
+        G4 approves only when this change carries `change-approved`, `readiness-approved` and
+        `uat-approved` (plus `client-approved` if ticked below), applied by someone other than
+        you, and the release falls inside the change window.
   - type: dropdown
     id: change_type
     attributes:
@@ -25,6 +28,12 @@ body:
         - Emergency
     validations:
       required: true
+  - type: input
+    id: release
+    attributes:
+      label: Release
+      description: The main commit being released (full SHA, or at least 7 characters) or its devsecops-release run URL
+      placeholder: 3f2a9c1
   - type: input
     id: window_start
     attributes:

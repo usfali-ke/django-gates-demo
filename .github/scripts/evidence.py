@@ -2,6 +2,11 @@
 
     python3 .github/scripts/evidence.py <dir with report-*/ and gate-{result,preview}-*/> <out dir>
 
+REPORT_PREFIX (default `report-`) is the artifact name prefix of the
+reports: a release stage names them `report-<env>-<control>`, because one
+release run deploys to dev, staging and prod and every environment runs
+the same controls.
+
 Writes into <out dir>:
   manifest.json  what ran, what it decided, and the sha256 of every report
                  file — the predicate cosign attests to the image digest,
@@ -43,11 +48,8 @@ CONTROLS = {
     "image-compliance": ("2-image", "dockle.json", "Dockle Scan"),
     "django-deploy-check": ("2-image", None, None),
     "publish": ("3-publish", None, None),
-    "functional": ("4-preprod", None, None),
-    "performance": ("4-preprod", None, None),
-    "dast-nuclei": ("5-dast", "nuclei.jsonl", "Nuclei Scan"),
-    "dast-tls": ("5-dast", None, None),
-    # devsecops-release.yml
+    # devsecops-stage.yml (one release stage per environment)
+    "promotion": ("R1-verify", None, None),
     "provenance": ("R1-verify", None, None),
     "evidence-check": ("R1-verify", None, None),
     "config": ("R1-verify", "checkov/results_json.json", "Checkov Scan"),
@@ -57,8 +59,14 @@ CONTROLS = {
     "approve-staging": ("R2-approve", None, None),
     "deploy": ("R3-deploy", None, None),
     "post-deploy": ("R4-verify", None, None),
-    "dependency-check": ("R5-test", None, None),
+    # against the deployed environment
+    "functional": ("R5-test", None, None),
+    "performance": ("R5-test", None, None),
+    "dast-nuclei": ("R5-test", "nuclei.jsonl", "Nuclei Scan"),
+    "dast-tls": ("R5-test", None, None),
+    "dependency-check": ("R5-test", "trivy.json", "Trivy Scan"),
     "smoke": ("R5-test", None, None),
+    "health-watch": ("R5-test", None, None),
 }
 
 
@@ -74,11 +82,12 @@ def main():
     src, out = Path(sys.argv[1]), Path(sys.argv[2])
     e = os.environ.get
     applicable = [c for c in (e("CONTROLS") or ",".join(CONTROLS)).split(",") if c]
+    prefix = e("REPORT_PREFIX") or "report-"
     (out / "reports").mkdir(parents=True, exist_ok=True)
     controls = []
     for name in applicable:
         stage, dd_file, dd_type = CONTROLS.get(name, ("?", None, None))
-        folder = src / f"report-{name}"
+        folder = src / f"{prefix}{name}"
         entry = {"control": name, "stage": stage, "status": "missing", "detail": "no report — the job did not run (an earlier gate failed, or not applicable to this event) or crashed before uploading", "files": []}
         if folder.is_dir():
             dest = out / "reports" / name

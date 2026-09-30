@@ -47,25 +47,27 @@ GATES = {
         ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
         ("commits_signed", "security", [("commits-signed", "result")]),
     ],
+    # The Control Gate at the end of CI (devsecops-pipeline.yml): build
+    # successful, every test passed, code quality met, and every static and
+    # image control clean, before anything is deployed anywhere. Coverage
+    # and the image compliance checks are properties of the artifact, so
+    # they are decided here, once, for the digest.
     "G2": [
         ("reproducible_build_config_controlled", "delivery", [("build", "result")]),
+        ("unit_tests_pass", "quality", [("unit-tests", "result")]),
+        ("coverage_threshold_met", "quality", [("unit-tests", "coverage")]),
         ("code_quality_threshold_met", "quality", [("code-quality", "result")]),
+        ("sast_clean", "security", [("sast-semgrep", "result")]),
+        ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
         ("sca_clean", "security", [("sca-trivy", "result")]),
         ("iac_clean", "security", [("iac-checkov", "result")]),
         ("container_image_scan_hardened_base", "security", [("image-scan", "result")]),
+        ("compliance_scan_clean", "security", [("image-compliance", "result"), ("django-deploy-check", "result")]),
         ("artifact_signed_attested", "security", [("publish", "result")]),
         ("sbom_present", "security", [("sbom", "result")]),
     ],
-    "G3": [
-        ("functional_integration_regression_pass", "quality", [("functional", "result")]),
-        ("performance_within_slo", "quality", [("performance", "result")]),
-        ("coverage_threshold_met", "quality", [("unit-tests", "coverage")]),
-        ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
-        ("compliance_scan_clean", "security", [("image-compliance", "result"), ("django-deploy-check", "result")]),
-    ],
-    # G3 against the deployed environments (devsecops-release.yml, job
-    # env-tests). Coverage and the image compliance checks are properties
-    # of the artifact, already decided by the pipeline's G3 for this digest.
+    # G3 runs only against a deployed environment (devsecops-stage.yml, job
+    # env-tests), never against an image that isn't deployed yet.
     # dev: integration tests, DAST, and the deployed image's dependencies
     # re-scanned against today's vulnerability data.
     "G3@dev": [
@@ -73,22 +75,25 @@ GATES = {
         ("dast_scan_clean", "security", [("dast-nuclei", "result")]),
         ("dependency_check_clean", "security", [("dependency-check", "result")]),
     ],
+    # staging: end-to-end, performance and security scans; UAT follows.
     "G3@staging": [
         ("functional_integration_regression_pass", "quality", [("functional", "result")]),
         ("performance_within_slo", "quality", [("performance", "result")]),
         ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
     ],
     # prod after the rollout: read-only smoke tests (no test users, no
-    # writes). Argo CD's own G6 (sync, canary analysis, admission) is
-    # recorded separately by the dashboard.
+    # writes), then a health watch of the new pods. Argo CD's own G6 (sync,
+    # canary analysis, admission) is recorded separately by the dashboard.
     "G6@prod": [
         ("post_deploy_smoke_pass", "quality", [("smoke", "result")]),
+        ("post_deploy_health_watch_green", "delivery", [("health-watch", "result")]),
     ],
-    # Before each environment's deploy commit (devsecops-release.yml).
+    # Before each environment's deploy commit (devsecops-stage.yml).
     "G5": _G5,
     "G5@dev": _G5,
-    # Promotion from dev: dev's G3 for this digest, the notes the approver
-    # read, and the staging-approval environment's reviewer.
+    # Promotion from dev (the first Approval Gate): dev's G3 for this
+    # digest (test results + security scans), the release notes the
+    # approver read, and the staging-approval environment's reviewer.
     "G5@staging": _G5 + [
         ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
         ("release_notes_published", "governance", [("release-notes", "result")]),
