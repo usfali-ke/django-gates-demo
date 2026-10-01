@@ -65,12 +65,15 @@ CONTROLS = {
     "deploy": ("R3-deploy", None, None),
     "post-deploy": ("R4-verify", None, None),
     # against the deployed environment
-    "functional": ("R5-test", None, None),
+    "smoke": ("R5-test", None, None),
+    "integration": ("R5-test", None, None),
+    "e2e": ("R5-test", None, None),
+    "regression": ("R5-test", None, None),
+    "security-tests": ("R5-test", None, None),
     "performance": ("R5-test", None, None),
     "dast-nuclei": ("R5-test", "nuclei.jsonl", "Nuclei Scan"),
     "dast-tls": ("R5-test", None, None),
     "dependency-check": ("R5-test", "trivy.json", "Trivy Scan"),
-    "smoke": ("R5-test", None, None),
     "health-watch": ("R5-test", None, None),
 }
 

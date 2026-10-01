@@ -1043,9 +1043,13 @@ jobs:
     # supplies KUBECONFIG: the env-tester service account, which may
     # port-forward in every environment but exec (to create test users)
     # only in dev and staging. The repo holds no cluster credential.
-    #   dev      integration tests · nuclei · dependency re-check (trivy,
+    # Each suite (tests/live, tests/perf, the scanners) is its own step
+    # and its own control with a verdict, and G3/G6 has a criterion for it:
+    #   dev      smoke · integration · regression · security tests
+    #            (authenticated) · nuclei · dependency re-check (trivy,
     #            today's vulnerability data, on the deployed digest)
-    #   staging  end-to-end · k6 · nuclei · testssl.sh
+    #   staging  smoke · end-to-end · regression · security tests
+    #            (authenticated) · k6 · nuclei · testssl.sh
     #   prod     smoke tests (read-only, no test users, no writes) · health
     #            watch (HEALTH_WATCH_SECONDS of /healthz probes + restarts)
     needs: [resolve, post-deploy]
@@ -1125,46 +1129,81 @@ jobs:
             || { docker logs "env-proxy-${GITHUB_RUN_ID}" 2>&1 | tail -20; tail -5 "$OUT/port-forward.log"; exit 1; }
           cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/env-ca.crt" > "$RUNNER_TEMP/env-bundle.crt"
           chmod 644 "$RUNNER_TEMP/env-ca.crt" "$RUNNER_TEMP/env-bundle.crt"   # read by tool containers running as other uids
-      - name: ${{ inputs.environment == 'staging' && 'end-to-end tests' || 'integration tests' }}
-        id: functional-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
-        run: |
-          mkdir -p "$OUT/functional"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
-          rc=0
-          uv sync --frozen || rc=$?
-          uv run --frozen pytest tests/functional -p no:cacheprovider --junitxml="$OUT/functional/junit.xml" || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-      - id: functional
-        if: ${{ !cancelled() && inputs.environment != 'prod' }}
-        env:
-          CONTROL: functional
-          VERDICT_FILE: reports/env-tests/functional/verdict.json
-          RC: ${{ steps.functional-run.outputs.rc }}
-          LABEL: tests/functional against ${{ inputs.environment }} (${{ env.NS }})
-          TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/functional/junit.xml"
       - name: smoke tests
         id: smoke-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'prod' }}
-        run: |
-          mkdir -p "$OUT/smoke"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
-          rc=0
-          uv sync --frozen || rc=$?
-          uv run --frozen pytest tests/functional -m smoke -p no:cacheprovider --junitxml="$OUT/smoke/junit.xml" || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+        if: ${{ !cancelled() && steps.up.outcome == 'success' }}
+        env:
+          ENV_FILE: ${{ runner.temp }}/env-tests.env
+        run: bash tests/env/live-suite.sh smoke tests/live -m smoke
       - id: smoke
-        if: ${{ !cancelled() && inputs.environment == 'prod' }}
+        if: ${{ !cancelled() }}
         env:
           CONTROL: smoke
           VERDICT_FILE: reports/env-tests/smoke/verdict.json
           RC: ${{ steps.smoke-run.outputs.rc }}
-          LABEL: tests/functional -m smoke against prod (${{ env.NS }}), read-only
+          LABEL: "tests/live -m smoke against ${{ inputs.environment }} (read-only: no test users, no writes)"
           TOOL: pytest + requests
         run: python3 .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
+      - name: integration tests
+        id: integration-run
+        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'dev' }}
+        env:
+          ENV_FILE: ${{ runner.temp }}/env-tests.env
+        run: bash tests/env/live-suite.sh integration tests/live/test_integration.py
+      - id: integration
+        if: ${{ !cancelled() && inputs.environment == 'dev' }}
+        env:
+          CONTROL: integration
+          VERDICT_FILE: reports/env-tests/integration/verdict.json
+          RC: ${{ steps.integration-run.outputs.rc }}
+          LABEL: "tests/live/test_integration.py against ${{ inputs.environment }} (TLS ingress, sessions, auth, API and pages on one database)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
+      - name: end-to-end tests
+        id: e2e-run
+        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'staging' }}
+        env:
+          ENV_FILE: ${{ runner.temp }}/env-tests.env
+        run: bash tests/env/live-suite.sh e2e tests/live/test_e2e.py
+      - id: e2e
+        if: ${{ !cancelled() && inputs.environment == 'staging' }}
+        env:
+          CONTROL: e2e
+          VERDICT_FILE: reports/env-tests/e2e/verdict.json
+          RC: ${{ steps.e2e-run.outputs.rc }}
+          LABEL: "tests/live/test_e2e.py against ${{ inputs.environment }} (user journeys through the pages and their forms)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
+      - name: regression tests
+        id: regression-run
+        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
+        env:
+          ENV_FILE: ${{ runner.temp }}/env-tests.env
+        run: bash tests/env/live-suite.sh regression tests/live/test_regression.py
+      - id: regression
+        if: ${{ !cancelled() && inputs.environment != 'prod' }}
+        env:
+          CONTROL: regression
+          VERDICT_FILE: reports/env-tests/regression/verdict.json
+          RC: ${{ steps.regression-run.outputs.rc }}
+          LABEL: "tests/live/test_regression.py against ${{ inputs.environment }} (fixed or decided behaviour that must not come back)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
+      - name: security tests (authenticated)
+        id: security-tests-run
+        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
+        env:
+          ENV_FILE: ${{ runner.temp }}/env-tests.env
+        run: bash tests/env/live-suite.sh security-tests tests/live/test_security.py
+      - id: security-tests
+        if: ${{ !cancelled() && inputs.environment != 'prod' }}
+        env:
+          CONTROL: security-tests
+          VERDICT_FILE: reports/env-tests/security-tests/verdict.json
+          RC: ${{ steps.security-tests-run.outputs.rc }}
+          LABEL: "tests/live/test_security.py against ${{ inputs.environment }} (OWASP Top 10 with two users: IDOR, CSRF, sessions, headers, injection)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
       - name: health watch
         if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'prod' }}
         # Monitoring after the rollout: the new pods keep answering /healthz
@@ -1341,7 +1380,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          body="**Staging is ready for UAT.** \`${DIGEST:0:19}…\` (built from ${SOURCE_SHA:0:7}) is deployed to staging and passed its end-to-end, performance and security tests: ${RUN_URL}
+          body="**Staging is ready for UAT.** \`${DIGEST:0:19}…\` (built from ${SOURCE_SHA:0:7}) is deployed to staging and passed its smoke, end-to-end, regression, performance and security tests (authenticated, nuclei, testssl.sh): ${RUN_URL}
 
           Sign off by adding the \`uat-approved\` label (someone other than the requester). Prod's Approval Gate (\`release-approval\` in that run) and G4 require it."
           echo "$body" >> "$GITHUB_STEP_SUMMARY"
@@ -1401,8 +1440,8 @@ jobs:
             done
           fi
           case "$TARGET_ENV" in
-            dev)     controls="promotion,provenance,evidence-check,config,rollback-plan,deploy,post-deploy,functional,dast-nuclei,dependency-check" ;;
-            staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-staging,deploy,post-deploy,functional,performance,dast-nuclei,dast-tls" ;;
+            dev)     controls="promotion,provenance,evidence-check,config,rollback-plan,deploy,post-deploy,smoke,integration,regression,security-tests,dast-nuclei,dependency-check" ;;
+            staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-staging,deploy,post-deploy,smoke,e2e,regression,security-tests,performance,dast-nuclei,dast-tls" ;;
             prod)    controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,deploy,post-deploy,smoke,health-watch" ;;
           esac
           CONTROLS=$controls python3 .github/scripts/evidence.py "$in" release-evidence

@@ -68,18 +68,23 @@ GATES = {
     ],
     # G3 runs only against a deployed environment (devsecops-stage.yml, job
     # env-tests), never against an image that isn't deployed yet.
-    # dev: integration tests, DAST, and the deployed image's dependencies
-    # re-scanned against today's vulnerability data.
+    # dev: smoke, integration and regression tests; DAST (nuclei, and the
+    # authenticated security tests nuclei can't do); the deployed image's
+    # dependencies re-scanned against today's vulnerability data.
     "G3@dev": [
-        ("functional_integration_regression_pass", "quality", [("functional", "result")]),
-        ("dast_scan_clean", "security", [("dast-nuclei", "result")]),
+        ("functional_integration_regression_pass", "quality",
+         [("smoke", "result"), ("integration", "result"), ("regression", "result")]),
+        ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("security-tests", "result")]),
         ("dependency_check_clean", "security", [("dependency-check", "result")]),
     ],
-    # staging: end-to-end, performance and security scans; UAT follows.
+    # staging: smoke, end-to-end and regression tests, performance, and the
+    # security scans (nuclei, testssl.sh, authenticated); UAT follows.
     "G3@staging": [
-        ("functional_integration_regression_pass", "quality", [("functional", "result")]),
+        ("functional_integration_regression_pass", "quality",
+         [("smoke", "result"), ("e2e", "result"), ("regression", "result")]),
         ("performance_within_slo", "quality", [("performance", "result")]),
-        ("dast_scan_clean", "security", [("dast-nuclei", "result"), ("dast-tls", "result")]),
+        ("dast_scan_clean", "security",
+         [("dast-nuclei", "result"), ("dast-tls", "result"), ("security-tests", "result")]),
     ],
     # prod after the rollout: read-only smoke tests (no test users, no
     # writes), then a health watch of the new pods. Argo CD's own G6 (sync,

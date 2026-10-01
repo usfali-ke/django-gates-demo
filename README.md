@@ -23,9 +23,29 @@ DJANGO_DEBUG=1 uv run python manage.py migrate
 DJANGO_DEBUG=1 uv run python manage.py runserver
 ```
 
-Run the tests with `uv run pytest tests/unit`. The functional, perf and
-DAST suites need a deployed environment: the release pipeline runs them
-against dev, staging and prod right after each deploy.
+Run the unit tests with `uv run pytest tests/unit`. The other suites test
+a running app, so the release pipeline runs them against dev, staging and
+prod right after each deploy:
+
+| suite | what it checks | runs in |
+|---|---|---|
+| `tests/live/test_smoke.py` (`-m smoke`) | read-only: health, TLS redirect, headers, login page, static files, anonymous access refused | dev · staging · prod |
+| `tests/live/test_integration.py` | ingress + sessions + auth + API + pages together, validation, persistence | dev |
+| `tests/live/test_e2e.py` | user journeys through the pages and their forms (login, add, delete, logout, two users) | staging |
+| `tests/live/test_regression.py` | fixed or decided behaviour: no CORS on static, note limit, method allow-lists, body size, caching | dev · staging |
+| `tests/live/test_security.py` | authenticated DAST (OWASP Top 10): IDOR, CSRF, open redirect, session fixation, logout, enumeration, cookies, headers, injection | dev · staging |
+| `tests/perf/load.js` (k6) | p95 latency SLO, error rate | staging |
+| nuclei · testssl.sh · trivy | unauthenticated DAST, TLS, the deployed digest's dependencies | dev/staging · staging · dev |
+
+To run a suite against any running instance (for example `docker run` of
+the image behind `tests/env/Caddyfile`), use its make target, e.g.
+`make regression` or `make security-tests`. All but `make smoke` need two
+users (`manage.py ensure_user`):
+
+```
+BASE_URL=https://localhost:18443 HTTP_URL=http://localhost:18480 REQUESTS_CA_BUNDLE=ca.crt \
+USER_A=... PASSWORD_A=... USER_B=... PASSWORD_B=... make e2e
+```
 
 ## Build & unit tests (`devsecops-pipeline.yml`, CI)
 
@@ -158,13 +178,15 @@ digest is deployed there:
 1 Build & unit tests (devsecops-pipeline) ── G2 Control Gate ── starts ↓
 
 2 Deploy to Dev ──── R1 verify → G5(dev) → deploy/dev → G6(dev)
-                     → G3 in dev: integration tests · DAST (nuclei)
+                     → G3 in dev: smoke · integration · regression tests
+                       · DAST (nuclei + authenticated security tests)
                        · dependency re-check of the deployed digest
    Approval Gate ─── staging-approval: dev's test results + security scans,
                      release notes (in the run summary)
 3 Deploy to Staging  R1 verify → G5(staging) → deploy/staging → G6(staging)
-                     → G3 in staging: end-to-end · performance (k6)
-                       · DAST (nuclei + testssl.sh) → UAT (change request told)
+                     → G3 in staging: smoke · end-to-end · regression tests
+                       · performance (k6) · DAST (nuclei + testssl.sh
+                       + authenticated security tests) → UAT (change request told)
    Approval Gate ─── release-approval + G4: UAT sign-off (uat-approved),
                      test results, Go/No-Go (readiness-approved), change window
 4 Deploy to Prod ─── R1 verify → G5(prod) → deploy/prod (canary) → G6(prod)
@@ -266,7 +288,9 @@ and the environment tester's RBAC are in the security dashboard's
 
 The tests after each deploy (G3 in dev and staging, the smoke tests and
 health watch in prod) run on a self-hosted runner, because GitHub-hosted runners can't
-reach the cluster. The job:
+reach the cluster. It is one job per stage, so one runner registration,
+and each suite in it is its own step, control (`report-<env>-env-tests`)
+and G3/G6 criterion source. The job:
 - finds the pod running the promoted digest;
 - port-forwards it to `127.0.0.1:18000`;
 - outside prod, creates two random-password users in it

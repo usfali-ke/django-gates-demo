@@ -7,6 +7,10 @@
 #   make scan          static controls (no image build)
 #   make scan-image    builds the image, then image-scan · image-compliance · django-deploy-check
 #   make sca-trivy     any single control, by its pipeline name
+#   make smoke         a release-pipeline test suite (smoke · integration ·
+#                      e2e · regression · security-tests) against a running
+#                      app: BASE_URL, HTTP_URL, USER_A/PASSWORD_A,
+#                      USER_B/PASSWORD_B, REQUESTS_CA_BUNDLE
 #
 # Differences from CI: the image is a local `docker build` (not the
 # reproducible OCI artifact), and trufflehog verifies candidates against
@@ -32,8 +36,9 @@ SHOW     = ; rc=$$?; python3 .github/scripts/findings.py native reports/$@/$(1);
 
 STATIC := code-quality sast-semgrep secrets-gitleaks secrets-trufflehog sca-trivy iac-checkov
 IMAGE  := image-scan image-compliance django-deploy-check
+LIVE   := smoke integration e2e regression security-tests
 
-.PHONY: scan scan-image image pre-commit-secrets $(STATIC) $(IMAGE)
+.PHONY: scan scan-image image pre-commit-secrets $(STATIC) $(IMAGE) $(LIVE)
 
 # Every control runs; the exit code says whether any failed.
 scan:
@@ -122,3 +127,15 @@ pre-commit-secrets:
 	  --report-format json --report-path /repo/reports/secrets-gitleaks/gitleaks-staged.json --exit-code 0 || true
 	@SCOPE="the staged changes" CONTROL=secrets-gitleaks TOOL="gitleaks (pre-commit)" \
 	  python3 .github/scripts/verdict.py gitleaks reports/secrets-gitleaks/gitleaks-staged.json
+
+# The release pipeline's tests/live suites, as its environment test job
+# runs them (tests/env/live-suite.sh), against BASE_URL.
+smoke:          SUITE = tests/live -m smoke
+integration:    SUITE = tests/live/test_integration.py
+e2e:            SUITE = tests/live/test_e2e.py
+regression:     SUITE = tests/live/test_regression.py
+security-tests: SUITE = tests/live/test_security.py
+$(LIVE):
+	@test -n "$$BASE_URL" || { echo "BASE_URL (and the users, for all but smoke) must point at a running app"; exit 2; }
+	@OUT=reports bash tests/env/live-suite.sh $@ $(SUITE); \
+	  RC=$$(cat reports/$@/rc) LABEL="$(SUITE) against $$BASE_URL" $(call VERDICT,pytest + requests) tests reports/$@/junit.xml
