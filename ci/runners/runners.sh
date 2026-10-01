@@ -98,10 +98,11 @@ stop() {
   log "stopping: workflows fall back to ubuntu-latest"
   gh_api -X DELETE "${api}/actions/variables/CI_RUNS_ON" > /dev/null || true
   docker ps -q --filter "label=${prefix}" | xargs -r docker rm -f > /dev/null
-  # Runners that never got a job stay registered (offline) otherwise.
+  # Runners that never got a job stay registered (offline) otherwise. One
+  # GitHub still sees as busy can't be deleted yet (422); it expires.
   gh_api "${api}/actions/runners?per_page=100" \
     | jq -r --arg p "$prefix-" '.runners[] | select(.name | startswith($p)) | .id' \
-    | while read -r id; do gh_api -X DELETE "${api}/actions/runners/${id}" > /dev/null || true; done
+    | while read -r id; do gh_api -X DELETE "${api}/actions/runners/${id}" > /dev/null 2>&1 || true; done
   kill 0 2> /dev/null || true
 }
 
