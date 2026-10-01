@@ -12,43 +12,44 @@
 #   rollback (kind) the digest the environment ran before its last deploy:
 #            that deploy commit's Rollback-Digest trailer
 #
-# In order:
+# In SDLC order, a control gate between the phases:
 #
-#   R1 resolve   which digest this environment may get (above) → `promotion`;
-#                chained from the previous stage, it must still be the digest
-#                that stage deployed (input `expect-digest`)
-#   R1 verify    signature + SBOM + SLSA provenance (for the commit that
-#                built it) · evidence attestation (the pipeline's Control
-#                Gate passed for this digest) · target config (deploy/<env>):
-#                schema-valid, checkov-clean, only the digest changes ·
-#                rollback target (what runs now: still signed and pullable)
-#                staging/prod also: G3 passed in the previous environment
-#                (its signed release record) · release notes (every change
-#                since what the environment runs now)
-#   R2 approve   staging: Approval Gate `staging-approval` — test results,
-#                security scans and release notes are in the run summary
-#                prod: G4 — `release-approval` (UAT sign-off, test results,
-#                Go/No-Go, change window), then the security dashboard's own
-#                decision on the change request
-#                (whoever started or re-ran the run, or authored the change,
-#                can't approve either)
-#   G5           deployment gate for this environment, BEFORE anything is
-#                committed
-#   R3 deploy    the digest committed to deploy/<env> (GitOps; Argo CD syncs)
-#   R4 verify    wait for the dashboard's `security-dashboard/G6/<env>`
-#                status on the deploy commit (Argo CD sync + canary analysis
-#                + Kyverno)
-#   R5 test      against the deployed environment, on the self-hosted runner
-#                (a GitHub-hosted runner can't reach the cluster):
-#                dev G3      integration tests, DAST (nuclei), dependency
-#                            re-check of the deployed digest
-#                staging G3  end-to-end, performance (k6), DAST (nuclei +
-#                            testssl.sh); then UAT
-#                prod G6     read-only smoke tests + health watch (probes,
-#                            latency SLO, restarts); rollback plan on failure
-#   R6 evidence  every report + hash manifest → artifact
-#                `release-evidence-<env>` (90 days); after a deploy, attested
-#                to the image digest — the record the next environment reads
+#   Verify    resolve which digest this environment may get (above) →
+#             `promotion`; chained from the previous stage, it must still be
+#             the digest that stage deployed (input `expect-digest`) ·
+#             signature + SBOM + SLSA provenance (for the commit that built
+#             it) · pipeline evidence (G2 passed for this digest) · target
+#             config (deploy/<env>): schema-valid, checkov-clean, only the
+#             digest changes · staging/prod: G3 passed in the previous
+#             environment (its signed release record)
+#   Plan      release notes (every change since what the environment runs
+#             now) · rollback plan (what runs now: still signed and pullable)
+#   Approve   staging: Approval Gate `staging-approval` (test results,
+#             security scans, release notes in the run summary)
+#   G4        prod only: `release-approval` (UAT sign-off, test results,
+#             Go/No-Go, change window), then the security dashboard's own
+#             decision on the change request (whoever started or re-ran the
+#             run, or authored the change, can't approve)
+#   G5        deployment gate, BEFORE anything is committed
+#   Deploy    the digest committed to deploy/<env> (GitOps; Argo CD syncs) ·
+#             wait for the dashboard's `security-dashboard/G6/<env>` status on
+#             the deploy commit (Argo CD sync + canary analysis + Kyverno)
+#   Test      one job per control against the deployed environment (see
+#             "Test" below):
+#             dev      functional (smoke, integration) · regression ·
+#                      security (authenticated, DAST nuclei, dependency
+#                      re-check of the deployed digest)
+#             staging  functional (smoke, end-to-end) · regression ·
+#                      performance (k6) · security (authenticated, DAST
+#                      nuclei, TLS testssl.sh)
+#             prod     read-only smoke · Monitor: health watch (probes,
+#                      latency SLO, restarts)
+#   G3 / G6   test gate (dev, staging) / post-deploy gate (prod; the release
+#             pipeline rolls back on failure)
+#   Accept    staging: UAT can start (sign-off feeds prod's G4)
+#   Evidence  every report + hash manifest → artifact `release-evidence-<env>`
+#             (90 days); after a deploy, attested to the image digest — the
+#             record the next environment reads
 #
 # One release run deploys to several environments, so every artifact is
 # named per environment (`report-<env>-<control>`, `gate-result-<G>-<env>`,
@@ -127,7 +128,7 @@ env:
 
 jobs:
   resolve:
-    name: R1 resolve the digest
+    name: Verify · resolve the digest (promotion)
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -237,7 +238,7 @@ jobs:
           if-no-files-found: ignore
 
   provenance:
-    name: R1 verify · signature, SBOM, SLSA provenance
+    name: Verify · signature, SBOM, SLSA provenance
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -306,7 +307,7 @@ jobs:
           if-no-files-found: ignore
 
   evidence-check:
-    name: R1 verify · pipeline evidence (Control Gate passed)
+    name: Verify · pipeline evidence (G2 Control Gate passed)
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -375,7 +376,7 @@ jobs:
           if-no-files-found: ignore
 
   config:
-    name: R1 verify · target config (deploy/${{ inputs.environment }})
+    name: Verify · target config (deploy/${{ inputs.environment }})
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -444,7 +445,7 @@ jobs:
           if-no-files-found: ignore
 
   previous-env-tests:
-    name: R1 verify · tests passed in the previous environment
+    name: Verify · tests passed in the previous environment
     # staging needs dev's G3 for this digest, prod needs staging's. The
     # previous environment's stage attested its release record (with the
     # G3 it ran against the deployed digest) to the digest, signed by this
@@ -503,7 +504,7 @@ jobs:
             echo
             echo "| control | status | detail |"
             echo "|---|---|---|"
-            jq -r '.controls[]? | select(.stage == "R5-test") | "| `\(.control)` | \(.status) | \(.detail | gsub("[|\n]"; " ")) |"' "$OUT/record.json"
+            jq -r '.controls[]? | select(.stage == "test" or .stage == "monitor" or .stage == "R5-test") | "| `\(.control)` | \(.status) | \(.detail | gsub("[|\n]"; " ")) |"' "$OUT/record.json"
           } >> "$GITHUB_STEP_SUMMARY"
           res pass "G3 passed in ${prev} for this digest (${criteria}) — ${run}"
       - id: verdict
@@ -521,7 +522,7 @@ jobs:
           if-no-files-found: ignore
 
   release-notes:
-    name: R1 release notes
+    name: Plan · release notes
     # What the approver approves: every change between the source running
     # in this environment now and the one being released, in the run
     # summary (read before approving) and as evidence.
@@ -609,7 +610,7 @@ jobs:
           if-no-files-found: ignore
 
   rollback-plan:
-    name: R1 rollback plan
+    name: Plan · rollback plan
     # What a failed deploy goes back to: the digest the environment runs
     # now (for a redeploy of that digest, the target its deploy recorded).
     # The deploy commit records it (Rollback-Digest/-Source) and kind
@@ -687,7 +688,7 @@ jobs:
           if-no-files-found: ignore
 
   approve-staging:
-    name: R2 Approval Gate · staging
+    name: Approve · staging (Approval Gate)
     # Asked only once everything above passed: the approver reads dev's
     # test results and security scans (previous-env-tests) and the release
     # notes in this run's summary.
@@ -734,7 +735,7 @@ jobs:
           if-no-files-found: ignore
 
   g4:
-    name: R2 Approval Gate · prod (G4)
+    name: G4 approval gate · prod (CAB)
     # `release-approval` is asked once staging's tests passed and
     # everything above verified. Approve after UAT sign-off, the Go/No-Go
     # review and inside the change window; the change request must say so
@@ -862,7 +863,7 @@ jobs:
             ${{ inputs.environment != 'prod' && 'rollback_plan_ready' || '' }},${{ inputs.kind == 'rollback' && 'previous_environment_tests_passed' || '' }}
 
   deploy:
-    name: R3 deploy (GitOps commit)
+    name: Deploy · GitOps commit to deploy/${{ inputs.environment }}
     # The only write path to the cluster: a commit on main that Argo CD
     # syncs. [skip ci] + paths-ignore keep it from re-running the pipeline.
     needs: [resolve, config, gate-g5, rollback-plan, g4]
@@ -975,7 +976,7 @@ jobs:
           if-no-files-found: ignore
 
   post-deploy:
-    name: R4 verify the rollout (G6)
+    name: Deploy · verify the rollout (G6 status)
     # Argo CD reports G6 (sync, canary analysis, Kyverno admission) to the
     # dashboard; the dashboard mirrors it as commit status
     # `security-dashboard/G6/<env>` on the deploy commit. A GitHub-hosted
@@ -1036,38 +1037,42 @@ jobs:
           path: reports/post-deploy/
           if-no-files-found: ignore
 
-  env-tests:
-    name: R5 ${{ inputs.environment == 'prod' && 'post-deploy smoke + health watch (G6)' || format('tests against {0} (G3)', inputs.environment) }}
-    # One job, so one ephemeral self-hosted runner registration covers it
-    # (README: "Environment test runner"). The runner's own environment
-    # supplies KUBECONFIG: the env-tester service account, which may
-    # port-forward in every environment but exec (to create test users)
-    # only in dev and staging. The repo holds no cluster credential.
-    # Each suite (tests/live, tests/perf, the scanners) is its own step
-    # and its own control with a verdict, and G3/G6 has a criterion for it:
-    #   dev      smoke · integration · regression · security tests
-    #            (authenticated) · nuclei · dependency re-check (trivy,
-    #            today's vulnerability data, on the deployed digest)
-    #   staging  smoke · end-to-end · regression · security tests
-    #            (authenticated) · k6 · nuclei · testssl.sh
-    #   prod     smoke tests (read-only, no test users, no writes) · health
-    #            watch (HEALTH_WATCH_SECONDS of /healthz probes + restarts)
+  # ── Test: one job per control against the deployed environment ──────────
+  # Like the pipeline's control jobs, each test is its own job, report
+  # (`report-<env>-<control>`) and verdict, and G3/G6 below has a criterion
+  # for each:
+  #   dev      functional (smoke, integration) · regression · security
+  #            (authenticated, DAST nuclei, dependency re-check)
+  #   staging  functional (smoke, end-to-end) · regression · performance
+  #            (k6) · security (authenticated, DAST nuclei, TLS testssl.sh)
+  #   prod     smoke (read-only: no test users, no writes) · health watch
+  # The cluster-facing ones run on the environment test runner (README:
+  # "Environment test runner"; a GitHub-hosted runner can't reach the
+  # cluster): its environment supplies KUBECONFIG, the env-tester service
+  # account, which may port-forward everywhere but exec (to create test
+  # users) only in dev and staging. The repo holds no cluster credential.
+  # tests/env/env-up.sh gives every job its own ports, proxy and test
+  # users, so they can run side by side.
+
+  smoke:
+    name: Test · functional · smoke
     needs: [resolve, post-deploy]
     if: ${{ !cancelled() && needs.post-deploy.result == 'success' }}
-    # Tests of one environment don't overlap (they share the test users
-    # and the runner's ports).
-    concurrency:
-      group: devsecops-env-tests-${{ inputs.environment }}
-      cancel-in-progress: false
     runs-on: [self-hosted, linux, django-gates-demo-env]
-    timeout-minutes: 45
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-smoke
+      cancel-in-progress: false
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
     env:
       NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
       DIGEST: ${{ needs.resolve.outputs.digest }}
-      OUT: reports/env-tests
+      CONTROL: smoke
+      OUT: reports
+      VERDICT_FILE: reports/smoke/verdict.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1078,137 +1083,483 @@ jobs:
           enable-cache: false
       - name: Reach ${{ inputs.environment }}
         id: up
-        # The pod under test must run the released digest. Outside prod, two
-        # fresh random-password users, created in that pod (the demo's
-        # SQLite is per pod) with the password on stdin, never in argv.
-        # Secrets go to a 0600 file.
-        run: |
-          set -euo pipefail
-          mkdir -p "$OUT"
-          pods=$(kubectl -n "$NS" get pods -l app=django-gates-demo -o json)
-          pod=$(jq -r --arg d "$DIGEST" '[.items[] | select(.status.phase == "Running")
-                 | select(any((.status.containerStatuses // [])[]; .ready and (.imageID | endswith($d))))][0].metadata.name // empty' <<<"$pods")
-          [ -n "$pod" ] || { echo "::error::no ready pod in ${NS} runs ${DIGEST}"; jq -r '.items[] | "\(.metadata.name) \(.status.containerStatuses[0].imageID)"' <<<"$pods"; exit 1; }
-          echo "Testing pod ${pod} (${DIGEST:0:19}…) in ${NS}" | tee -a "$GITHUB_STEP_SUMMARY"
-          nohup kubectl -n "$NS" port-forward "pod/${pod}" 18000:8000 > "$OUT/port-forward.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/port-forward.pid"
-          rand() { python3 -c 'import secrets; print(secrets.token_urlsafe(24))'; }
-          env_file="$RUNNER_TEMP/env-tests.env"
-          (umask 077; {
-            echo "BASE_URL=https://localhost:18443"; echo "HTTP_URL=http://localhost:18480"
-            echo "REQUESTS_CA_BUNDLE=$RUNNER_TEMP/env-bundle.crt"
-            echo "SSL_CERT_FILE=$RUNNER_TEMP/env-bundle.crt"
-            if [ "$TARGET_ENV" != prod ]; then
-              echo "USER_A=${TARGET_ENV}-alice"; echo "PASSWORD_A=$(rand)"
-              echo "USER_B=${TARGET_ENV}-bob"; echo "PASSWORD_B=$(rand)"
-            fi; } > "$env_file")
-          set -a
-          # shellcheck source=/dev/null
-          . "$env_file"
-          set +a
-          if [ "$TARGET_ENV" != prod ]; then
-            for u in A B; do
-              user="USER_$u"; pw="PASSWORD_$u"
-              # shellcheck disable=SC2016 # $0 expands in the pod's shell
-              kubectl -n "$NS" exec -i "$pod" -- sh -c 'read -r ENSURE_USER_PASSWORD; export ENSURE_USER_PASSWORD; exec python manage.py ensure_user "$0"' "${!user}" <<<"${!pw}"
-            done
-          fi
-          # caddy carries a file capability (cap_net_bind_service): without
-          # it in the bounding set the binary can't even exec.
-          # A 0644 copy: the checkout's modes follow the runner's umask, and
-          # root in a cap-drop ALL container can't read past them.
-          install -m 644 tests/env/Caddyfile "$RUNNER_TEMP/Caddyfile"
-          docker run -d --name "env-proxy-${GITHUB_RUN_ID}" --network host --cap-drop ALL --cap-add NET_BIND_SERVICE \
-            -v "$RUNNER_TEMP/Caddyfile:/etc/caddy/Caddyfile:ro" "$CADDY" > /dev/null
-          for _ in $(seq 30); do
-            docker cp "env-proxy-${GITHUB_RUN_ID}:/data/caddy/pki/authorities/local/root.crt" "$RUNNER_TEMP/env-ca.crt" 2>/dev/null \
-              && curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz && break
-            sleep 2
-          done
-          curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null https://localhost:18443/healthz \
-            || { docker logs "env-proxy-${GITHUB_RUN_ID}" 2>&1 | tail -20; tail -5 "$OUT/port-forward.log"; exit 1; }
-          cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/env-ca.crt" > "$RUNNER_TEMP/env-bundle.crt"
-          chmod 644 "$RUNNER_TEMP/env-ca.crt" "$RUNNER_TEMP/env-bundle.crt"   # read by tool containers running as other uids
+        run: bash tests/env/env-up.sh
       - name: smoke tests
-        id: smoke-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' }}
-        env:
-          ENV_FILE: ${{ runner.temp }}/env-tests.env
+        id: run
+        if: steps.up.outcome == 'success'
         run: bash tests/env/live-suite.sh smoke tests/live -m smoke
-      - id: smoke
+      - id: verdict
         if: ${{ !cancelled() }}
         env:
-          CONTROL: smoke
-          VERDICT_FILE: reports/env-tests/smoke/verdict.json
-          RC: ${{ steps.smoke-run.outputs.rc }}
+          RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live -m smoke against ${{ inputs.environment }} (read-only: no test users, no writes)"
           TOOL: pytest + requests
         run: python3 .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
-      - name: integration tests
-        id: integration-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'dev' }}
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-smoke
+          path: reports/smoke/
+          if-no-files-found: ignore
+
+  integration:
+    name: Test · functional · integration
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'dev' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-integration
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: integration
+      OUT: reports
+      VERDICT_FILE: reports/integration/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
         env:
-          ENV_FILE: ${{ runner.temp }}/env-tests.env
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · functional · integration
+        id: run
+        if: steps.up.outcome == 'success'
         run: bash tests/env/live-suite.sh integration tests/live/test_integration.py
-      - id: integration
-        if: ${{ !cancelled() && inputs.environment == 'dev' }}
+      - id: verdict
+        if: ${{ !cancelled() }}
         env:
-          CONTROL: integration
-          VERDICT_FILE: reports/env-tests/integration/verdict.json
-          RC: ${{ steps.integration-run.outputs.rc }}
+          RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_integration.py against ${{ inputs.environment }} (TLS ingress, sessions, auth, API and pages on one database)"
           TOOL: pytest + requests
         run: python3 .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
-      - name: end-to-end tests
-        id: e2e-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'staging' }}
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-integration
+          path: reports/integration/
+          if-no-files-found: ignore
+
+  e2e:
+    name: Test · functional · end-to-end
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'staging' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-e2e
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: e2e
+      OUT: reports
+      VERDICT_FILE: reports/e2e/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
         env:
-          ENV_FILE: ${{ runner.temp }}/env-tests.env
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · functional · end-to-end
+        id: run
+        if: steps.up.outcome == 'success'
         run: bash tests/env/live-suite.sh e2e tests/live/test_e2e.py
-      - id: e2e
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
+      - id: verdict
+        if: ${{ !cancelled() }}
         env:
-          CONTROL: e2e
-          VERDICT_FILE: reports/env-tests/e2e/verdict.json
-          RC: ${{ steps.e2e-run.outputs.rc }}
+          RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_e2e.py against ${{ inputs.environment }} (user journeys through the pages and their forms)"
           TOOL: pytest + requests
         run: python3 .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
-      - name: regression tests
-        id: regression-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-e2e
+          path: reports/e2e/
+          if-no-files-found: ignore
+
+  regression:
+    name: Test · regression
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment != 'prod' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-regression
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: regression
+      OUT: reports
+      VERDICT_FILE: reports/regression/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
         env:
-          ENV_FILE: ${{ runner.temp }}/env-tests.env
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · regression
+        id: run
+        if: steps.up.outcome == 'success'
         run: bash tests/env/live-suite.sh regression tests/live/test_regression.py
-      - id: regression
-        if: ${{ !cancelled() && inputs.environment != 'prod' }}
+      - id: verdict
+        if: ${{ !cancelled() }}
         env:
-          CONTROL: regression
-          VERDICT_FILE: reports/env-tests/regression/verdict.json
-          RC: ${{ steps.regression-run.outputs.rc }}
+          RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_regression.py against ${{ inputs.environment }} (fixed or decided behaviour that must not come back)"
           TOOL: pytest + requests
         run: python3 .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
-      - name: security tests (authenticated)
-        id: security-tests-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-regression
+          path: reports/regression/
+          if-no-files-found: ignore
+
+  security-tests:
+    name: Test · security · authenticated (OWASP Top 10)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment != 'prod' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-security-tests
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: security-tests
+      OUT: reports
+      VERDICT_FILE: reports/security-tests/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
         env:
-          ENV_FILE: ${{ runner.temp }}/env-tests.env
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · security · authenticated (OWASP Top 10)
+        id: run
+        if: steps.up.outcome == 'success'
         run: bash tests/env/live-suite.sh security-tests tests/live/test_security.py
-      - id: security-tests
-        if: ${{ !cancelled() && inputs.environment != 'prod' }}
+      - id: verdict
+        if: ${{ !cancelled() }}
         env:
-          CONTROL: security-tests
-          VERDICT_FILE: reports/env-tests/security-tests/verdict.json
-          RC: ${{ steps.security-tests-run.outputs.rc }}
+          RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_security.py against ${{ inputs.environment }} (OWASP Top 10 with two users: IDOR, CSRF, sessions, headers, injection)"
           TOOL: pytest + requests
         run: python3 .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-security-tests
+          path: reports/security-tests/
+          if-no-files-found: ignore
+
+  performance:
+    name: Test · performance (k6 load)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'staging' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-performance
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: performance
+      OUT: reports
+      VERDICT_FILE: reports/performance/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        env:
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: k6 load
+        if: steps.up.outcome == 'success'
+        run: |
+          mkdir -p "$OUT/performance" && chmod 777 "$OUT/performance"
+          # shellcheck source=/dev/null
+          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
+          docker run --rm --network host --user "$(id -u):$(id -g)" \
+            -v "$PWD/tests/perf:/perf:ro" -v "$PWD/$OUT/performance:/out" -v "$SSL_CERT_FILE:/ca.crt:ro" \
+            -e SSL_CERT_FILE=/ca.crt -e BASE_URL -e USER_A -e PASSWORD_A -e SUMMARY_OUT=/out/k6-summary.json \
+            "$K6" run --quiet /perf/load.js || true
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TOOL: k6 2.3.0 (10 VUs, 30 s) against staging
+        run: python3 .github/scripts/verdict.py k6 "$OUT/performance/k6-summary.json"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-performance
+          path: reports/performance/
+          if-no-files-found: ignore
+
+  dast-nuclei:
+    name: Test · security · DAST (nuclei)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment != 'prod' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-dast-nuclei
+      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: dast-nuclei
+      OUT: reports
+      VERDICT_FILE: reports/dast-nuclei/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
+      - name: nuclei
+        id: run
+        if: steps.up.outcome == 'success'
+        # Templates pinned to a release commit, not "latest at scan time",
+        # so the same deployment gets the same verdict on a re-run.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT/dast-nuclei" && chmod 777 "$OUT/dast-nuclei"
+          rm -rf "$RUNNER_TEMP/templates"
+          umask 022   # the nuclei container reads them as another uid
+          git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES" https://github.com/projectdiscovery/nuclei-templates.git "$RUNNER_TEMP/templates"
+          got=$(git -C "$RUNNER_TEMP/templates" rev-parse HEAD)
+          [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
+          touch "$OUT/dast-nuclei/nuclei.jsonl"
+          docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT/dast-nuclei:/out" "$NUCLEI" \
+            -u "$BASE_URL" -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
+            -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          TOOL: nuclei 3.11.1 against ${{ inputs.environment }}
+          TEMPLATES: ${{ env.NUCLEI_TEMPLATES }}
+        run: python3 .github/scripts/verdict.py nuclei "$OUT/dast-nuclei/nuclei.jsonl"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-dast-nuclei
+          path: reports/dast-nuclei/
+          if-no-files-found: ignore
+
+  dast-tls:
+    name: Test · security · TLS (testssl.sh)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'staging' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-dast-tls
+      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: dast-tls
+      OUT: reports
+      VERDICT_FILE: reports/dast-tls/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
+      - name: testssl.sh
+        if: steps.up.outcome == 'success'
+        # The TLS endpoint is the runner's stand-in ingress (tests/env/Caddyfile).
+        run: |
+          mkdir -p "$OUT/dast-tls" && chmod 777 "$OUT/dast-tls"
+          docker run --rm --network host -v "$PWD/$OUT/dast-tls:/out" -v "$ENV_CA:/ca.crt:ro" "$TESTSSL" \
+            --quiet --color 0 --warnings off --add-ca /ca.crt \
+            --jsonfile-pretty /out/testssl.json "$BASE_URL" > "$OUT/dast-tls/testssl.log" 2>&1 || true
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TARGET_URL: ${{ env.BASE_URL }} (staging's stand-in ingress)
+          TOOL: testssl.sh 3.2.4 against staging
+        run: python3 .github/scripts/verdict.py testssl "$OUT/dast-tls/testssl.json"
+      - name: testssl.sh report
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/findings.py native "$OUT/dast-tls/testssl.log"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-dast-tls
+          path: reports/dast-tls/
+          if-no-files-found: ignore
+
+  dependency-check:
+    name: Test · security · dependency re-check (trivy)
+    # The pipeline scanned these bytes when it built them; this scans the
+    # deployed digest again with today's vulnerability data, so a CVE
+    # published since the build is caught before staging. Reads only the
+    # registry, so a GitHub-hosted runner does.
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: dependency-check
+      RISK_CONTROL: image-scan
+      OUT: reports
+      VERDICT_FILE: reports/dependency-check/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: trivy image (current vulnerability DB)
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TOOL: trivy 0.74.0 (deployed digest, current vulnerability DB)
+        run: python3 .github/scripts/verdict.py trivy "$OUT/dependency-check/trivy.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-dependency-check
+          path: reports/dependency-check/
+          if-no-files-found: ignore
+
+  health-watch:
+    name: Monitor · health watch (probes, latency SLO, restarts)
+    # Monitoring after the rollout: the new pods keep answering /healthz
+    # within the latency SLO, and no container of the app restarts, for
+    # HEALTH_WATCH_SECONDS. Read-only, like prod's smoke tests.
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'prod' }}
+    runs-on: [self-hosted, linux, django-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-health-watch
+      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: django-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: health-watch
+      OUT: reports
+      VERDICT_FILE: reports/health-watch/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
       - name: health watch
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'prod' }}
-        # Monitoring after the rollout: the new pods keep answering /healthz
-        # within the latency SLO, and no container of the app restarts,
-        # for HEALTH_WATCH_SECONDS. Read-only, like the smoke tests.
+        if: steps.up.outcome == 'success'
         run: |
           set -uo pipefail
           mkdir -p "$OUT/health-watch"
@@ -1222,8 +1573,8 @@ jobs:
           end=$((SECONDS + HEALTH_WATCH_SECONDS))
           while [ "$SECONDS" -lt "$end" ]; do
             at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            out=$(curl -sS -o /dev/null --max-time 5 --cacert "$RUNNER_TEMP/env-ca.crt" -w '%{http_code} %{time_total}' \
-                    https://localhost:18443/healthz 2>/dev/null) || true
+            out=$(curl -sS -o /dev/null --max-time 5 --cacert "$ENV_CA" -w '%{http_code} %{time_total}' \
+                    "${BASE_URL}/healthz" 2>/dev/null) || true
             code=${out%% *}; [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
             code=$((10#$code))
             t=${out##* }; [[ "$t" =~ ^[0-9]+(\.[0-9]+)?$ ]] || t=0
@@ -1233,130 +1584,56 @@ jobs:
           after=$(restarts) || after='{}'
           jq -s --argjson b "$before" --argjson a "$after" --argjson s "$HEALTH_WATCH_SECONDS" \
             '{probes: ., seconds: $s, restarts_before: $b, restarts_after: $a}' "$probes" > "$OUT/health-watch/health.json"
-      - id: health-watch
-        if: ${{ !cancelled() && inputs.environment == 'prod' }}
+      - id: verdict
+        if: ${{ !cancelled() }}
         env:
-          CONTROL: health-watch
-          VERDICT_FILE: reports/env-tests/health-watch/verdict.json
           TOOL: curl /healthz every 10 s + kubectl restart counts
         run: python3 .github/scripts/verdict.py health "$OUT/health-watch/health.json"
-      - name: k6 load
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'staging' }}
-        run: |
-          mkdir -p "$OUT/performance" && chmod 777 "$OUT/performance"
-          # shellcheck source=/dev/null
-          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
-          docker run --rm --network host --user "$(id -u):$(id -g)" \
-            -v "$PWD/tests/perf:/perf:ro" -v "$PWD/$OUT/performance:/out" -v "$SSL_CERT_FILE:/ca.crt:ro" \
-            -e SSL_CERT_FILE=/ca.crt -e BASE_URL -e USER_A -e PASSWORD_A -e SUMMARY_OUT=/out/k6-summary.json \
-            "$K6" run --quiet /perf/load.js || true
-      - id: performance
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
-        env:
-          CONTROL: performance
-          VERDICT_FILE: reports/env-tests/performance/verdict.json
-          TOOL: k6 2.3.0 (10 VUs, 30 s) against staging
-        run: python3 .github/scripts/verdict.py k6 "$OUT/performance/k6-summary.json"
-      - name: nuclei
-        id: nuclei-run
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment != 'prod' }}
-        # Templates pinned to a release commit, not "latest at scan time",
-        # so the same deployment gets the same verdict on a re-run.
-        run: |
-          set -uo pipefail
-          mkdir -p "$OUT/dast-nuclei" && chmod 777 "$OUT/dast-nuclei"
-          rm -rf "$RUNNER_TEMP/templates"
-          umask 022   # the nuclei container reads them as another uid
-          git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES" https://github.com/projectdiscovery/nuclei-templates.git "$RUNNER_TEMP/templates"
-          got=$(git -C "$RUNNER_TEMP/templates" rev-parse HEAD)
-          [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
-          touch "$OUT/dast-nuclei/nuclei.jsonl"
-          docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT/dast-nuclei:/out" "$NUCLEI" \
-            -u https://localhost:18443 -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
-            -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
-      - id: dast-nuclei
-        if: ${{ !cancelled() && inputs.environment != 'prod' }}
-        env:
-          CONTROL: dast-nuclei
-          VERDICT_FILE: reports/env-tests/dast-nuclei/verdict.json
-          RC: ${{ steps.nuclei-run.outputs.rc }}
-          TOOL: nuclei 3.11.1 against ${{ inputs.environment }}
-          TEMPLATES: ${{ env.NUCLEI_TEMPLATES }}
-        run: python3 .github/scripts/verdict.py nuclei "$OUT/dast-nuclei/nuclei.jsonl"
-      - name: testssl.sh
-        if: ${{ !cancelled() && steps.up.outcome == 'success' && inputs.environment == 'staging' }}
-        # The TLS endpoint is the runner's stand-in ingress (tests/env/Caddyfile).
-        run: |
-          mkdir -p "$OUT/dast-tls" && chmod 777 "$OUT/dast-tls"
-          docker run --rm --network host -v "$PWD/$OUT/dast-tls:/out" -v "$RUNNER_TEMP/env-ca.crt:/ca.crt:ro" "$TESTSSL" \
-            --quiet --color 0 --warnings off --add-ca /ca.crt \
-            --jsonfile-pretty /out/testssl.json https://localhost:18443 > "$OUT/dast-tls/testssl.log" 2>&1 || true
-      - id: dast-tls
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
-        env:
-          CONTROL: dast-tls
-          VERDICT_FILE: reports/env-tests/dast-tls/verdict.json
-          TARGET_URL: https://localhost:18443 (staging's stand-in ingress)
-          TOOL: testssl.sh 3.2.4 against staging
-        run: python3 .github/scripts/verdict.py testssl "$OUT/dast-tls/testssl.json"
-      - name: testssl.sh report
-        if: ${{ !cancelled() && inputs.environment == 'staging' }}
-        env:
-          VERDICT_FILE: reports/env-tests/dast-tls/verdict.json
-        run: python3 .github/scripts/findings.py native "$OUT/dast-tls/testssl.log"
-      - name: dependency re-check
-        if: ${{ !cancelled() && inputs.environment == 'dev' }}
-        # The pipeline scanned these bytes when it built them; this scans
-        # the deployed digest again with today's vulnerability data, so a
-        # CVE published since the build is caught before staging.
-        env:
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ github.token }}
-        run: |
-          mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
-          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
-      - id: dependency-check
-        if: ${{ !cancelled() && inputs.environment == 'dev' }}
-        env:
-          CONTROL: dependency-check
-          RISK_CONTROL: image-scan
-          VERDICT_FILE: reports/env-tests/dependency-check/verdict.json
-          TOOL: trivy 0.74.0 (deployed digest, current vulnerability DB)
-        run: python3 .github/scripts/verdict.py trivy "$OUT/dependency-check/trivy.json"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-health-watch
+          path: reports/health-watch/
+          if-no-files-found: ignore
+
+  test-gate:
+    name: ${{ inputs.environment == 'prod' && 'G6 post-deploy gate (smoke + health watch)' || format('G3 test gate ({0})', inputs.environment) }}
+    # Every test job above answers a criterion (gate.py G3@<env>, G6@prod);
+    # one that should have run but was skipped or failed fails the gate,
+    # and with it every later stage (prod: the automatic rollback).
+    needs: [resolve, post-deploy, smoke, integration, e2e, regression, security-tests, performance, dast-nuclei, dast-tls,
+            dependency-check, health-watch]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
       - uses: ./.github/actions/gate
-        if: ${{ !cancelled() }}
         with:
           gate: ${{ inputs.environment == 'prod' && 'G6' || 'G3' }}
           profile: ${{ inputs.environment }}
           name-suffix: -${{ inputs.environment }}
-          needs: ${{ toJSON(steps) }}
+          needs: ${{ toJSON(needs) }}
           subject: ${{ needs.resolve.outputs.digest }}
           commit-sha: ${{ needs.resolve.outputs.source-sha }}
           artifact-digest: ${{ needs.resolve.outputs.digest }}
           environment: ${{ inputs.environment }}
-      - name: Tear down
-        if: always()
-        run: |
-          [ -f "$RUNNER_TEMP/port-forward.pid" ] && kill "$(cat "$RUNNER_TEMP/port-forward.pid")" 2>/dev/null || true
-          docker logs "env-proxy-${GITHUB_RUN_ID}" > "$OUT/proxy.log" 2>&1 || true
-          docker rm -f "env-proxy-${GITHUB_RUN_ID}" > /dev/null 2>&1 || true
-          rm -f "$RUNNER_TEMP/env-tests.env"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-${{ inputs.environment }}-env-tests
-          path: reports/env-tests/
-          if-no-files-found: ignore
 
   uat:
-    name: UAT — staging ready for sign-off
+    name: Accept · UAT ready for sign-off
     # Staging's automated tests passed on the deployed digest: tell the
     # change request that UAT can start. The tester signs off with the
     # `uat-approved` label; prod's Approval Gate requires it.
-    needs: [resolve, env-tests]
-    if: ${{ !cancelled() && inputs.environment == 'staging' && needs.env-tests.result == 'success' }}
+    needs: [resolve, test-gate]
+    if: ${{ !cancelled() && inputs.environment == 'staging' && needs.test-gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -1392,9 +1669,10 @@ jobs:
           fi
 
   release-evidence:
-    name: R6 release evidence
+    name: Evidence · release record (attested)
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
-            g4, gate-g5, deploy, post-deploy, env-tests]
+            g4, gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
+            performance, dast-nuclei, dast-tls, dependency-check, health-watch, test-gate]
     if: always() && needs.resolve.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1429,16 +1707,9 @@ jobs:
       - name: Bundle + hash manifest
         env:
           G4_RESULT: ${{ needs.g4.result }}
-        # env-tests uploads one artifact (one runner job); each test in it
-        # is its own control here, as it was its own job in the pipeline.
         run: |
           set -euo pipefail
           in="$RUNNER_TEMP/in"
-          if [ -d "${in}/${REPORT_PREFIX}env-tests" ]; then
-            for d in "${in}/${REPORT_PREFIX}env-tests"/*/; do
-              [ -d "$d" ] && mv "$d" "${in}/${REPORT_PREFIX}$(basename "$d")"
-            done
-          fi
           case "$TARGET_ENV" in
             dev)     controls="promotion,provenance,evidence-check,config,rollback-plan,deploy,post-deploy,smoke,integration,regression,security-tests,dast-nuclei,dependency-check" ;;
             staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-staging,deploy,post-deploy,smoke,e2e,regression,security-tests,performance,dast-nuclei,dast-tls" ;;

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Registers and runs the environment test runner for one job
-# (README: "Environment test runner"):
+# (README: "Environment test runner"). Every test after a deploy is its own
+# job, so keep it in a loop while a release runs:
 #
-#     GH_TOKEN=... bash tests/env/env-runner.sh [runner dir]
+#     while :; do GH_TOKEN=... bash tests/env/env-runner.sh [runner dir]; done
+#
+# Loops with different runner dirs run side by side (each registers under
+# its own name; tests/env/env-up.sh gives every job its own ports).
 #
 # The runner dir holds an unpacked actions/runner release (default
 # ~/actions-runner-env). The runner runs as the env-tester ServiceAccount,
@@ -31,10 +35,10 @@ registration=$(curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN 
 
 cd "$dir"
 ./config.sh --unattended --replace --ephemeral --url "https://github.com/${repo}" \
-  --name "env-$(hostname -s)" --labels django-gates-demo-env --token "$registration"
+  --name "env-$(hostname -s)-$(basename "$dir")" --labels django-gates-demo-env --token "$registration"
 unset registration
 # Node tries each address of a host for only 250 ms by default (happy
-# eyeballs). On a slow link, or with DNS handing out an unroutable NAT64
-# address, every attempt times out and the artifact upload fails with
-# ETIMEDOUT; 2 s per address still falls back between IPv6 and IPv4.
-exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" NODE_OPTIONS=--network-family-autoselection-attempt-timeout=2000 ./run.sh
+# eyeballs). With DNS handing out an unroutable NAT64 address, the IPv6
+# attempts time out and the artifact upload fails with ETIMEDOUT, even at
+# 2 s per address under load: IPv4 first, no racing.
+exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection" ./run.sh

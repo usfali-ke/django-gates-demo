@@ -55,17 +55,17 @@ dynamic test runs in the release pipeline, against the environment the
 new digest was just deployed to.
 
 ```
-1 build ──────── checkout · build twice (reproducible?) · unit tests + coverage
-                 · code quality (ruff)
-2 static ─────── SAST (semgrep) · gitleaks · trufflehog · trivy SCA (uv.lock)
-                 · checkov · reviewers · signed commits
-2 image ──────── trivy image scan · syft SBOM · dockle · manage.py check --deploy
-3 package ────── (main only) push by digest · cosign sign · SBOM + SLSA attestations
+1 Code ───────── SAST (semgrep) · gitleaks · trufflehog · trivy SCA (uv.lock)
+                 · checkov · code quality (ruff) · reviewers · signed commits
+2 Build ──────── checkout · build twice (reproducible?) · unit tests + coverage
+   └─ G1 merge gate (PRs) ── reviewed · signed · unit tests · SAST · secrets
+3 Package ────── trivy image scan · syft SBOM · dockle · manage.py check --deploy
+                 → (main only) push by digest · cosign sign · SBOM + SLSA attestations
    └─ G2 Control Gate ── build successful · all tests passed · code quality
                          threshold met · no blocking findings · signed
-4 evidence ───── bundle + sha256 manifest → artifact `evidence` (90 days);
-                 on main, cosign-attested to the image digest
-5 release ────── (main, G2 passed) starts devsecops-release for this commit
+4 Release ────── bundle + sha256 manifest → artifact `evidence` (90 days;
+                 on main, cosign-attested to the image digest) → (main, G2
+                 passed) starts devsecops-release for this commit
 ```
 
 Each control is its own job, and every one of them runs even when another
@@ -175,30 +175,37 @@ environment, and every test in it runs against that environment after the
 digest is deployed there:
 
 ```
-1 Build & unit tests (devsecops-pipeline) ── G2 Control Gate ── starts ↓
+devsecops-pipeline (CI)
+1 Code ─────────── SAST · secrets ×2 · SCA · IaC · code quality · reviewers · signed commits
+2 Build ────────── reproducible image build · unit tests + coverage
+   G1 merge gate (pull requests)
+3 Package ──────── image scan · SBOM · CIS (dockle) · check --deploy → push + sign + attest
+   G2 Control Gate (CI → release)
+4 Release ──────── evidence bundle (attested) → starts devsecops-release ↓
 
-2 Deploy to Dev ──── R1 verify → G5(dev) → deploy/dev → G6(dev)
-                     → G3 in dev: smoke · integration · regression tests
-                       · DAST (nuclei + authenticated security tests)
-                       · dependency re-check of the deployed digest
-   Approval Gate ─── staging-approval: dev's test results + security scans,
-                     release notes (in the run summary)
-3 Deploy to Staging  R1 verify → G5(staging) → deploy/staging → G6(staging)
-                     → G3 in staging: smoke · end-to-end · regression tests
-                       · performance (k6) · DAST (nuclei + testssl.sh
-                       + authenticated security tests) → UAT (change request told)
-   Approval Gate ─── release-approval + G4: UAT sign-off (uat-approved),
-                     test results, Go/No-Go (readiness-approved), change window
-4 Deploy to Prod ─── R1 verify → G5(prod) → deploy/prod (canary) → G6(prod)
-                     → post-deploy smoke tests · health watch (5 min of
-                       /healthz probes, latency SLO, no restarts)
-                     · rollback plan verified before the deploy; a failure
-                       after it starts the rollback automatically
-
-Monitoring, logging & feedback: run summary per stage, a comment on the
-change request and the pull requests, the rollback command if a deployed
-stage failed; gate results, deployment events and release evidence to the
-security dashboard; Argo CD notifications for every sync and canary.
+devsecops-release, one stage per environment, each a job per control
+5 Deploy to Dev ── Verify → Plan → G5 → Deploy → G6 (rollout)
+                   → Test: smoke · integration · regression · security tests
+                     · DAST (nuclei) · dependency re-check
+                   → G3 test gate
+   Approval Gate ─ staging-approval: dev's test results + security scans,
+                   release notes (in the run summary)
+6 Deploy to Staging  Verify → Plan → G5 → Deploy → G6 (rollout)
+                   → Test: smoke · end-to-end · regression · performance (k6)
+                     · security tests · DAST (nuclei) · TLS (testssl.sh)
+                   → G3 test gate → Accept: UAT (change request told)
+   G4 ──────────── release-approval: UAT sign-off (uat-approved), test
+                   results, Go/No-Go (readiness-approved), change window
+7 Deploy to Prod ─ Verify → Plan → G5 → Deploy (canary) → G6 (rollout)
+                   → Test: read-only smoke · Monitor: health watch (5 min of
+                     /healthz probes, latency SLO, no restarts)
+                   → G6 post-deploy gate; a failure starts the rollback
+8 Operate ──────── automatic prod rollback · monitoring, logging & feedback:
+                   run summary per stage, a comment on the change request
+                   and the pull requests, the rollback command if a deployed
+                   stage failed; gate results, deployment events and release
+                   evidence to the security dashboard; Argo CD notifications
+                   for every sync and canary.
 ```
 
 A stage starts only when the previous one deployed **and passed its
@@ -206,7 +213,7 @@ tests**; a failed stage stops the run there. Staging and prod also refuse
 to run if the previous environment has moved on to a newer release while
 this one waited for approval.
 
-- **R1 verify**, every stage: signature + SBOM + SLSA provenance for the
+- **Verify**, every stage: signature + SBOM + SLSA provenance for the
   commit that built the digest; the evidence attestation (the pipeline's
   Control Gate passed); the target overlay is schema-valid and
   checkov-clean, and only its digest changes. Also:
@@ -225,7 +232,7 @@ this one waited for approval.
   `uat-approved`, and the dashboard's own decision on it.
 - **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
   trailers (`Environment`, `Image-Digest`, `Source-Commit`,
-  `Rollback-Digest`, `Rollback-Source`) are what the next stage's R1
+  `Rollback-Digest`, `Rollback-Source`) are what the next stage's Verify
   reads, together with the `security-dashboard/G6/<env>` status on that
   commit.
 - **Evidence:** every stage leaves a `release-evidence-<env>` bundle,
@@ -287,16 +294,22 @@ and the environment tester's RBAC are in the security dashboard's
 ### Environment test runner
 
 The tests after each deploy (G3 in dev and staging, the smoke tests and
-health watch in prod) run on a self-hosted runner, because GitHub-hosted runners can't
-reach the cluster. It is one job per stage, so one runner registration,
-and each suite in it is its own step, control (`report-<env>-env-tests`)
-and G3/G6 criterion source. The job:
+health watch in prod) run on a self-hosted runner, because GitHub-hosted
+runners can't reach the cluster. Like the pipeline's controls, every test
+is its own job, report (`report-<env>-<control>`) and G3/G6 criterion
+source; a separate job (`G3 test gate` / `G6 post-deploy gate`) decides.
+Each test job starts with `tests/env/env-up.sh`, which:
 - finds the pod running the promoted digest;
-- port-forwards it to `127.0.0.1:18000`;
-- outside prod, creates two random-password users in it
-  (`manage.py ensure_user`, with the password on stdin);
-- puts a Caddy TLS proxy on `https://localhost:18443` in front of it
-  (`tests/env/Caddyfile`).
+- port-forwards it to a port of its own (per environment and test, so test
+  jobs can run side by side);
+- for the suites that log in (not prod), creates two random-password users
+  named after the test in it (`manage.py ensure_user`, with the password
+  on stdin);
+- puts a Caddy TLS proxy on its own `https://localhost:<port>` in front of
+  it (`tests/env/Caddyfile`);
+
+and ends with `tests/env/env-down.sh`. The dependency re-check only reads
+the registry, so it runs on a GitHub-hosted runner.
 
 The runner needs docker, kubectl, git, jq, python3 and curl. `uv` is
 installed by the job. It runs as the `env-tester` ServiceAccount
@@ -307,9 +320,15 @@ installed by the job. It runs as the `env-tester` ServiceAccount
 token for `env-tester`, writes a kubeconfig with it (mode 0600), registers
 the runner as **ephemeral** (one registration serves one job) with the
 label `django-gates-demo-env`, and runs it. It needs `GH_TOKEN` with
-admin rights on the repo, for the registration token. One release run has
-up to three environment test jobs (one per stage), so keep it in a loop
-while a release is running.
+admin rights on the repo, for the registration token. A stage has up to
+seven environment test jobs, so keep it in a loop while a release is
+running (a test job shows "Waiting for a runner" until one registers):
+
+```bash
+while :; do GH_TOKEN=... bash tests/env/env-runner.sh; done
+```
+
+More loops, each with its own runner dir, run the tests in parallel.
 
 This repo is public, so a pull request from a fork could try to run on a
 self-hosted runner. To prevent that:

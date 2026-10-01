@@ -7,8 +7,8 @@ criterion (keys: the dashboard's docs/GATE_INGEST_API.md).
     NEEDS='${{ toJSON(needs) }}' python3 .github/scripts/gate.py G1 out.json
 
 NEEDS can also be a job's own `toJSON(steps)`: a step's outputs have the
-same shape, so one job that runs several controls (G3 in staging, on a
-single ephemeral runner) names its verdict steps after the controls.
+same shape, so a job that runs several controls can name its verdict steps
+after them. The pipelines don't: every control is its own job.
 PROFILE picks another criteria list for the same gate (GATES["G3@staging"]).
 
 A criterion is:
@@ -67,7 +67,8 @@ GATES = {
         ("sbom_present", "security", [("sbom", "result")]),
     ],
     # G3 runs only against a deployed environment (devsecops-stage.yml, job
-    # env-tests), never against an image that isn't deployed yet.
+    # test-gate after one job per test), never against an image that isn't
+    # deployed yet.
     # dev: smoke, integration and regression tests; DAST (nuclei, and the
     # authenticated security tests nuclei can't do); the deployed image's
     # dependencies re-scanned against today's vulnerability data.

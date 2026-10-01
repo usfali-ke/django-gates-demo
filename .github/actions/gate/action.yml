@@ -14,7 +14,7 @@ inputs:
     description: G1 | G2 | G3 | G5 | G6
     required: true
   needs:
-    description: toJSON(needs) of the calling job (or toJSON(steps), see gate.py)
+    description: toJSON(needs) of the calling job (toJSON(steps) also works, see gate.py)
     required: true
   subject:
     description: What was evaluated (pr-123, image digest). Re-evaluating the same subject after a fail counts as rework.

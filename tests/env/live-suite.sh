@@ -2,7 +2,7 @@
 # Runs one tests/live suite against a running environment and records it
 # for verdict.py:
 #
-#     OUT=reports/env-tests [ENV_FILE=...] bash tests/env/live-suite.sh <control> <pytest args...>
+#     OUT=reports [ENV_FILE=...] bash tests/env/live-suite.sh <control> <pytest args...>
 #
 # ENV_FILE (the runner's 0600 file: BASE_URL, HTTP_URL, REQUESTS_CA_BUNDLE,
 # USER_*/PASSWORD_*) is sourced if given; otherwise they come from the
