@@ -129,7 +129,7 @@ jobs:
   resolve:
     name: R1 resolve the digest
     if: github.ref == 'refs/heads/main'
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -239,7 +239,7 @@ jobs:
   provenance:
     name: R1 verify · signature, SBOM, SLSA provenance
     needs: resolve
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -308,7 +308,7 @@ jobs:
   evidence-check:
     name: R1 verify · pipeline evidence (Control Gate passed)
     needs: resolve
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -377,7 +377,7 @@ jobs:
   config:
     name: R1 verify · target config (deploy/${{ inputs.environment }})
     needs: resolve
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -451,7 +451,7 @@ jobs:
     # workflow on main: a record nobody can write by hand.
     needs: resolve
     if: inputs.environment != 'dev'
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -527,7 +527,7 @@ jobs:
     # summary (read before approving) and as evidence.
     needs: resolve
     if: inputs.environment != 'dev'
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -617,7 +617,7 @@ jobs:
     # Argo Rollouts already aborts a canary that fails its analysis; this
     # is for a problem found after the rollout completed.
     needs: resolve
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -694,7 +694,7 @@ jobs:
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
     if: inputs.environment == 'staging'
     environment: staging-approval
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -742,7 +742,7 @@ jobs:
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
     if: inputs.environment == 'prod'
     environment: release-approval
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
@@ -835,7 +835,7 @@ jobs:
       always() && needs.resolve.result == 'success' &&
       (needs.g4.result == 'success' || (inputs.environment != 'prod' && needs.g4.result == 'skipped')) &&
       (needs.approve-staging.result == 'success' || (inputs.environment != 'staging' && needs.approve-staging.result == 'skipped'))
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -875,7 +875,7 @@ jobs:
     concurrency:
       group: devsecops-deploy-${{ inputs.environment }}
       cancel-in-progress: false
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -984,7 +984,7 @@ jobs:
     needs: [deploy]
     # Same as deploy: the skipped g4 ancestor must not skip this job.
     if: ${{ !cancelled() && needs.deploy.result == 'success' }}
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
       contents: read
@@ -1315,7 +1315,7 @@ jobs:
           TRIVY_PASSWORD: ${{ github.token }}
         run: |
           mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
-          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v "${TRIVY_CACHE_VOLUME:-trivy-cache}:/root/.cache/trivy" "$TRIVY" \
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
             image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
       - id: dependency-check
         if: ${{ !cancelled() && inputs.environment == 'dev' }}
@@ -1357,7 +1357,7 @@ jobs:
     # `uat-approved` label; prod's Approval Gate requires it.
     needs: [resolve, env-tests]
     if: ${{ !cancelled() && inputs.environment == 'staging' && needs.env-tests.result == 'success' }}
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1396,7 +1396,7 @@ jobs:
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
             g4, gate-g5, deploy, post-deploy, env-tests]
     if: always() && needs.resolve.result == 'success'
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read

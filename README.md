@@ -303,50 +303,17 @@ installed by the job. It runs as the `env-tester` ServiceAccount
 (`django-gates-demo-tools`), which can list pods and port-forward in
 `django-gates-demo-{dev,stg,prod}` and exec only in dev and stg.
 
-The environment test slot of `ci/runners/runners.sh` (below) is that
-runner: per job it mints a 2-hour token for `env-tester` and gives the job
-a kubeconfig with it (mode 0600, readable only by the runner user).
+`bash tests/env/env-runner.sh [runner dir]` does the setup: it mints a 2-hour
+token for `env-tester`, writes a kubeconfig with it (mode 0600), registers
+the runner as **ephemeral** (one registration serves one job) with the
+label `django-gates-demo-env`, and runs it. It needs `GH_TOKEN` with
+admin rights on the repo, for the registration token. One release run has
+up to three environment test jobs (one per stage), so keep it in a loop
+while a release is running.
 
-## Self-hosted runners (`ci/runners`)
-
-GitHub-hosted runners can take minutes to pick up a job. While
-`ci/runners/runners.sh` runs, every job runs on this machine instead, in
-Docker containers that use its Docker daemon (so its image cache) and its
-network:
-
-```
-GH_TOKEN=... [SLOTS=6] [ENV_SLOTS=1] bash ci/runners/runners.sh
-```
-
-`GH_TOKEN` needs admin rights on the repo (it registers runners and sets a
-repo variable); `backend/.env`'s `GITHUB_TOKEN` in the security dashboard
-works. Stop it with Ctrl-C (or SIGTERM).
-
-- It builds the runner image from `ci/runners/Dockerfile` (GitHub's
-  `actions-runner`, pinned by digest, plus gh, kubectl, skopeo and the
-  other tools the jobs expect from `ubuntu-latest`).
-- Each of the `SLOTS` generic slots (label `django-gates-demo-docker`)
-  and `ENV_SLOTS` environment test slots (label `django-gates-demo-env`)
-  loops: a **just-in-time** runner registration (one job, then GitHub
-  removes it), a fresh container, then its work directory is wiped. No
-  job sees the admin token or another job's files. Each slot has its own
-  trivy cache volume (`TRIVY_CACHE_VOLUME`), so parallel scans don't
-  lock each other out.
-- While it runs, the repo variable `CI_RUNS_ON` is
-  `django-gates-demo-docker`, and every job's `runs-on` is
-  `vars.CI_RUNS_ON || 'ubuntu-latest'`. On exit it deletes the variable,
-  its containers and any registration that never got a job, so the
-  workflows go back to GitHub-hosted runners. If it was killed without
-  cleaning up, delete the variable (Settings → Secrets and variables →
-  Actions → Variables) and jobs stop waiting for it.
-- Logs: `~/.local/share/django-gates-demo-runners/<slot>/runner.log`.
-
-A job on these runners can control this machine: it has the Docker
-socket. This repo is public, so:
-- pull requests from forks always run on `ubuntu-latest` (the pipeline's
-  `runs-on` checks `head.repo.fork`), and the release workflows only run
-  on `main`;
+This repo is public, so a pull request from a fork could try to run on a
+self-hosted runner. To prevent that:
+- keep the runner registered only while a release runs;
 - keep *Settings → Actions → Fork pull request workflows → Require
-  approval for all external contributors* on;
-- run it only on a machine where that is acceptable, and stop it when
-  you don't need it.
+  approval for all external contributors* on. The pipeline itself never
+  targets this label.

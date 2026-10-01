@@ -77,7 +77,7 @@ jobs:
   # ── 1 build ────────────────────────────────────────────────────────────
   build:
     name: 1 build (reproducible)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
@@ -137,7 +137,7 @@ jobs:
 
   unit-tests:
     name: 1 unit tests + coverage
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -192,7 +192,7 @@ jobs:
 
   code-quality:
     name: 1 code quality · ruff (lint + complexity)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -237,7 +237,7 @@ jobs:
   # ── 2 static ───────────────────────────────────────────────────────────
   sast-semgrep:
     name: 2 SAST · semgrep
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -285,7 +285,7 @@ jobs:
 
   secrets-gitleaks:
     name: 2 secrets · gitleaks (full history)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -327,7 +327,7 @@ jobs:
 
   secrets-trufflehog:
     name: 2 secrets · trufflehog (verified)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -368,7 +368,7 @@ jobs:
 
   sca-trivy:
     name: 2 SCA · trivy (lockfile)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -386,7 +386,7 @@ jobs:
           persist-credentials: false
       - run: |
           mkdir -p "$OUT"
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v "${TRIVY_CACHE_VOLUME:-trivy-cache}:/root/.cache/trivy" "$TRIVY" \
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
             fs --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
       - id: verdict
         if: always()
@@ -418,7 +418,7 @@ jobs:
 
   iac-checkov:
     name: 2 IaC · checkov (Dockerfile + k8s render)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -476,7 +476,7 @@ jobs:
   reviewers:
     name: 2 governance · reviewers
     if: startsWith(github.event_name, 'pull_request')
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -516,7 +516,7 @@ jobs:
   commits-signed:
     name: 2 governance · signed commits
     if: startsWith(github.event_name, 'pull_request')
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -558,7 +558,7 @@ jobs:
     name: 2 image · trivy
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -585,9 +585,9 @@ jobs:
           tar -xf "$RUNNER_TEMP/image/image.oci.tar" -C "$RUNNER_TEMP/oci"
           got=$(jq -r '.manifests[0].digest' "$RUNNER_TEMP/oci/index.json")
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
-          docker run --rm -v "$RUNNER_TEMP/oci:/oci:ro" -v "$PWD/$OUT:/out" -v "${TRIVY_CACHE_VOLUME:-trivy-cache}:/root/.cache/trivy" "$TRIVY" \
+          docker run --rm -v "$RUNNER_TEMP/oci:/oci:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
             image --input /oci --scanners vuln,secret --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q || true
-          docker run --rm -v "$PWD/$OUT:/out" -v "${TRIVY_CACHE_VOLUME:-trivy-cache}:/root/.cache/trivy" "$TRIVY" \
+          docker run --rm -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
             convert --format sarif --output /out/trivy.sarif /out/trivy.json -q || true
       - id: verdict
         if: always()
@@ -620,7 +620,7 @@ jobs:
     name: 2 image · SBOM (syft)
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -663,7 +663,7 @@ jobs:
     name: 2 image · CIS benchmark (dockle)
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -717,7 +717,7 @@ jobs:
     name: 2 image · django check --deploy
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -774,7 +774,7 @@ jobs:
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
             sca-trivy, iac-checkov, image-scan, sbom, image-compliance, django-deploy-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -899,7 +899,7 @@ jobs:
     name: G1 merge gate
     needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -923,7 +923,7 @@ jobs:
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
             image-scan, sbom, image-compliance, django-deploy-check, publish]
     if: always()
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -951,7 +951,7 @@ jobs:
             reviewers, commits-signed, image-scan, sbom, image-compliance, django-deploy-check, publish,
             gate-g1, gate-g2]
     if: always()
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1026,7 +1026,7 @@ jobs:
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.publish.outputs.published == 'true'
       && needs.gate-g2.outputs.status == 'pass' && needs.evidence.result == 'success' }}
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: write
@@ -1048,7 +1048,7 @@ jobs:
     name: PR findings comment
     needs: evidence
     if: always() && startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read

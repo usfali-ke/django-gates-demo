@@ -142,7 +142,7 @@ jobs:
     if: >-
       always() && github.ref == 'refs/heads/main' && inputs.kind != 'rollback' &&
       needs.prod.result == 'failure' && needs.prod.outputs.gitops-sha != ''
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: write
@@ -167,7 +167,7 @@ jobs:
     # events, release evidence) and Argo CD's notifications.
     needs: [dev, staging, prod, rollback]
     if: always() && github.ref == 'refs/heads/main'
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
