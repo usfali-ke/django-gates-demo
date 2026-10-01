@@ -31,14 +31,15 @@ RUN DJANGO_SECRET_KEY=collectstatic-build-step-only \
 # The runtime stage only copies files and deletes: its layers depend on
 # nothing but the inputs (and SOURCE_DATE_EPOCH for timestamps).
 FROM python:3.13-slim@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b AS runtime
-# The pinned base lags Debian's openssl security fixes (CVE-2026-75804,
-# CVE-2026-84782 fixed in 3.5.7-1~deb13u3). Upgrade only those packages, and
+# The pinned base lags Debian security fixes: openssl (CVE-2026-75804,
+# CVE-2026-84782, fixed in 3.5.7-1~deb13u3) and pcre2 (CVE-2026-103111,
+# fixed in 10.46-1~deb13u3). Upgrade only those packages, and
 # drop apt's lists/logs/caches in the same layer: they embed timestamps and
 # would break the reproducible-build check. Remove this once the pinned base
-# digest is bumped to an image that already carries the fix.
+# digest is bumped to an image that already carries the fixes.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends --only-upgrade \
-      openssl libssl3t64 openssl-provider-legacy \
+      openssl libssl3t64 openssl-provider-legacy libpcre2-8-0 \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt /var/cache/ldconfig \
       /var/log/apt /var/log/dpkg.log /var/log/alternatives.log /var/log/apt-history.log
 # pip isn't used at runtime, and its vendored libraries (msgpack, ...) carry
