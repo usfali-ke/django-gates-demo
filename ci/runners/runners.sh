@@ -78,13 +78,15 @@ slot() {
       extra=(-v "$dir/kubeconfig:/home/runner/.kube/config:ro" -e KUBECONFIG=/home/runner/.kube/config)
     fi
     log "${kind}-${n}: ${name} waiting for a job"
-    # Node tries each address of a host for only 250 ms by default; on a
-    # slow link uploads then fail with ETIMEDOUT (as in tests/env).
+    # This network's DNS also returns NAT64 (64:ff9b::) addresses, which
+    # don't route. Node races IPv6 against IPv4 with a 250 ms limit per
+    # attempt (2 s isn't enough when several jobs pull images at once), and
+    # uploads fail with ETIMEDOUT. IPv4 first, no racing: the OS timeout.
     ACTIONS_RUNNER_INPUT_JITCONFIG=$jit docker run --rm --name "$name" --label "$prefix=$kind" \
       --network host --group-add "$(stat -c %g /var/run/docker.sock)" \
       -v /var/run/docker.sock:/var/run/docker.sock -v "$dir/_work:$dir/_work" \
       -e ACTIONS_RUNNER_INPUT_JITCONFIG -e TRIVY_CACHE_VOLUME="trivy-cache-${kind}-${n}" \
-      -e NODE_OPTIONS=--network-family-autoselection-attempt-timeout=2000 \
+      -e NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection" \
       "${extra[@]}" "$image" /home/runner/run.sh > "$dir/runner.log" 2>&1 || true
     log "${kind}-${n}: ${name} done ($(grep -m1 -o 'completed with result: [A-Za-z]*' "$dir/runner.log" || echo "no job"))"
     jit=""
