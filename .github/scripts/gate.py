@@ -48,14 +48,16 @@ GATES = {
         ("commits_signed", "security", [("commits-signed", "result")]),
     ],
     # The Control Gate at the end of CI (devsecops-pipeline.yml): build
-    # successful, every test passed, code quality met, and every static and
-    # image control clean, before anything is deployed anywhere. Coverage
-    # and the image compliance checks are properties of the artifact, so
-    # they are decided here, once, for the digest.
+    # successful, every static and image control clean, before anything is
+    # deployed anywhere. Coverage and the image compliance checks are
+    # properties of the artifact, so they are decided here, once, for the
+    # digest. Doc mapping (docs/DevSecOps_process.docx): G2 is the BUILD
+    # gate — reproducible build + no Critical/High + signed/attested + SBOM.
+    # Unit tests and the coverage threshold are TEST-phase criteria: unit
+    # tests are decided at G1 (the PR gate), coverage at G3 via the "G3@ci"
+    # profile below, pushed by the same Control Gate job.
     "G2": [
         ("reproducible_build_config_controlled", "delivery", [("build", "result")]),
-        ("unit_tests_pass", "quality", [("unit-tests", "result")]),
-        ("coverage_threshold_met", "quality", [("unit-tests", "coverage")]),
         ("code_quality_threshold_met", "quality", [("code-quality", "result")]),
         ("sast_clean", "security", [("sast-semgrep", "result")]),
         ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
@@ -65,6 +67,14 @@ GATES = {
         ("compliance_scan_clean", "security", [("image-compliance", "result"), ("django-deploy-check", "result")]),
         ("artifact_signed_attested", "security", [("publish", "result")]),
         ("sbom_present", "security", [("sbom", "result")]),
+    ],
+    # The TEST phase's coverage criterion (doc G3: "...AND coverage
+    # threshold met..."), decided in CI where coverage is measured — the
+    # pipeline's Control Gate job records it as gate "G3" alongside G2, so
+    # it merges with the G3 decisions the stage pipeline makes per
+    # environment (functional, performance, DAST).
+    "G3@ci": [
+        ("coverage_threshold_met", "quality", [("unit-tests", "coverage")]),
     ],
     # G3 runs only against a deployed environment (devsecops-stage.yml, job
     # test-gate after one job per test), never against an image that isn't

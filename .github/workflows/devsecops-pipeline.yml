@@ -924,7 +924,7 @@ jobs:
   # "G2"): nothing is deployed unless it passed for this digest, which
   # devsecops-release.yml checks in the signed evidence.
   gate-g2:
-    name: G2 Control Gate (CI → release)
+    name: G2/G3(ci) Control Gate (CI → release)
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
             image-scan, sbom, image-compliance, django-deploy-check, publish]
     if: always()
@@ -948,6 +948,23 @@ jobs:
           artifact-digest: ${{ needs.build.outputs.digest }}
           record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
           allow-skipped: ${{ !(github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && 'artifact_signed_attested' || '' }}
+      # Doc mapping: the coverage threshold is a TEST-phase (G3) criterion,
+      # decided here in CI where coverage is measured. Same Control Gate
+      # job records it as gate G3 so the dashboard's G3 sees it alongside
+      # the stage pipeline's functional/performance/DAST decisions. Runs
+      # even when the G2 gate failed (both verdicts belong in the record);
+      # this step failing fails the job, and the release job below requires
+      # needs.gate-g2.result == 'success' as well as the G2 status.
+      - id: gate-g3
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/gate
+        with:
+          gate: G3
+          profile: ci
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.build.outputs.digest || github.sha }}
+          artifact-digest: ${{ needs.build.outputs.digest }}
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
   # ── 4 Release: evidence ────────────────────────────────────────────────
   evidence:
@@ -1030,7 +1047,8 @@ jobs:
     needs: [publish, gate-g2, evidence]
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.publish.outputs.published == 'true'
-      && needs.gate-g2.outputs.status == 'pass' && needs.evidence.result == 'success' }}
+      && needs.gate-g2.outputs.status == 'pass' && needs.gate-g2.result == 'success'
+      && needs.evidence.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
