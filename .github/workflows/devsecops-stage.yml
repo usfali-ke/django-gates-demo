@@ -79,6 +79,11 @@ on:
         required: false
         type: string
         default: ""
+      allow-self-approval:
+        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
+        required: false
+        type: string
+        default: ""
       expect-digest:
         description: The digest the previous stage of this run deployed; resolve fails if the previous environment has moved on since
         required: false
@@ -717,6 +722,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+          ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval }}
         run: bash .github/scripts/approvals.sh staging-approval
       - id: verdict
         if: always()
@@ -785,6 +791,7 @@ jobs:
         id: sod
         env:
           GH_TOKEN: ${{ github.token }}
+          ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval }}
         # The dashboard checks the same thing independently.
         run: bash .github/scripts/approvals.sh release-approval
       - env:

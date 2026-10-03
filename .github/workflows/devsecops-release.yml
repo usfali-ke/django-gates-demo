@@ -65,6 +65,11 @@ on:
         description: prod — change request being released (7, #7 or CHG-7); default the one whose Release field names this release
         required: false
         type: string
+      allow-self-approval:
+        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
+        required: false
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -86,6 +91,7 @@ jobs:
       environment: dev
       kind: ${{ inputs.kind }}
       commit: ${{ inputs.commit }}
+      allow-self-approval: ${{ inputs.allow-self-approval }}
 
   staging:
     name: 6 Deploy to Staging
@@ -109,6 +115,7 @@ jobs:
       environment: staging
       kind: ${{ inputs.kind }}
       expect-digest: ${{ needs.dev.outputs.digest }}
+      allow-self-approval: ${{ inputs.allow-self-approval }}
 
   prod:
     name: 7 Deploy to Production
@@ -131,6 +138,7 @@ jobs:
       kind: ${{ inputs.kind }}
       change: ${{ inputs.change }}
       expect-digest: ${{ needs.staging.outputs.digest }}
+      allow-self-approval: ${{ inputs.allow-self-approval }}
 
   rollback:
     name: 8 Operate · rollback prod (automatic)
