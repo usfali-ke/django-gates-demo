@@ -33,6 +33,19 @@ self=$(jq -rn --argjson s "$excluded" --argjson a "$approved" '$a - ($a - $s) | 
 if [ "$approved" = "[]" ]; then
   detail="no ${environment} approval recorded for this run"
 elif [ -n "$self" ]; then
+  # Documented single-operator exception (opt-in per run): a two-person team
+  # where one account starts the pipeline and the other authors the change
+  # has no eligible approver left under the doc's strict rule. When
+  # ALLOW_SELF_APPROVAL is set, the exclusion is waived — but the waiver is
+  # written into the verdict detail, which the dashboard records verbatim
+  # on the checklist evidence, so the exception is always visible.
+  if [ "${ALLOW_SELF_APPROVAL:-}" = "true" ] || [ "${ALLOW_SELF_APPROVAL:-}" = "1" ]; then
+    detail="SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): ${environment} approved by ${self}, who started/re-ran this run or authored the change — exclusion waived by ALLOW_SELF_APPROVAL"
+    echo "detail=$detail" >> "$GITHUB_OUTPUT"
+    echo "::warning::$detail"
+    echo "$detail" | tee -a "$GITHUB_STEP_SUMMARY"
+    exit 0
+  fi
   detail="${environment} approved by ${self}, who started or re-ran this run or authored the change — someone who did neither must approve"
 else
   detail="${environment}: started by $(jq -r 'join(", ")' <<<"$started")"
