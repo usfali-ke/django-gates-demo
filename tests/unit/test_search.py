@@ -61,7 +61,7 @@ def test_export_archive_zips_own_notes_in_memory(alice_client, alice, bob):
         assert zf.read("notes.txt").decode() == "a1\n"
 
 
-@pytest.mark.parametrize("name", ["x; touch /tmp/pwned", "$(id)", "../../evil", "a b", "x" * 65, ""])
+@pytest.mark.parametrize("name", ["x; touch /tmp/pwned", "$(id)", "../../evil", "a b", "x" * 65, "", "abc\n", "abc\r\nX: y"])
 def test_export_archive_rejects_unsafe_names(alice_client, alice, name):
     assert alice_client.get(reverse("notes:export-archive"), {"name": name}).status_code == 400
 
@@ -76,7 +76,7 @@ def test_attachment_serves_only_inside_own_directory(alice_client, alice, bob, s
 
     r = alice_client.get(reverse("notes:attachment"), {"file": "a.txt"})
     assert r.status_code == 200 and b"".join(r.streaming_content) == b"alice file"
-    for attempt in ["../outside.txt", f"../{bob.pk}/b.txt", "/etc/passwd", str(tmp_path / "outside.txt"), "", "missing.txt"]:
+    for attempt in ["../outside.txt", f"../{bob.pk}/b.txt", "/etc/passwd", str(tmp_path / "outside.txt"), "", "missing.txt", "a\x00b.txt", "x" * 5000]:
         assert alice_client.get(reverse("notes:attachment"), {"file": attempt}).status_code == 404, attempt
 
 

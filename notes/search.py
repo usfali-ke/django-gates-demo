@@ -13,7 +13,9 @@ from django.views.decorators.http import require_GET
 from .models import Note
 
 # Archive names become a download filename only; nothing is written to disk.
-ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# fullmatch, not match + "$": "$" also accepts a trailing newline, which
+# would reach the Content-Disposition header.
+ARCHIVE_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 MAX_RESULTS = 50
 
 
@@ -49,7 +51,7 @@ def export_archive(request):
     """Zip the caller's notes in memory: no shell, no temp files, and the
     requested name is validated before it reaches the download filename."""
     name = request.GET.get("name", "notes")
-    if not ARCHIVE_NAME.match(name):
+    if not ARCHIVE_NAME.fullmatch(name):
         return HttpResponseBadRequest("name may contain only letters, digits, '-' and '_' (max 64)")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -67,11 +69,14 @@ def attachment(request):
     uploaded .html/.svg served inline would be stored XSS on this origin."""
     root = _attachments_root(request.user)
     requested = request.GET.get("file", "")
-    if not requested:
+    if not requested or "\x00" in requested:  # NUL makes the os calls raise
         raise Http404
-    path = (root / requested).resolve()
-    if not path.is_relative_to(root) or not path.is_file():
-        raise Http404
+    try:
+        path = (root / requested).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise Http404
+    except (OSError, ValueError):
+        raise Http404 from None
     response = FileResponse(path.open("rb"), as_attachment=True, filename=path.name, content_type="application/octet-stream")
     response["X-Content-Type-Options"] = "nosniff"
     return response
