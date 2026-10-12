@@ -61,9 +61,10 @@ def export_archive(request):
 @login_required
 @require_GET
 def attachment(request):
-    """Serve one of the caller's attachments. The resolved path must stay
+    """Download one of the caller's attachments. The resolved path must stay
     inside the caller's own directory: '..', absolute paths and symlinks
-    pointing out of it are all a 404."""
+    pointing out of it are all a 404. Always a download, never rendered: an
+    uploaded .html/.svg served inline would be stored XSS on this origin."""
     root = _attachments_root(request.user)
     requested = request.GET.get("file", "")
     if not requested:
@@ -71,4 +72,6 @@ def attachment(request):
     path = (root / requested).resolve()
     if not path.is_relative_to(root) or not path.is_file():
         raise Http404
-    return FileResponse(path.open("rb"))
+    response = FileResponse(path.open("rb"), as_attachment=True, filename=path.name, content_type="application/octet-stream")
+    response["X-Content-Type-Options"] = "nosniff"
+    return response

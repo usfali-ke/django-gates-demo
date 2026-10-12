@@ -80,6 +80,17 @@ def test_attachment_serves_only_inside_own_directory(alice_client, alice, bob, s
         assert alice_client.get(reverse("notes:attachment"), {"file": attempt}).status_code == 404, attempt
 
 
+def test_attachment_is_a_download_never_rendered(alice_client, alice, settings, tmp_path):
+    settings.NOTE_ATTACHMENTS_DIR = tmp_path
+    (tmp_path / str(alice.pk)).mkdir()
+    (tmp_path / str(alice.pk) / "page.html").write_text("<script>alert(1)</script>")
+    r = alice_client.get(reverse("notes:attachment"), {"file": "page.html"})
+    assert r.status_code == 200
+    assert r["Content-Type"] == "application/octet-stream"
+    assert r["Content-Disposition"].startswith("attachment;")
+    assert r["X-Content-Type-Options"] == "nosniff"
+
+
 def test_attachment_symlink_out_of_directory_is_refused(alice_client, alice, settings, tmp_path):
     settings.NOTE_ATTACHMENTS_DIR = tmp_path
     (tmp_path / "outside.txt").write_text("outside")
