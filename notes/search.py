@@ -5,9 +5,8 @@ from pathlib import Path
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
-from django.http import FileResponse, Http404, HttpResponse, HttpResponseBadRequest, JsonResponse
-from django.shortcuts import get_object_or_404
-from django.utils.html import format_html, format_html_join
+from django.http import FileResponse, Http404, HttpResponseBadRequest, JsonResponse
+from django.shortcuts import get_object_or_404, render
 from django.views.decorators.http import require_GET
 
 from .models import Note
@@ -29,12 +28,11 @@ def _attachments_root(user) -> Path:
 @require_GET
 def search(request):
     """Search the caller's notes. ORM (parameterized; LIKE wildcards in the
-    term are escaped by icontains) and auto-escaped HTML for both the term
-    and the note text."""
+    term are escaped by icontains), rendered through a template so Django
+    auto-escapes both the term and the note text."""
     q = request.GET.get("q", "").strip()[:200]
     notes = Note.objects.filter(owner=request.user, text__icontains=q).order_by("-id")[:MAX_RESULTS]
-    items = format_html_join("", "<li>{}</li>", ((n.text,) for n in notes))
-    return HttpResponse(format_html("<h2>Results for {}</h2><ul>{}</ul>", q, items))
+    return render(request, "notes/search.html", {"q": q, "notes": notes})
 
 
 @login_required
