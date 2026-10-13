@@ -1,45 +1,49 @@
-# CI: from a developer's commit to a signed artifact, in ONE run. The SDLC
-# phases in order, the control gates between them. Every control is its
-# own job and keeps its report as evidence, so the run shows what passed
-# and what failed; controls within a phase run in parallel.
+# CI: from a developer's commit to a signed artifact, in ONE run. The
+# SDLC phases (docs/DevSecOps_process.docx) in order, the control gates
+# between them, and every control its own job keeping its report as
+# evidence. Phases run sequentially — a phase's jobs start only when the
+# previous phase's gate passed; controls within a phase run in parallel.
 #
-#   1 Code      the source: SAST (semgrep) · secrets (gitleaks, trufflehog) ·
-#               SCA (trivy, lockfile) · IaC (checkov) · code quality (ruff:
-#               lint + complexity) · PR: reviewers · signed commits
-#   2 Build     the image, built twice (reproducible?) → `image` artifact ·
-#               unit tests + coverage
-#     ── G1 merge gate (pull requests): reviewed, signed, tested, no SAST or
-#        secret findings ──
-#   3 Package   the built image: trivy · syft SBOM · dockle (CIS) · django
-#               check --deploy; then, main only and only if every control
-#               passed: push the exact built digest to GHCR, cosign sign +
-#               SBOM/SLSA attestations
-#     ── G2 Control Gate (CI → release): build successful, all tests passed,
-#        code quality threshold met, every scan clean, artifact signed ──
-#   4 Release   every report + hash manifest → artifact `evidence` (90 days;
-#               on main attested to the image digest) · starts
-#               devsecops-release.yml for this commit (5 dev → 6 staging →
-#               7 prod → 8 operate)
-#   Feedback    PR findings comment
+#   Develop   the source, before anything is built: SAST (semgrep) ·
+#             secrets (gitleaks, trufflehog) · quality (ruff: lint +
+#             complexity) · unit tests + coverage · PR: reviewers ·
+#             signed commits · AI security review
+#     ── G1 merge gate (Develop → Build, on pull requests): reviewed,
+#        signed, tested, no SAST or secret findings. A failed G1 skips
+#        every Build job — the pipeline does not proceed to the phase ──
+#   Build     reproducible image (built twice) · SCA (trivy, lockfile) ·
+#             IaC (checkov) · the built image: trivy · syft SBOM · dockle
+#             (CIS) · django check --deploy; then, main only and only if
+#             every control passed: push the exact built digest to GHCR,
+#             cosign sign + SBOM/SLSA attestations
+#     ── G2 Control Gate (Build → Release): build reproducible, every
+#        scan clean, code quality threshold met, artifact signed + SBOM;
+#        the same job records the Test-phase coverage threshold as
+#        G3 (ci) ──
+#   Release   every report + hash manifest → artifact `evidence` (90 days;
+#             on main attested to the image digest) · starts
+#             devsecops-release.yml for this commit (dev → staging → prod)
+#   Feedback  PR findings comment
 #
-# Nothing dynamic runs here: functional, regression, performance and
-# security tests (DAST, TLS) run in the release pipeline, each its own job
-# against each environment after this digest is deployed to it — never
-# against an image nobody deployed.
+# Plan precedes the pipeline (requirements, acceptance criteria, threat
+# model) and Test is decided against deployed environments in the release
+# pipeline — never against an image nobody deployed.
 #
 # Rules that make the results trustworthy:
 #  - Tools never decide pass/fail (they run "don't fail on findings");
 #    .github/scripts/verdict.py applies the threshold, records the verdict
 #    in the report, and fails the job. A missing report is a fail.
+#  - A gate criterion fails closed when its control didn't run (skipped
+#    after an earlier gate failed, cancelled or crashed) — never an
+#    implicit pass; gate.py's verdict says which.
 #  - Exceptions live in security/accepted-risks.json, each with a reason
 #    and an expiry, and every verdict lists the ones it applied.
-#  - Nothing is rebuilt: Package tests the `image` artifact from Build,
+#  - Nothing is rebuilt: Build's image tests use the `image` artifact,
 #    checked against its digest, and publish pushes those same bytes; the
 #    release deploys that digest.
 #  - Every image and action is pinned by digest/SHA.
 #  - G1 goes to the security dashboard on pull requests, G2 on pushes to
 #    main (artifact `gate-result-<G>`). Elsewhere they're `gate-preview-<G>`.
-
 name: devsecops-pipeline
 
 on:
@@ -79,9 +83,12 @@ env:
   CERT_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
-  # ── 1 Code: the source, before anything is built ───────────────────────
+  # ── Develop: the source, before anything is built (the doc's Plan
+  #    phase precedes the pipeline: requirements, acceptance criteria,
+  #    threat model). Controls within the phase run in parallel. ─────────
+
   sast-semgrep:
-    name: 1 Code · SAST · semgrep
+    name: Develop · SAST · semgrep
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -129,7 +136,7 @@ jobs:
           if-no-files-found: ignore
 
   secrets-gitleaks:
-    name: 1 Code · secrets · gitleaks (full history)
+    name: Develop · secrets · gitleaks (full history)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -171,7 +178,7 @@ jobs:
           if-no-files-found: ignore
 
   secrets-trufflehog:
-    name: 1 Code · secrets · trufflehog (verified)
+    name: Develop · secrets · trufflehog (verified)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -211,242 +218,8 @@ jobs:
           path: reports/secrets-trufflehog/
           if-no-files-found: ignore
 
-  sca-trivy:
-    name: 1 Code · SCA · trivy (lockfile)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      security-events: write
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: sca-trivy
-      OUT: reports/sca-trivy
-      VERDICT_FILE: reports/sca-trivy/verdict.json
-      NATIVE: reports/sca-trivy/trivy-fs.txt
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: |
-          mkdir -p "$OUT"
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            fs --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: trivy 0.74.0 (fs, lockfile incl. dev dependencies)
-        run: python3 .github/scripts/verdict.py trivy-fs "$OUT/trivy-fs.json"
-      # trivy's table from the same JSON (no second scan): the severities
-      # that block, minus the accepted risks.
-      - name: tool report
-        if: always()
-        run: |
-          touch "$OUT/accepted-ids.txt"
-          docker run --rm -v "$PWD/$OUT:/out" "$TRIVY" convert --format table --severity CRITICAL,HIGH,UNKNOWN \
-            --ignorefile /out/accepted-ids.txt --output /out/trivy-fs.txt /out/trivy-fs.json -q || true
-          python3 .github/scripts/findings.py native "$NATIVE"
-      # Code scanning, as in sast-semgrep.
-      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/sca-trivy/findings.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
-        continue-on-error: true
-        with:
-          sarif_file: reports/sca-trivy/findings.sarif
-          category: sca-trivy
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-sca-trivy
-          path: reports/sca-trivy/
-          if-no-files-found: ignore
-
-  iac-checkov:
-    name: 1 Code · IaC · checkov (Dockerfile + k8s render)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      security-events: write
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: iac-checkov
-      OUT: reports/iac-checkov
-      VERDICT_FILE: reports/iac-checkov/verdict.json
-      NATIVE: reports/iac-checkov/results_github_failed_only.md
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: false
-      - run: |
-          set -uo pipefail
-          mkdir -p "$OUT/input"
-          cp Dockerfile "$OUT/input/Dockerfile"
-          # checkov skips CRDs, so the Rollout is scanned as the Deployment
-          # it is equivalent to (scan_view.py) — never applied.
-          # Prod's render: every overlay is deploy/base plus names and a digest.
-          kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/prod.yaml" || exit 0
-          docker run --rm -v "$PWD/$OUT:/work" "$CHECKOV" -f /work/input/prod.yaml -f /work/input/Dockerfile \
-            --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
-          mv "$OUT/results_json.json" "$OUT/checkov.json" || true
-          cat "$OUT/results_cli.txt" 2>/dev/null || true
-      - id: verdict
-        if: always()
-        env:
-          TOOL: checkov 3.3.20
-        run: python3 .github/scripts/verdict.py checkov "$OUT/checkov.json"
-      # The tool's own report under the verdict (findings.py native).
-      - name: tool report
-        if: always()
-        run: python3 .github/scripts/findings.py native "$NATIVE"
-      # Code scanning, as in sast-semgrep.
-      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/iac-checkov/findings.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
-        continue-on-error: true
-        with:
-          sarif_file: reports/iac-checkov/findings.sarif
-          category: iac-checkov
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-iac-checkov
-          path: reports/iac-checkov/
-          if-no-files-found: ignore
-
-  reviewers:
-    name: 1 Code · governance · reviewers
-    if: startsWith(github.event_name, 'pull_request')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: reviewers
-      OUT: reports/reviewers
-      VERDICT_FILE: reports/reviewers/verdict.json
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$OUT"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --jq '.[] | tojson' > "$OUT/reviews.jsonl"
-      - id: verdict
-        if: always()
-        env:
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          REQUIRED_APPROVALS: "1"
-          TOOL: GitHub pull request reviews API
-        run: python3 .github/scripts/verdict.py reviewers "$OUT/reviews.jsonl"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-reviewers
-          path: reports/reviewers/
-          if-no-files-found: ignore
-
-  # AI security review by the Hermes agent: the PR event goes to the Hermes
-  # gateway on the lab network (hence lab-runner), Hermes reviews the diff
-  # and comments, and the verdict for this head commit decides the control —
-  # any Critical/High fails it. Source: security-dashboard/pipeline/github/
-  # hermes-pr-review/. Secret HERMES_WEBHOOK_SECRET; optional variables
-  # HERMES_WEBHOOK_URL, HERMES_COMMENTER.
-  ai-review:
-    name: 1 Code · AI security review · Hermes
-    if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: lab-runner
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: ai-review
-      OUT: reports/ai-review
-      VERDICT_FILE: reports/ai-review/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/scripts
-      - id: verdict
-        env:
-          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
-          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          WAIT_SECONDS: "1500"
-        run: python3 .github/scripts/hermes_review.py
-      # Supplementary evidence only — the verdict reaches gate-g1 through the
-      # job output. lab-runner's egress to GitHub's artifact storage is
-      # flaky (ETIMEDOUT), and that must not turn a passing review red.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        continue-on-error: true
-        with:
-          name: report-ai-review
-          path: reports/ai-review/
-          if-no-files-found: ignore
-
-  commits-signed:
-    name: 1 Code · governance · signed commits
-    if: startsWith(github.event_name, 'pull_request')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: commits-signed
-      OUT: reports/commits-signed
-      VERDICT_FILE: reports/commits-signed/verdict.json
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      # GitHub's own verification (signature by a key registered to the
-      # committer) — not merely "has a signature".
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$OUT"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
-            --jq '.[] | [.sha[0:7], (.commit.verification.verified|tostring), .commit.verification.reason] | @tsv' > "$OUT/commits.tsv"
-      - id: verdict
-        if: always()
-        env:
-          TOOL: GitHub commit verification
-        run: python3 .github/scripts/verdict.py commits "$OUT/commits.tsv"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-commits-signed
-          path: reports/commits-signed/
-          if-no-files-found: ignore
-
   code-quality:
-    name: 1 Code · quality · ruff (lint + complexity)
+    name: Develop · quality · ruff (lint + complexity)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -489,9 +262,221 @@ jobs:
           path: reports/code-quality/
           if-no-files-found: ignore
 
-  # ── 2 Build ────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Develop · unit tests + coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.tests.outputs.result }}
+      coverage: ${{ steps.coverage.outputs.coverage }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - id: run
+        run: |
+          mkdir -p reports/unit-tests reports/coverage
+          rc=0
+          uv sync --frozen || rc=$?
+          uv run --frozen pytest --junitxml=reports/unit-tests/junit.xml \
+            --cov --cov-report=xml:reports/coverage/coverage.xml --cov-report=term || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+      - id: tests
+        if: always()
+        env:
+          CONTROL: unit-tests
+          VERDICT_FILE: reports/unit-tests/verdict.json
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: tests/unit
+          TOOL: pytest + pytest-django
+        run: python3 .github/scripts/verdict.py tests reports/unit-tests/junit.xml
+      - id: coverage
+        if: always()
+        env:
+          CONTROL: coverage
+          VERDICT_FILE: reports/coverage/verdict.json
+          OUTPUT: coverage
+          TOOL: pytest-cov
+        run: python3 .github/scripts/verdict.py coverage reports/coverage/coverage.xml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-unit-tests
+          path: reports/unit-tests/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-coverage
+          path: reports/coverage/
+          if-no-files-found: ignore
+
+  reviewers:
+    name: Develop · governance · reviewers
+    if: startsWith(github.event_name, 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: reviewers
+      OUT: reports/reviewers
+      VERDICT_FILE: reports/reviewers/verdict.json
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$OUT"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --jq '.[] | tojson' > "$OUT/reviews.jsonl"
+      - id: verdict
+        if: always()
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REQUIRED_APPROVALS: "1"
+          TOOL: GitHub pull request reviews API
+        run: python3 .github/scripts/verdict.py reviewers "$OUT/reviews.jsonl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-reviewers
+          path: reports/reviewers/
+          if-no-files-found: ignore
+
+  ai-review:
+    name: Develop · AI security review · Hermes
+    if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: lab-runner
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: ai-review
+      OUT: reports/ai-review
+      VERDICT_FILE: reports/ai-review/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: verdict
+        env:
+          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
+          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WAIT_SECONDS: "1500"
+        run: python3 .github/scripts/hermes_review.py
+      # Supplementary evidence only — the verdict reaches gate-g1 through the
+      # job output. lab-runner's egress to GitHub's artifact storage is
+      # flaky (ETIMEDOUT), and that must not turn a passing review red.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        continue-on-error: true
+        with:
+          name: report-ai-review
+          path: reports/ai-review/
+          if-no-files-found: ignore
+
+  commits-signed:
+    name: Develop · governance · signed commits
+    if: startsWith(github.event_name, 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: commits-signed
+      OUT: reports/commits-signed
+      VERDICT_FILE: reports/commits-signed/verdict.json
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      # GitHub's own verification (signature by a key registered to the
+      # committer) — not merely "has a signature".
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$OUT"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[] | [.sha[0:7], (.commit.verification.verified|tostring), .commit.verification.reason] | @tsv' > "$OUT/commits.tsv"
+      - id: verdict
+        if: always()
+        env:
+          TOOL: GitHub commit verification
+        run: python3 .github/scripts/verdict.py commits "$OUT/commits.tsv"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-commits-signed
+          path: reports/commits-signed/
+          if-no-files-found: ignore
+
+  # ── G1 merge gate, the phase boundary Develop → Build. Mandatory on
+  #    pull requests: when any Develop control failed the gate fails, and
+  #    every Build job below is skipped — the pipeline stops at the phase.
+  #    On a push to main G1 is skipped: the merge already happened under
+  #    branch protection.
+
+  gate-g1:
+    name: G1 merge gate (Develop → Build)
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-review]
+    if: always() && startsWith(github.event_name, 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: G1
+          needs: ${{ toJSON(needs) }}
+          subject: pr-${{ github.event.pull_request.number }}
+          commit-sha: ${{ github.event.pull_request.head.sha }}
+
+  # ── Build: the artifact — reproducible, scanned, signed. Nothing here
+  #    runs on a PR whose G1 failed. SCA, IaC and the reproducible build
+  #    are the doc's Build-phase controls; the image jobs test the `image`
+  #    artifact from the build, checked against its digest. ───────────────
+
   build:
-    name: 2 Build · image (reproducible)
+    name: Build · image (reproducible)
+    needs: [gate-g1]
+    # The phase boundary: on a PR nothing is built until the merge gate
+    # passed — a failed G1 skips this job and the whole Build phase. On a
+    # push to main there is no G1 (skipped: the merge already happened
+    # under branch protection) and Build proceeds.
+    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -550,15 +535,82 @@ jobs:
           path: reports/build/
           if-no-files-found: ignore
 
-  unit-tests:
-    name: 2 Build · unit tests + coverage
+  sca-trivy:
+    name: Build · SCA · trivy (lockfile)
+    needs: [gate-g1]
+    # The phase boundary: on a PR nothing is built until the merge gate
+    # passed — a failed G1 skips this job and the whole Build phase. On a
+    # push to main there is no G1 (skipped: the merge already happened
+    # under branch protection) and Build proceeds.
+    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: read
+      security-events: write
     outputs:
-      result: ${{ steps.tests.outputs.result }}
-      coverage: ${{ steps.coverage.outputs.coverage }}
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: sca-trivy
+      OUT: reports/sca-trivy
+      VERDICT_FILE: reports/sca-trivy/verdict.json
+      NATIVE: reports/sca-trivy/trivy-fs.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p "$OUT"
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            fs --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: trivy 0.74.0 (fs, lockfile incl. dev dependencies)
+        run: python3 .github/scripts/verdict.py trivy-fs "$OUT/trivy-fs.json"
+      # trivy's table from the same JSON (no second scan): the severities
+      # that block, minus the accepted risks.
+      - name: tool report
+        if: always()
+        run: |
+          touch "$OUT/accepted-ids.txt"
+          docker run --rm -v "$PWD/$OUT:/out" "$TRIVY" convert --format table --severity CRITICAL,HIGH,UNKNOWN \
+            --ignorefile /out/accepted-ids.txt --output /out/trivy-fs.txt /out/trivy-fs.json -q || true
+          python3 .github/scripts/findings.py native "$NATIVE"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/sca-trivy/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/sca-trivy/findings.sarif
+          category: sca-trivy
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-sca-trivy
+          path: reports/sca-trivy/
+          if-no-files-found: ignore
+
+  iac-checkov:
+    name: Build · IaC · checkov (Dockerfile + k8s render)
+    needs: [gate-g1]
+    # The phase boundary: on a PR nothing is built until the merge gate
+    # passed — a failed G1 skips this job and the whole Build phase. On a
+    # push to main there is no G1 (skipped: the merge already happened
+    # under branch protection) and Build proceeds.
+    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: iac-checkov
+      OUT: reports/iac-checkov
+      VERDICT_FILE: reports/iac-checkov/verdict.json
+      NATIVE: reports/iac-checkov/results_github_failed_only.md
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -567,47 +619,43 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
-      - id: run
-        run: |
-          mkdir -p reports/unit-tests reports/coverage
-          rc=0
-          uv sync --frozen || rc=$?
-          uv run --frozen pytest --junitxml=reports/unit-tests/junit.xml \
-            --cov --cov-report=xml:reports/coverage/coverage.xml --cov-report=term || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-      - id: tests
+      - run: |
+          set -uo pipefail
+          mkdir -p "$OUT/input"
+          cp Dockerfile "$OUT/input/Dockerfile"
+          # checkov skips CRDs, so the Rollout is scanned as the Deployment
+          # it is equivalent to (scan_view.py) — never applied.
+          # Prod's render: every overlay is deploy/base plus names and a digest.
+          kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/prod.yaml" || exit 0
+          docker run --rm -v "$PWD/$OUT:/work" "$CHECKOV" -f /work/input/prod.yaml -f /work/input/Dockerfile \
+            --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
+          mv "$OUT/results_json.json" "$OUT/checkov.json" || true
+          cat "$OUT/results_cli.txt" 2>/dev/null || true
+      - id: verdict
         if: always()
         env:
-          CONTROL: unit-tests
-          VERDICT_FILE: reports/unit-tests/verdict.json
-          RC: ${{ steps.run.outputs.rc }}
-          LABEL: tests/unit
-          TOOL: pytest + pytest-django
-        run: python3 .github/scripts/verdict.py tests reports/unit-tests/junit.xml
-      - id: coverage
+          TOOL: checkov 3.3.20
+        run: python3 .github/scripts/verdict.py checkov "$OUT/checkov.json"
+      # The tool's own report under the verdict (findings.py native).
+      - name: tool report
         if: always()
-        env:
-          CONTROL: coverage
-          VERDICT_FILE: reports/coverage/verdict.json
-          OUTPUT: coverage
-          TOOL: pytest-cov
-        run: python3 .github/scripts/verdict.py coverage reports/coverage/coverage.xml
+        run: python3 .github/scripts/findings.py native "$NATIVE"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/iac-checkov/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/iac-checkov/findings.sarif
+          category: iac-checkov
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: report-unit-tests
-          path: reports/unit-tests/
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-coverage
-          path: reports/coverage/
+          name: report-iac-checkov
+          path: reports/iac-checkov/
           if-no-files-found: ignore
 
-  # ── 3 Package: the built image artifact (whatever the build verdict) ───
   image-scan:
-    name: 3 Package · image scan · trivy
+    name: Build · image scan · trivy
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
@@ -669,7 +717,7 @@ jobs:
           if-no-files-found: ignore
 
   sbom:
-    name: 3 Package · SBOM (syft)
+    name: Build · SBOM (syft)
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
@@ -712,7 +760,7 @@ jobs:
           if-no-files-found: ignore
 
   image-compliance:
-    name: 3 Package · CIS benchmark (dockle)
+    name: Build · CIS benchmark (dockle)
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
@@ -766,7 +814,7 @@ jobs:
           if-no-files-found: ignore
 
   django-deploy-check:
-    name: 3 Package · django check --deploy
+    name: Build · django check --deploy
     needs: build
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
@@ -820,9 +868,8 @@ jobs:
           path: reports/django-deploy-check/
           if-no-files-found: ignore
 
-  # ── 3 Package: publish ─────────────────────────────────────────────────
   publish:
-    name: 3 Package · push + sign + attest (GHCR)
+    name: Build · push + sign + attest (GHCR)
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
             sca-trivy, iac-checkov, image-scan, sbom, image-compliance, django-deploy-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
@@ -852,7 +899,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github
       - id: ready
-        name: Every Code, Build and Package control passed?
+        name: Every Develop and Build control passed?
         # A signature is the statement "this passed every static control".
         env:
           NEEDS: ${{ toJSON(needs) }}
@@ -934,7 +981,7 @@ jobs:
             python3 .github/scripts/verdict.py signed   # fail: lists the controls that didn't pass
           elif [ "$GO" != true ]; then
             python3 .github/scripts/verdict.py result skipped \
-              "not published: images are pushed and signed only from main — a push or a manual run (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every Code, Build and Package control passed"
+              "not published: images are pushed and signed only from main — a push or a manual run (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every Develop and Build control passed"
           elif [ "$VERIFY_OUTCOME" = success ]; then
             python3 .github/scripts/verdict.py signed
           else
@@ -947,32 +994,17 @@ jobs:
           path: reports/publish/
           if-no-files-found: ignore
 
-  gate-g1:
-    name: G1 merge gate (PR)
-    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-review]
-    if: always() && startsWith(github.event_name, 'pull_request')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - uses: ./.github/actions/gate
-        with:
-          gate: G1
-          needs: ${{ toJSON(needs) }}
-          subject: pr-${{ github.event.pull_request.number }}
-          commit-sha: ${{ github.event.pull_request.head.sha }}
+  # ── G2 Control Gate, the phase boundary Build → Release: nothing is
+  #    released unless it passed for this digest, which devsecops-release
+  #    checks in the signed evidence. The same job records the Test-phase
+  #    coverage threshold as G3 (profile "ci"), decided here in CI where
+  #    coverage is measured. A criterion whose control never ran (e.g.
+  #    Build skipped because G1 failed) fails closed — never an implicit
+  #    pass.
 
-  # The Control Gate between CI and the release pipeline (gate.py GATES
-  # "G2"): nothing is deployed unless it passed for this digest, which
-  # devsecops-release.yml checks in the signed evidence.
   gate-g2:
-    name: G2/G3(ci) Control Gate (CI → release)
-    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+    name: G2 Control Gate (Build → Release)
+    needs: [gate-g1, build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
             image-scan, sbom, image-compliance, django-deploy-check, publish]
     if: always()
     runs-on: ubuntu-latest
@@ -1013,11 +1045,14 @@ jobs:
           artifact-digest: ${{ needs.build.outputs.digest }}
           record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
-  # ── 4 Release: evidence ────────────────────────────────────────────────
+  # ── Release: the evidence bundle, then the handover to the release
+  #    pipeline (the doc's Test phase runs there, per environment, against
+  #    what was actually deployed — never against an undeployed build).
+
   evidence:
-    name: 4 Release · evidence bundle
+    name: Release · evidence bundle
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
-            reviewers, commits-signed, image-scan, sbom, image-compliance, django-deploy-check, publish,
+            reviewers, commits-signed, ai-review, image-scan, sbom, image-compliance, django-deploy-check, publish,
             gate-g1, gate-g2]
     if: always()
     runs-on: ubuntu-latest
@@ -1034,7 +1069,7 @@ jobs:
       # Controls that apply to this event; the rest aren't listed as missing.
       CONTROLS: >-
         build,unit-tests,coverage,code-quality,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
-        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
+        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,ai-review,' || '' }}image-scan,sbom,
         image-compliance,django-deploy-check,publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1085,12 +1120,8 @@ jobs:
             --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
           echo "Evidence manifest attested to ${REF} (${PREDICATE_TYPE})" >> "$GITHUB_STEP_SUMMARY"
 
-  # ── 4 Release: hand over to the release pipeline ───────────────────────
-  # A published, Control-Gate-passed, evidence-attested digest starts the
-  # release pipeline for this commit: deploy to dev and test it there, then
-  # staging and prod, each behind its approval gate.
   release:
-    name: 4 Release · start the release pipeline
+    name: Release · start the release pipeline
     needs: [publish, gate-g2, evidence]
     if: >-
       ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.publish.outputs.published == 'true'
@@ -1109,11 +1140,8 @@ jobs:
             -f start=dev -f kind=planned -f commit="$GITHUB_SHA"
           echo "Started devsecops-release for ${GITHUB_SHA:0:7} (dev → staging → prod): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Feedback: PR comment ───────────────────────────────────────────────
-  # One comment per PR, edited in place: every control, what's new compared
-  # with main, links to the job summaries. Its own job so only it can write
-  # to the PR. Same-repo PRs only: a fork's token is read-only, and running
-  # fork code with a write token is what pull_request_target gets wrong.
+  # ── Feedback: back to the developers.
+
   pr-comment:
     name: Feedback · PR findings comment
     needs: evidence

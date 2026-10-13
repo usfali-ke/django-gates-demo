@@ -55,23 +55,30 @@ dynamic test runs in the release pipeline, against the environment the
 new digest was just deployed to.
 
 ```
-1 Code ───────── SAST (semgrep) · gitleaks · trufflehog · trivy SCA (uv.lock)
-                 · checkov · code quality (ruff) · reviewers · signed commits
-2 Build ──────── checkout · build twice (reproducible?) · unit tests + coverage
-   └─ G1 merge gate (PRs) ── reviewed · signed · unit tests · SAST · secrets
-3 Package ────── trivy image scan · syft SBOM · dockle · manage.py check --deploy
-                 → (main only) push by digest · cosign sign · SBOM + SLSA attestations
-   └─ G2 Control Gate ── build successful · all tests passed · code quality
-                         threshold met · no blocking findings · signed
-4 Release ────── bundle + sha256 manifest → artifact `evidence` (90 days;
+Develop ──────── SAST (semgrep) · gitleaks · trufflehog · quality (ruff)
+                 · unit tests + coverage · PR: reviewers · signed commits
+                 · AI security review
+   └─ G1 merge gate (PRs, Develop → Build) ── reviewed · signed · unit
+      tests · SAST · secrets · AI review. A failed G1 skips every Build
+      job — the pipeline does not proceed to the next phase
+Build ────────── build twice (reproducible?) · SCA · checkov · the built
+                 image: trivy scan · syft SBOM · dockle · check --deploy
+                 → (main only) push by digest · cosign sign · SBOM + SLSA
+                 attestations
+   └─ G2 Control Gate (Build → Release) ── build reproducible · every scan
+      clean · code quality threshold met · signed + SBOM; the same gate
+      job records the Test-phase coverage threshold as G3 (ci)
+Release ──────── bundle + sha256 manifest → artifact `evidence` (90 days;
                  on main, cosign-attested to the image digest) → (main, G2
                  passed) starts devsecops-release for this commit
 ```
 
-Each control is its own job, and every one of them runs even when another
-fails. Each job ends in `.github/scripts/verdict.py`, which applies that
-control's threshold and writes `verdict.json` next to the raw report in
-the `report-<control>` artifact. A red job means a failed control.
+Phases run in order: a phase's jobs start only when the previous phase's
+gate passed, and controls within a phase run in parallel. Each control is
+its own job, and every one of them runs even when another *in the same
+phase* fails. Each job ends in `.github/scripts/verdict.py`, which applies
+that control's threshold and writes `verdict.json` next to the raw report
+in the `report-<control>` artifact. A red job means a failed control.
 `.github/scripts/gate.py` maps controls to gate criteria.
 
 A control can only report `skipped` when it could not be evaluated in
@@ -176,36 +183,40 @@ digest is deployed there:
 
 ```
 devsecops-pipeline (CI)
-1 Code ─────────── SAST · secrets ×2 · SCA · IaC · code quality · reviewers · signed commits
-2 Build ────────── reproducible image build · unit tests + coverage
-   G1 merge gate (pull requests)
-3 Package ──────── image scan · SBOM · CIS (dockle) · check --deploy → push + sign + attest
-   G2 Control Gate (CI → release)
-4 Release ──────── evidence bundle (attested) → starts devsecops-release ↓
+Develop ────────── SAST · secrets ×2 · quality · unit tests + coverage
+                   · reviewers · signed commits · AI review
+   G1 merge gate (pull requests, Develop → Build)
+Build ──────────── reproducible image build · SCA · IaC · image scan · SBOM
+                   · CIS (dockle) · check --deploy → push + sign + attest
+   G2 Control Gate (Build → Release)
+Release ────────── evidence bundle (attested) → starts devsecops-release ↓
 
-devsecops-release, one stage per environment, each a job per control
-5 Deploy to Dev ── Verify → Plan → G5 → Deploy → G6 (rollout)
-                   → Test: smoke · integration · regression · security tests
-                     · DAST (nuclei) · dependency re-check
+devsecops-release, one stage per environment, each a job per control.
+Every stage walks the SDLC phases in order — a stage starts only when
+the previous one deployed and passed its tests:
+Dev ────────────── Release (notes, rollback plan) → Deliver (verify, G5)
+                   → Deploy (G6) → Test: smoke · integration · regression
+                   · security tests · DAST (nuclei) · dependency re-check
                    → G3 test gate
    Approval Gate ─ staging-approval: dev's test results + security scans,
                    release notes (in the run summary)
-6 Deploy to Staging  Verify → Plan → G5 → Deploy → G6 (rollout)
-                   → Test: smoke · end-to-end · regression · performance (k6)
-                     · security tests · DAST (nuclei) · TLS (testssl.sh)
-                   → G3 test gate → Accept: UAT (change request told)
+Staging ────────── Release (notes, rollback plan) → Deliver (verify, G5)
+                   → Deploy (G6) → Test: smoke · end-to-end · regression
+                   · performance (k6) · security tests · DAST (nuclei)
+                   · TLS (testssl.sh) → G3 test gate → Monitor/UAT
    G4 ──────────── release-approval: UAT sign-off (uat-approved), test
                    results, Go/No-Go (readiness-approved), change window
-7 Deploy to Prod ─ Verify → Plan → G5 → Deploy (canary) → G6 (rollout)
-                   → Test: read-only smoke · Monitor: health watch (5 min of
-                     /healthz probes, latency SLO, no restarts)
-                   → G6 post-deploy gate; a failure starts the rollback
-8 Operate ──────── automatic prod rollback · monitoring, logging & feedback:
-                   run summary per stage, a comment on the change request
-                   and the pull requests, the rollback command if a deployed
-                   stage failed; gate results, deployment events and release
-                   evidence to the security dashboard; Argo CD notifications
-                   for every sync and canary.
+Production ─────── Release (change mgmt: G4 CAB) → Deliver (verify, G5)
+                   → Deploy (canary, G6) → Test: read-only smoke
+                   → Monitor: health watch (5 min of /healthz probes,
+                     latency SLO, no restarts) → G6 post-deploy gate; a
+                     failure starts the rollback
+Operate ────────── automatic prod rollback · Feedback: run summary per
+                   stage, a comment on the change request and the pull
+                   requests, the rollback command if a deployed stage
+                   failed; gate results, deployment events and release
+                   evidence to the security dashboard; Argo CD
+                   notifications for every sync and canary.
 ```
 
 A stage starts only when the previous one deployed **and passed its
@@ -213,7 +224,7 @@ tests**; a failed stage stops the run there. Staging and prod also refuse
 to run if the previous environment has moved on to a newer release while
 this one waited for approval.
 
-- **Verify**, every stage: signature + SBOM + SLSA provenance for the
+- **Deliver**, every stage: signature + SBOM + SLSA provenance for the
   commit that built the digest; the evidence attestation (the pipeline's
   Control Gate passed); the target overlay is schema-valid and
   checkov-clean, and only its digest changes. Also:
@@ -232,10 +243,10 @@ this one waited for approval.
   `uat-approved`, and the dashboard's own decision on it.
 - **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
   trailers (`Environment`, `Image-Digest`, `Source-Commit`,
-  `Rollback-Digest`, `Rollback-Source`) are what the next stage's Verify
+  `Rollback-Digest`, `Rollback-Source`) are what the next stage's Deliver
   reads, together with the `security-dashboard/G6/<env>` status on that
   commit.
-- **Evidence:** every stage leaves a `release-evidence-<env>` bundle,
+- **Release record:** every stage leaves a `release-evidence-<env>` bundle,
   attested to the digest once it was deployed.
 
 How to release:

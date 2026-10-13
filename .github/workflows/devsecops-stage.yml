@@ -12,9 +12,10 @@
 #   rollback (kind) the digest the environment ran before its last deploy:
 #            that deploy commit's Rollback-Digest trailer
 #
-# In SDLC order, a control gate between the phases:
+# In SDLC order, the control gates between the phases (per environment;
+# jobs within a phase run in parallel):
 #
-#   Verify    resolve which digest this environment may get (above) →
+#   Deliver   resolve which digest this environment may get (above) →
 #             `promotion`; chained from the previous stage, it must still be
 #             the digest that stage deployed (input `expect-digest`) ·
 #             signature + SBOM + SLSA provenance (for the commit that built
@@ -22,14 +23,14 @@
 #             config (deploy/<env>): schema-valid, checkov-clean, only the
 #             digest changes · staging/prod: G3 passed in the previous
 #             environment (its signed release record)
-#   Plan      release notes (every change since what the environment runs
-#             now) · rollback plan (what runs now: still signed and pullable)
-#   Approve   staging: Approval Gate `staging-approval` (test results,
-#             security scans, release notes in the run summary)
-#   G4        prod only: `release-approval` (UAT sign-off, test results,
+#   Release   release notes (every change since what the environment runs
+#             now) · rollback plan (what runs now: still signed and
+#             pullable) · staging: Approval Gate `staging-approval` (test
+#             results, security scans, release notes in the run summary) ·
+#             prod: G4 `release-approval` (UAT sign-off, test results,
 #             Go/No-Go, change window), then the security dashboard's own
-#             decision on the change request (whoever started or re-ran the
-#             run, or authored the change, can't approve)
+#             decision on the change request (whoever started or re-ran
+#             the run, or authored the change, can't approve)
 #   G5        deployment gate, BEFORE anything is committed
 #   Deploy    the digest committed to deploy/<env> (GitOps; Argo CD syncs) ·
 #             wait for the dashboard's `security-dashboard/G6/<env>` status on
@@ -42,12 +43,12 @@
 #             staging  functional (smoke, end-to-end) · regression ·
 #                      performance (k6) · security (authenticated, DAST
 #                      nuclei, TLS testssl.sh)
-#             prod     read-only smoke · Monitor: health watch (probes,
-#                      latency SLO, restarts)
+#             prod     read-only smoke
 #   G3 / G6   test gate (dev, staging) / post-deploy gate (prod; the release
 #             pipeline rolls back on failure)
-#   Accept    staging: UAT can start (sign-off feeds prod's G4)
-#   Evidence  every report + hash manifest → artifact `release-evidence-<env>`
+#   Monitor   health watch (probes, latency SLO, restarts) — prod; staging:
+#             UAT can start (sign-off feeds prod's G4)
+#   Record    every report + hash manifest → artifact `release-evidence-<env>`
 #             (90 days); after a deploy, attested to the image digest — the
 #             record the next environment reads
 #
@@ -132,8 +133,10 @@ env:
   HEALTH_WATCH_SECONDS: "300"
 
 jobs:
+  # ── Deliver: what may reach this environment (the doc's Deliver phase;
+  #    G5 is its gate, below). Jobs within the phase run in parallel. ──────
   resolve:
-    name: Verify · resolve the digest (promotion)
+    name: Deliver · resolve the digest (promotion)
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -243,7 +246,7 @@ jobs:
           if-no-files-found: ignore
 
   provenance:
-    name: Verify · signature, SBOM, SLSA provenance
+    name: Deliver · signature, SBOM, SLSA provenance
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -312,7 +315,7 @@ jobs:
           if-no-files-found: ignore
 
   evidence-check:
-    name: Verify · pipeline evidence (G2 Control Gate passed)
+    name: Deliver · pipeline evidence (G2 Control Gate passed)
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -381,7 +384,7 @@ jobs:
           if-no-files-found: ignore
 
   config:
-    name: Verify · target config (deploy/${{ inputs.environment }})
+    name: Deliver · target config (deploy/${{ inputs.environment }})
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -450,7 +453,7 @@ jobs:
           if-no-files-found: ignore
 
   previous-env-tests:
-    name: Verify · tests passed in the previous environment
+    name: Deliver · tests passed in the previous environment
     # staging needs dev's G3 for this digest, prod needs staging's. The
     # previous environment's stage attested its release record (with the
     # G3 it ran against the deployed digest) to the digest, signed by this
@@ -527,7 +530,7 @@ jobs:
           if-no-files-found: ignore
 
   release-notes:
-    name: Plan · release notes
+    name: Release · release notes
     # What the approver approves: every change between the source running
     # in this environment now and the one being released, in the run
     # summary (read before approving) and as evidence.
@@ -615,7 +618,7 @@ jobs:
           if-no-files-found: ignore
 
   rollback-plan:
-    name: Plan · rollback plan
+    name: Release · rollback plan
     # What a failed deploy goes back to: the digest the environment runs
     # now (for a redeploy of that digest, the target its deploy recorded).
     # The deploy commit records it (Rollback-Digest/-Source) and kind
@@ -692,8 +695,9 @@ jobs:
           path: reports/rollback-plan/
           if-no-files-found: ignore
 
+  # ── Release: the candidate, its records and approvals (G4 on prod). ────
   approve-staging:
-    name: Approve · staging (Approval Gate)
+    name: Release · approval gate · staging
     # Asked only once everything above passed: the approver reads dev's
     # test results and security scans (previous-env-tests) and the release
     # notes in this run's summary.
@@ -869,6 +873,7 @@ jobs:
           allow-skipped: >-
             ${{ inputs.environment != 'prod' && 'rollback_plan_ready' || '' }},${{ inputs.kind == 'rollback' && 'previous_environment_tests_passed' || '' }}
 
+  # ── Deploy: the GitOps commit; G6 admission happens on the cluster. ─────
   deploy:
     name: Deploy · GitOps commit to deploy/${{ inputs.environment }}
     # The only write path to the cluster: a commit on main that Argo CD
@@ -1536,6 +1541,7 @@ jobs:
           path: reports/dependency-check/
           if-no-files-found: ignore
 
+  # ── Monitor: golden signals on the new pods. ───────────────────────────
   health-watch:
     name: Monitor · health watch (probes, latency SLO, restarts)
     # Monitoring after the rollout: the new pods keep answering /healthz
@@ -1635,7 +1641,7 @@ jobs:
           environment: ${{ inputs.environment }}
 
   uat:
-    name: Accept · UAT ready for sign-off
+    name: Test · UAT ready for sign-off
     # Staging's automated tests passed on the deployed digest: tell the
     # change request that UAT can start. The tester signs off with the
     # `uat-approved` label; prod's Approval Gate requires it.
@@ -1676,7 +1682,7 @@ jobs:
           fi
 
   release-evidence:
-    name: Evidence · release record (attested)
+    name: Release · record (attested)
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
             g4, gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
             performance, dast-nuclei, dast-tls, dependency-check, health-watch, test-gate]
