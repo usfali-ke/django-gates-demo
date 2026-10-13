@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+{# Django auto-escapes both the term and the note text. #}
+<h2>Results for {{ q }}</h2>
+<ul>
+{% for note in notes %}
+  <li>{{ note.text }}</li>
+{% empty %}
+  <li>No matching notes.</li>
+{% endfor %}
+</ul>
+{% endblock %}
