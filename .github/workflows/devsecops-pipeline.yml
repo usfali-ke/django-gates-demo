@@ -394,8 +394,12 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           WAIT_SECONDS: "1500"
         run: python3 .github/scripts/hermes_review.py
+      # Supplementary evidence only — the verdict reaches gate-g1 through the
+      # job output. lab-runner's egress to GitHub's artifact storage is
+      # flaky (ETIMEDOUT), and that must not turn a passing review red.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
+        continue-on-error: true
         with:
           name: report-ai-review
           path: reports/ai-review/
