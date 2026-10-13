@@ -173,8 +173,10 @@ def readyz(request):
             cursor.execute("SELECT 1")
             cursor.fetchone()
 
-    except Exception:
-        logger.exception("Database readiness check failed")
+    except Exception as exc:
+        # Type only: driver messages can carry host/user/database names,
+        # and this runs on every failed readiness probe.
+        logger.warning("Database readiness check failed: %s", type(exc).__name__)
 
         return JsonResponse(
             {"status": "unavailable"},
