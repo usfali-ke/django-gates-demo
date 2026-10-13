@@ -8,6 +8,7 @@ from notes import views
 urlpatterns = [
     path("", RedirectView.as_view(pattern_name="notes:list", permanent=False)),
     path("healthz", views.healthz, name="healthz"),
+    path("readyz", views.readyz, name="readyz"),
     path("accounts/login/", auth_views.LoginView.as_view(redirect_authenticated_user=True), name="login"),
     path("accounts/logout/", auth_views.LogoutView.as_view(), name="logout"),
     path("", include("notes.urls")),

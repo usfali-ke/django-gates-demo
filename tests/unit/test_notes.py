@@ -81,7 +81,7 @@ def test_cannot_touch_another_users_note(alice_client, bob):
     assert alice_client.post(reverse("notes:delete", args=[theirs.pk])).status_code == 404
     assert alice_client.get(f"/api/notes/{theirs.pk}/").status_code == 404
     assert alice_client.delete(f"/api/notes/{theirs.pk}/").status_code == 404
-    assert alice_client.get("/api/notes/").json() == {"notes": []}
+    assert alice_client.get("/api/notes/").json()["notes"] == []
     assert Note.objects.filter(pk=theirs.pk).exists()
 
 
@@ -92,7 +92,7 @@ def test_api_round_trip(alice_client):
     assert alice_client.get("/api/notes/").json()["notes"] == [note]
     assert alice_client.get(f"/api/notes/{note['id']}/").json() == note
     assert alice_client.delete(f"/api/notes/{note['id']}/").status_code == 204
-    assert alice_client.get("/api/notes/").json() == {"notes": []}
+    assert alice_client.get("/api/notes/").json() == {"notes": [], "pagination": {"page": 1, "page_size": 25, "total": 0, "has_next": False}}
 
 
 @pytest.mark.parametrize("body", ["not json", "[]", '{"text": ""}', '{"text": 5}', json.dumps({"text": "x" * (MAX_TEXT + 1)})])
