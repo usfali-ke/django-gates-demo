@@ -12,45 +12,75 @@
 #   rollback (kind) the digest the environment ran before its last deploy:
 #            that deploy commit's Rollback-Digest trailer
 #
-# In SDLC order, the control gates between the phases (per environment;
-# jobs within a phase run in parallel):
+# The SDLC phases in the order this stage runs them, the control gate at
+# each boundary (docs/DevSecOps_process.docx). A failed gate breaks the
+# pipeline: the stage fails and no later phase — and no later environment
+# — runs. Jobs within a phase run in parallel:
 #
-#   Deliver   resolve which digest this environment may get (above) →
-#             `promotion`; chained from the previous stage, it must still be
-#             the digest that stage deployed (input `expect-digest`) ·
-#             signature + SBOM + SLSA provenance (for the commit that built
-#             it) · pipeline evidence (G2 passed for this digest) · target
-#             config (deploy/<env>): schema-valid, checkov-clean, only the
-#             digest changes · staging/prod: G3 passed in the previous
-#             environment (its signed release record)
-#   Release   release notes (every change since what the environment runs
-#             now) · rollback plan (what runs now: still signed and
-#             pullable) · staging: Approval Gate `staging-approval` (test
-#             results, security scans, release notes in the run summary) ·
-#             prod: G4 `release-approval` (UAT sign-off, test results,
-#             Go/No-Go, change window), then the security dashboard's own
-#             decision on the change request (whoever started or re-ran
-#             the run, or authored the change, can't approve)
-#   G5        deployment gate, BEFORE anything is committed
-#   Deploy    the digest committed to deploy/<env> (GitOps; Argo CD syncs) ·
-#             wait for the dashboard's `security-dashboard/G6/<env>` status on
-#             the deploy commit (Argo CD sync + canary analysis + Kyverno)
-#   Test      one job per control against the deployed environment (see
-#             "Test" below):
-#             dev      functional (smoke, integration) · regression ·
-#                      security (authenticated, DAST nuclei, dependency
-#                      re-check of the deployed digest)
-#             staging  functional (smoke, end-to-end) · regression ·
-#                      performance (k6) · security (authenticated, DAST
-#                      nuclei, TLS testssl.sh)
-#             prod     read-only smoke
-#   G3 / G6   test gate (dev, staging) / post-deploy gate (prod; the release
-#             pipeline rolls back on failure)
-#   Monitor   health watch (probes, latency SLO, restarts) — prod; staging:
-#             UAT can start (sign-off feeds prod's G4)
-#   Record    every report + hash manifest → artifact `release-evidence-<env>`
-#             (90 days); after a deploy, attested to the image digest — the
-#             record the next environment reads
+#   Deliver    which digest this environment may get, and may it be
+#              delivered at all: resolve → `promotion` (the digest the
+#              previous stage deployed, still the one this run expects;
+#              the criterion is G5's approved_gitops_pipeline_path — a
+#              release reaches an environment only through this pipeline)
+#              · provenance + evidence (G5 artifact_provenance_verified:
+#              signature, SBOM, SLSA for the commit that built the
+#              digest; the pipeline's G2 passed for it) · config (G5
+#              target_env_config_controlled: deploy/<env> schema-valid,
+#              checkov-clean, only the digest changes) · staging/prod:
+#              previous-env-tests (the previous environment's G3, from
+#              its signed release record)
+#   Release    the candidate's records: release notes (every change since
+#              what the environment runs now) · rollback plan (what runs
+#              now: still signed and pullable — G5 rollback_plan_ready).
+#              Both run in parallel with the Deliver checks; the approver
+#              reads them with the checks' evidence. Then the phase's
+#              approval: staging → Approval Gate `staging-approval`
+#              (segregation of duties; G5@staging
+#              promotion_approved_by_other), prod → G4 `release-approval`
+#              (UAT sign-off, Go/No-Go, change window, the change request
+#              labels, then the security dashboard's own decision on it —
+#              the doc's Release gate, G4, fires here, before G5)
+#   G5         deployment gate — every Deliver criterion plus the
+#              approval, BEFORE anything is committed. A failed G5 skips
+#              Deploy and the whole stage fails
+#   Deploy     the digest committed to deploy/<env> (GitOps; Argo CD
+#              syncs). Admission is the G6 half that happens on the
+#              cluster: Kyverno verifies the cosign signature and the
+#              approved registry at pod admission, Argo runs the canary
+#              analysis, and the dashboard mirrors the result as commit
+#              status `security-dashboard/G6/<env>` — post-deploy waits
+#              for it (the admission half of G6), so a rejected admission
+#              fails the stage here
+#   Test       one job per control against the deployed environment (see
+#              "Test" below):
+#              dev      functional (smoke, integration) · regression ·
+#                       security (authenticated, DAST nuclei, dependency
+#                       re-check of the deployed digest)
+#              staging  functional (smoke, end-to-end) · regression ·
+#                       performance (k6) · security (authenticated, DAST
+#                       nuclei, TLS testssl.sh)
+#              prod     read-only smoke (no test users, no writes)
+#   Monitor    the health watch on the new pods (probes, latency SLO,
+#              restarts) — prod only, in parallel with the Test jobs; it
+#              is the G6 criterion post_deploy_health_watch_green, so the
+#              gate below counts it. The doc's Monitor phase proper
+#              (G7/CONMON: SIEM, runtime threat detection, SLO telemetry)
+#              is not a pipeline job — the cluster's reporter and Wazuh
+#              push it to the dashboard continuously
+#   G3 / G6    the test gate — the phase boundary to the next
+#              environment. G3 (dev, staging): every test job above
+#              answers a criterion; one that should have run but was
+#              skipped or failed fails the gate, so the stage fails and
+#              the next environment never starts. G6@prod: smoke + health
+#              watch; a failure starts the automatic rollback
+#   UAT        staging only, after G3 passed: the change request is told
+#              UAT can start; the tester's `uat-approved` label is what
+#              prod's G4 requires (Test feeding Release)
+#   Record     every report + hash manifest → artifact `release-evidence-<env>`
+#              (90 days); after a deploy, attested to the image digest.
+#              Runs even when the stage failed — the honest record of
+#              what happened is itself evidence. The next environment's
+#              Deliver checks read it
 #
 # One release run deploys to several environments, so every artifact is
 # named per environment (`report-<env>-<control>`, `gate-result-<G>-<env>`,
@@ -133,8 +163,10 @@ env:
   HEALTH_WATCH_SECONDS: "300"
 
 jobs:
-  # ── Deliver: what may reach this environment (the doc's Deliver phase;
-  #    G5 is its gate, below). Jobs within the phase run in parallel. ──────
+  # ── Deliver: which digest this environment may get, and may it be
+  #    delivered at all — the doc's Deliver phase; its gate is G5, below.
+  #    resolve is the entry job; provenance/evidence/config fan out from
+  #    it, and the Release records run in the same wave, in parallel. ─────
   resolve:
     name: Deliver · resolve the digest (promotion)
     if: github.ref == 'refs/heads/main'
@@ -529,6 +561,11 @@ jobs:
           path: reports/previous-env-tests/
           if-no-files-found: ignore
 
+  # ── Release: the candidate's records and the phase's approvals —
+  #    staging's Approval Gate, and on prod the doc's Release gate (G4:
+  #    `release-approval`, then the dashboard's decision on the change
+  #    request). Records run in the Deliver wave; approvals wait for all
+  #    of them. ─────────────────────────────────────────────────────────────
   release-notes:
     name: Release · release notes
     # What the approver approves: every change between the source running
@@ -695,7 +732,6 @@ jobs:
           path: reports/rollback-plan/
           if-no-files-found: ignore
 
-  # ── Release: the candidate, its records and approvals (G4 on prod). ────
   approve-staging:
     name: Release · approval gate · staging
     # Asked only once everything above passed: the approver reads dev's
@@ -763,6 +799,10 @@ jobs:
       pull-requests: read
     outputs:
       change-id: ${{ steps.change.outputs.id }}
+      # The gate.py G5@prod criterion promotion_approved_by_other reads
+      # this: the approval G5 consumed (UAT, Go/No-Go, change window,
+      # segregation, the dashboard's decision) belongs in the G5 record.
+      result: ${{ steps.verdict.outputs.result }}
     env:
       DIGEST: ${{ needs.resolve.outputs.digest }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
@@ -778,7 +818,8 @@ jobs:
           CHANGE: ${{ inputs.change }}
           REQUIRE: "true"
         run: bash .github/scripts/change.sh
-      - name: UAT sign-off, Go/No-Go
+      - id: uat
+        name: UAT sign-off, Go/No-Go
         env:
           ID: ${{ steps.change.outputs.id }}
           STATE: ${{ steps.change.outputs.state }}
@@ -818,7 +859,8 @@ jobs:
           path: ${{ runner.temp }}/release-request/release-request.json
           if-no-files-found: error
           retention-days: 90
-      - name: Wait for the dashboard's G4 decision
+      - id: wait
+        name: Wait for the dashboard's G4 decision
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -837,7 +879,32 @@ jobs:
           done
           echo "::error::dashboard collector did not answer within 20 minutes (no security-dashboard/G4 status for this run)"
           exit 1
+      # The G5@prod record names the approval it consumed: every step of
+      # this job (change request, UAT/Go/No-Go labels, segregation of
+      # duties, the dashboard's decision) is the promotion approval.
+      - id: verdict
+        if: always()
+        env:
+          CONTROL: g4
+          OUT: reports/g4
+          VERDICT_FILE: reports/g4/verdict.json
+          STATUS: ${{ steps.change.outcome == 'success' && steps.uat.outcome == 'success' && steps.sod.outcome == 'success' && steps.wait.outcome == 'success' && 'pass' || 'fail' }}
+          DETAIL: ${{ steps.change.outputs.id && format('change {0} · ', steps.change.outputs.id) || '' }}${{ steps.sod.outputs.detail || 'approval steps did not all run' }}
+          TOOL: GitHub environment review (release-approval) + dashboard G4
+        run: |
+          mkdir -p "$OUT"
+          python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-g4
+          path: reports/g4/
+          if-no-files-found: ignore
 
+  # ── G5 deployment gate: the Deliver/Release phase boundary. Nothing is
+  #    committed unless every Deliver criterion passed and the approval
+  #    (staging's, or prod's G4) succeeded — a failed G5 skips Deploy and
+  #    the stage fails. ────────────────────────────────────────────────────
   gate-g5:
     name: G5 deployment gate
     # Before the deploy commit: nothing reaches an environment unless G5
@@ -1049,7 +1116,9 @@ jobs:
           path: reports/post-deploy/
           if-no-files-found: ignore
 
-  # ── Test: one job per control against the deployed environment ──────────
+  # ── Test: one job per control against the deployed environment; the
+  #    G3/G6 gate after them (plus prod's health watch) decides whether
+  #    the stage — and promotion to the next environment — may proceed. ──
   # Like the pipeline's control jobs, each test is its own job, report
   # (`report-<env>-<control>`) and verdict, and G3/G6 below has a criterion
   # for each:
@@ -1541,7 +1610,9 @@ jobs:
           path: reports/dependency-check/
           if-no-files-found: ignore
 
-  # ── Monitor: golden signals on the new pods. ───────────────────────────
+  # ── Monitor: golden signals on the new pods — the prod G6 criterion
+  #    (post_deploy_health_watch_green). G7/CONMON is continuous,
+  #    cluster-side (reporter + Wazuh → the dashboard), not a job here. ────
   health-watch:
     name: Monitor · health watch (probes, latency SLO, restarts)
     # Monitoring after the rollout: the new pods keep answering /healthz
@@ -1612,8 +1683,13 @@ jobs:
           path: reports/health-watch/
           if-no-files-found: ignore
 
+  # ── G3/G6 test gate: the phase boundary to the next environment.
+  #    Every Test job (and prod's health watch) answers a criterion
+  #    (gate.py G3@<env> / G6@prod); one that should have run but was
+  #    skipped or failed fails the gate — the stage fails, staging/prod
+  #    promotion never starts, and on prod the rollback begins. ─────────────
   test-gate:
-    name: ${{ inputs.environment == 'prod' && 'G6 post-deploy gate (smoke + health watch)' || format('G3 test gate ({0})', inputs.environment) }}
+    name: Test gate · ${{ inputs.environment }} (G3 or G6 post-deploy)
     # Every test job above answers a criterion (gate.py G3@<env>, G6@prod);
     # one that should have run but was skipped or failed fails the gate,
     # and with it every later stage (prod: the automatic rollback).
@@ -1640,6 +1716,8 @@ jobs:
           artifact-digest: ${{ needs.resolve.outputs.digest }}
           environment: ${{ inputs.environment }}
 
+  # ── UAT: staging, after G3 passed — the human acceptance that feeds
+  #    prod's G4 (the `uat-approved` label). ────────────────────────────────
   uat:
     name: Test · UAT ready for sign-off
     # Staging's automated tests passed on the deployed digest: tell the
@@ -1681,6 +1759,8 @@ jobs:
             echo "No change request names ${SOURCE_SHA:0:7} in its Release field yet: open one (Change request form) before approving prod." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # ── Record: the signed release record — runs even when the stage
+  #    failed; the next environment's Deliver checks read it. ───────────────
   release-evidence:
     name: Release · record (attested)
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
@@ -1726,7 +1806,7 @@ jobs:
           case "$TARGET_ENV" in
             dev)     controls="promotion,provenance,evidence-check,config,rollback-plan,deploy,post-deploy,smoke,integration,regression,security-tests,dast-nuclei,dependency-check" ;;
             staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-staging,deploy,post-deploy,smoke,e2e,regression,security-tests,performance,dast-nuclei,dast-tls" ;;
-            prod)    controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,deploy,post-deploy,smoke,health-watch" ;;
+            prod)    controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,g4,approve-staging,deploy,post-deploy,smoke,health-watch" ;;
           esac
           CONTROLS=$controls python3 .github/scripts/evidence.py "$in" release-evidence
           cp "${in}/release-request/release-request.json" release-evidence/ 2>/dev/null || true

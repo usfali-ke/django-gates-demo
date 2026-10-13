@@ -192,25 +192,27 @@ Build ──────────── reproducible image build · SCA · Ia
 Release ────────── evidence bundle (attested) → starts devsecops-release ↓
 
 devsecops-release, one stage per environment, each a job per control.
-Every stage walks the SDLC phases in order — a stage starts only when
-the previous one deployed and passed its tests:
-Dev ────────────── Release (notes, rollback plan) → Deliver (verify, G5)
-                   → Deploy (G6) → Test: smoke · integration · regression
-                   · security tests · DAST (nuclei) · dependency re-check
-                   → G3 test gate
+Every stage walks the SDLC phases in order, each phase ending at its
+control gate — a failed gate breaks the run there; a stage also starts
+only when the previous one deployed and passed its tests:
+Dev ────────────── Deliver (resolve · provenance · evidence · config)
+                   ∥ Release (notes, rollback plan) → G5 → Deploy
+                   (GitOps; G6 admission on the cluster) → Test: smoke
+                   · integration · regression · security tests · DAST
+                   (nuclei) · dependency re-check → G3 test gate
    Approval Gate ─ staging-approval: dev's test results + security scans,
                    release notes (in the run summary)
-Staging ────────── Release (notes, rollback plan) → Deliver (verify, G5)
-                   → Deploy (G6) → Test: smoke · end-to-end · regression
-                   · performance (k6) · security tests · DAST (nuclei)
-                   · TLS (testssl.sh) → G3 test gate → Monitor/UAT
+Staging ────────── Deliver ∥ Release records → G5 → Deploy (G6) →
+                   Test: smoke · end-to-end · regression · performance
+                   (k6) · security tests · DAST (nuclei) · TLS (testssl.sh)
+                   → G3 test gate → UAT ready (feeds prod's G4)
    G4 ──────────── release-approval: UAT sign-off (uat-approved), test
                    results, Go/No-Go (readiness-approved), change window
-Production ─────── Release (change mgmt: G4 CAB) → Deliver (verify, G5)
-                   → Deploy (canary, G6) → Test: read-only smoke
-                   → Monitor: health watch (5 min of /healthz probes,
-                     latency SLO, no restarts) → G6 post-deploy gate; a
-                     failure starts the rollback
+Production ─────── Deliver ∥ Release records (G4 CAB first) → G5 →
+                   Deploy (canary; G6 admission) → Test: read-only smoke
+                   ∥ Monitor: health watch (5 min of /healthz probes,
+                   latency SLO, no restarts) → G6 post-deploy gate; a
+                   failure starts the rollback
 Operate ────────── automatic prod rollback · Feedback: run summary per
                    stage, a comment on the change request and the pull
                    requests, the rollback command if a deployed stage
@@ -218,6 +220,17 @@ Operate ────────── automatic prod rollback · Feedback: run 
                    evidence to the security dashboard; Argo CD
                    notifications for every sync and canary.
 ```
+
+Deliver checks (resolve, provenance, evidence, config, and on staging/
+prod the previous environment's G3) and the Release records (release
+notes, rollback plan) run in parallel — the approver reads both. G5 then
+decides with the approval: staging's Approval Gate, or prod's G4
+(`release-approval`, then the dashboard's own decision on the change
+request) — and only then is anything committed. Admission is the G6 half
+that happens on the cluster: Kyverno verifies the cosign signature and
+the approved registry at pod admission, Argo runs the canary analysis,
+and the stage waits for the dashboard's mirrored G6 status before any
+test runs.
 
 A stage starts only when the previous one deployed **and passed its
 tests**; a failed stage stops the run there. Staging and prod also refuse
