@@ -958,7 +958,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read # the push authenticates with the GitOps deploy key, not the run token
     outputs:
       result: ${{ steps.verdict.outputs.result }}
       gitops-sha: ${{ steps.commit.outputs.gitops_sha }}
@@ -975,9 +975,38 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true # zizmor: ignore[artipacked] this job pushes the deploy commit
+          persist-credentials: false # main's ruleset rejects the run token; the deploy key below pushes
           fetch-depth: 0
+      - id: key
+        name: GitOps deploy key — main is protected, the run token cannot push there
+        # main requires every change to arrive through a pull request, and
+        # GitHub does not let github-actions (the run token) bypass a
+        # repository ruleset. The deploy commit is therefore pushed over SSH
+        # with the pipeline's deploy key, which is the ruleset's bypass actor
+        # (Settings → Rules → Branch-protect-gith → Bypass list). Humans are
+        # unaffected: their pushes to main still need a reviewed PR.
+        env:
+          GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITOPS_DEPLOY_KEY:-}" ]; then
+            echo "::error::secret GITOPS_DEPLOY_KEY is not set, so the deploy commit cannot reach the protected main branch. Add the release pipeline's deploy key as that repository secret (README → 'The deploy key that lets the pipeline push to main')."
+            exit 1
+          fi
+          ssh_dir="$RUNNER_TEMP/gitops-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$GITOPS_DEPLOY_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          # GitHub's published host key, pinned: nothing is learned at run time.
+          mkdir -p ~/.ssh
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i $ssh_dir/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          git ls-remote --exit-code origin refs/heads/main > /dev/null \
+            || { echo "::error::the GitOps deploy key cannot reach ${GITHUB_REPOSITORY}: revoked, installed on another repository, or read-only"; exit 1; }
       - id: commit
+        # Pushes over the SSH remote the step above installed.
         # On main as it is now (another release may have pushed since
         # config verified it), but only if what config verified — the base
         # and this environment's overlay — hasn't changed since. A push
@@ -992,6 +1021,7 @@ jobs:
           trailers=(--trailer "Environment: ${TARGET_ENV}" --trailer "Image-Digest: ${DIGEST}" --trailer "Source-Commit: ${SOURCE_SHA}")
           [ -z "$ROLLBACK_DIGEST" ] || trailers+=(--trailer "Rollback-Digest: ${ROLLBACK_DIGEST}" --trailer "Rollback-Source: ${ROLLBACK_SOURCE}")
           kind=$([ "$KIND" = planned ] || echo " ${KIND}")
+          PUSH_LOG="$RUNNER_TEMP/push-error.log"
           for attempt in 1 2 3; do
             git fetch -q origin main
             if ! git diff --quiet "$VERIFIED_SHA" origin/main -- deploy/base "deploy/${TARGET_ENV}"; then
@@ -1003,8 +1033,21 @@ jobs:
             git commit -q -m "deploy(${TARGET_ENV}): django-gates-demo ${DIGEST:7:12}${CHANGE_ID:+ ${CHANGE_ID}}${kind} [skip ci]" \
               -m "Released ${IMAGE}@${DIGEST} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               "${trailers[@]}"
-            git push -q origin HEAD:main && break
-            [ "$attempt" -lt 3 ] || { echo "::error::push to main failed 3 times"; exit 1; }
+            if git push -q origin HEAD:main 2>"$PUSH_LOG"; then break; fi
+            if [ "$attempt" -ge 3 ]; then
+              reason=$(grep -m1 -E '^remote: error:' "$PUSH_LOG" | sed 's/^remote: error: //' || true)
+              echo "::error::push to main failed 3 times${reason:+: ${reason}}"
+              # GH013 = the ref is protected by a repository ruleset. Name the
+              # fix instead of leaving a bare failure in the log.
+              if grep -qE 'GH013|rule violation' "$PUSH_LOG"; then
+                echo "::error::refs/heads/main is protected by a repository ruleset, which rejects this GitOps deploy commit. Add a bypass for the bot that pushes it (Settings -> Rules -> the main ruleset -> Bypass list -> github-actions[bot], mode 'always'); human pushes still require a pull request."
+              fi
+              mkdir -p "$OUT"
+              { echo "push to main rejected by the server (last attempt):"
+                grep -E '^remote:|^ ! \[' "$PUSH_LOG" | head -4
+              } > "$OUT/push-error.txt"
+              exit 1
+            fi
             sleep $((attempt * 5))
           done
           echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -1018,7 +1061,10 @@ jobs:
           if [ -n "$SHA" ]; then
             python3 .github/scripts/verdict.py result pass "GitOps commit ${SHA:0:7} on main → Argo CD app django-gates-demo-${TARGET_ENV} (automated sync)"
           else
-            python3 .github/scripts/verdict.py result fail "GitOps commit/push to main failed"
+            # Carry the server's own words into the deploy record, so the
+            # dashboard and the evidence bundle say why, not just that.
+            reason=$(grep -m1 -E '^remote: error:' "$OUT/push-error.txt" 2>/dev/null | sed 's/^.*error: //' | tr -d '\r' || true)
+            python3 .github/scripts/verdict.py result fail "GitOps commit/push to main failed${reason:+ — ${reason}}"
           fi
       - name: Build deployment-event
         if: steps.commit.outputs.gitops_sha != ''

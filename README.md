@@ -299,6 +299,54 @@ A stage refuses to run when:
   there (a newer release overtook it);
 - `deploy/base` or the target overlay changed on main after it verified them.
 
+### The deploy key that lets the pipeline push to main
+
+`main` is protected by the ruleset **Branch-protect-gith**: deletion and
+force-pushes are blocked, and every change must arrive through a pull
+request with one approval. GitHub does **not** let the run token
+(`github-actions`, which the deploy job would otherwise push with) bypass a
+repository ruleset — only the actors in the ruleset's bypass list are
+exempt, and on a personal-account repository that can be a deploy key or an
+installed GitHub App, never the first-party Actions app.
+
+So the deploy commit is pushed over SSH with a dedicated **write deploy
+key** that is the ruleset's one bypass actor:
+
+| half | where it lives |
+|---|---|
+| public | Settings → Deploy keys → `gitops-deploy (release pipeline)`, write access |
+| private | repository secret `GITOPS_DEPLOY_KEY` (Settings → Secrets and variables → Actions) |
+
+The deploy job (`devsecops-stage.yml`, job `deploy`) checks out without
+persisting the run token, installs the key, pins GitHub's published
+`ssh-ed25519` host key, points `origin` at `git@github.com:…` and proves the
+key can reach the repository before it commits anything. If the secret is
+missing the job fails immediately with that reason rather than at the push.
+The commit is still authored by `github-actions[bot]`, so provenance,
+trailers and the dashboard's deploy events are unchanged — only the
+credential carrying it to `main` differs.
+
+Humans are unaffected: their pushes to `main` still need a reviewed pull
+request. The bypass covers the deploy key alone.
+
+To repeat this in another repository:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "gitops-deploy (<owner>/<repo>) (release pipeline)" -f /tmp/gitops-deploy
+
+gh api "repos/<owner>/<repo>/keys" \
+  -f title="gitops-deploy (release pipeline)" \
+  -f key="$(cat /tmp/gitops-deploy.pub)" -F read_only=false
+
+gh secret set GITOPS_DEPLOY_KEY --repo <owner>/<repo> < /tmp/gitops-deploy
+```
+
+then add `{"actor_id": <deploy key id>, "actor_type": "DeployKey",
+"bypass_mode": "always"}` to that repository's ruleset bypass list (the API
+reports it back with `actor_id: null`; it scopes to the repository's deploy
+keys). Rotate by repeating the three commands with a fresh pair — one key
+can only be installed on one repository.
+
 ## One-time cluster setup (run by an operator)
 
 The Rollout reads `DJANGO_SECRET_KEY` from a Secret, which this repo never
