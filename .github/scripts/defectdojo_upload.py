@@ -84,26 +84,58 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+def _http_url(url: str) -> str:
+    """Refuse anything but http(s) — the artifact redirect's Location is chosen
+    by the server, and a file://, ftp:// or data: URL must never be opened."""
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("https", "http"):
+        raise ValueError(f"refusing non-HTTP(S) URL (scheme {scheme!r})")
+    return url
+
+
+def _opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
+    """A urllib opener with ONLY the HTTP(S) handlers (urlopen/build_opener
+    would also install file://, ftp:// and data: handlers). `handlers`
+    replace the default redirect handling."""
+    opener = urllib.request.OpenerDirector()
+    for h in (
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        urllib.request.UnknownHandler(),  # any other scheme raises URLError (else open() returns None)
+        *(handlers or (urllib.request.HTTPRedirectHandler(),)),
+    ):
+        opener.add_handler(h)
+    return opener
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_HTTP = _opener()
+_HTTP_NO_REDIRECT = _opener(_NoRedirect())
+
+
 def _github(url: str, token: str, *, raw: bool = False):
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    req = urllib.request.Request(_http_url(url), headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
     for attempt in range(4):
         try:
             if not raw:
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                with _HTTP.open(req, timeout=60) as resp:
                     return json.loads(resp.read())
             # The zip download redirects to blob storage, which must NOT get
             # the GitHub token (urllib would forward it): follow it by hand.
-            class NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, *args, **kwargs):
-                    return None
             try:
-                urllib.request.build_opener(NoRedirect).open(req, timeout=60)
+                _HTTP_NO_REDIRECT.open(req, timeout=60)
                 raise RuntimeError("expected a redirect to the artifact archive")
             except urllib.error.HTTPError as exc:
                 if exc.code not in (301, 302, 303, 307, 308):
                     raise
-                location = exc.headers["Location"]
-            with urllib.request.urlopen(location, timeout=300) as resp:
+                location = _http_url(exc.headers["Location"])
+            with _HTTP.open(location, timeout=300) as resp:
                 return resp.read()
         except (urllib.error.URLError, TimeoutError) as exc:
             if attempt == 3 or (isinstance(exc, urllib.error.HTTPError) and exc.code < 500 and exc.code != 429):
@@ -236,8 +268,8 @@ class DefectDojo:
         headers = dict(self.headers)
         if ctype:
             headers["Content-Type"] = ctype
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        req = urllib.request.Request(_http_url(url), data=body, headers=headers, method=method)
+        with _HTTP.open(req, timeout=120) as resp:
             return json.loads(resp.read() or b"{}")
 
     def get(self, path: str, **query: str) -> dict:
