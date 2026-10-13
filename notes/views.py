@@ -8,11 +8,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import RequestDataTooBig
 from django.db import connection, transaction
-from django.http import (
-    HttpResponse,
-    HttpResponseNotAllowed,
-    JsonResponse,
-)
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
@@ -78,29 +74,29 @@ def parse_positive_int(value, default, maximum):
         return None
 
 
-def parse_json_body(request):
-    content_type = request.content_type
+def _declared_size_error(request):
+    """413/400 from the declared Content-Length, before the body is read."""
+    content_length = request.META.get("CONTENT_LENGTH")
+    if not content_length:
+        return None
+    try:
+        if int(content_length) > MAX_JSON_BODY_BYTES:
+            return api_error("Request body too large", status=413)
+    except (ValueError, TypeError):
+        return api_error("Invalid Content-Length", status=400)
+    return None
 
-    if content_type != "application/json":
+
+def parse_json_body(request):
+    if request.content_type != "application/json":
         return None, api_error(
             "Content-Type must be application/json",
             status=415,
         )
 
-    content_length = request.META.get("CONTENT_LENGTH")
-
-    if content_length:
-        try:
-            if int(content_length) > MAX_JSON_BODY_BYTES:
-                return None, api_error(
-                    "Request body too large",
-                    status=413,
-                )
-        except (ValueError, TypeError):
-            return None, api_error(
-                "Invalid Content-Length",
-                status=400,
-            )
+    error = _declared_size_error(request)
+    if error is not None:
+        return None, error
 
     try:
         # Django may reject the body through its global
