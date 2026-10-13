@@ -120,6 +120,13 @@ on:
         required: false
         type: string
         default: ""
+    # Declared so a caller that forgets to pass it fails at the call, not
+    # deep inside the deploy job. Only the deploy job consumes it: the key
+    # that carries the GitOps commit past main's ruleset.
+    secrets:
+      GITOPS_DEPLOY_KEY:
+        description: Write deploy key whose public half is the ruleset's bypass actor (repo secret).
+        required: true
     outputs:
       digest:
         value: ${{ jobs.resolve.outputs.digest }}

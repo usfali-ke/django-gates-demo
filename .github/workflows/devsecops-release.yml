@@ -92,6 +92,11 @@ jobs:
       actions: read
       issues: write
       pull-requests: read
+    secrets:
+      # devsecops-stage.yml is a called workflow: repo secrets are not
+      # available inside it unless they are passed here. The deploy job
+      # reads exactly this one (the ruleset bypass for its push to main).
+      GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
     with:
       environment: dev
       kind: ${{ inputs.kind }}
@@ -116,6 +121,11 @@ jobs:
       actions: read
       issues: write
       pull-requests: read
+    secrets:
+      # devsecops-stage.yml is a called workflow: repo secrets are not
+      # available inside it unless they are passed here. The deploy job
+      # reads exactly this one (the ruleset bypass for its push to main).
+      GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
     with:
       environment: staging
       kind: ${{ inputs.kind }}
@@ -138,6 +148,11 @@ jobs:
       actions: read
       issues: write
       pull-requests: read
+    secrets:
+      # devsecops-stage.yml is a called workflow: repo secrets are not
+      # available inside it unless they are passed here. The deploy job
+      # reads exactly this one (the ruleset bypass for its push to main).
+      GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
     with:
       environment: prod
       kind: ${{ inputs.kind }}
