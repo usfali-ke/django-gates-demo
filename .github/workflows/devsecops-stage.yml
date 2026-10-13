@@ -1037,6 +1037,18 @@ jobs:
             git checkout -q -B main origin/main
             python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST"
             git add "$KUSTOMIZATION"
+            if git diff --cached --quiet; then
+              # Idempotent re-deploy: this environment already pins this
+              # digest (a re-run of the same release, or a promotion of what
+              # it already runs). There is nothing to commit, and an empty
+              # `git commit` would fail the job — so carry forward the commit
+              # that put this digest there, which is what post-deploy and the
+              # deployment event then refer to.
+              sha=$(git log -1 --format=%H origin/main -- "$KUSTOMIZATION")
+              echo "deploy/${TARGET_ENV} already pins ${DIGEST:0:19}… (${sha:0:7}) — nothing to commit"
+              echo "gitops_sha=$sha" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             git commit -q -m "deploy(${TARGET_ENV}): django-gates-demo ${DIGEST:7:12}${CHANGE_ID:+ ${CHANGE_ID}}${kind} [skip ci]" \
               -m "Released ${IMAGE}@${DIGEST} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               "${trailers[@]}"
