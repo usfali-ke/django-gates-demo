@@ -63,6 +63,7 @@ CONTROLS = {
     "release-notes": ("release", None, None),
     "rollback-plan": ("release", None, None),
     "approve-staging": ("release", None, None),
+    "g4": ("release", None, None),
     "deploy": ("deploy", None, None),
     "post-deploy": ("deploy", None, None),
     # against the deployed environment

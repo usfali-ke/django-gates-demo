@@ -2,25 +2,33 @@
 # AFTER the new digest is deployed to it, never against a build. One run
 # walks the SDLC phases in order — the same signed digest all the way —
 # and a stage's phase sequence only starts when the previous environment
-# finished its own (its tests included):
+# finished its own (its tests included). Each stage
+# (devsecops-stage.yml, one call per environment) runs the phases in
+# order, each ending at its control gate; a failed gate breaks the run
+# there — no later phase in the stage, and no later environment:
 #
 #   devsecops-pipeline (CI)    Plan → Develop ─ G1 ─ → Build ─ G2 ─ → Release
 #     └ starts this pipeline for the digest it published
-#   dev      Release (notes, rollback plan) → Deliver (verify + G5) →
-#            Deploy (G6) → Test (G3) →
+#   dev      Deliver (resolve, provenance, evidence, config) and Release
+#            (notes, rollback plan) in parallel → G5 → Deploy (GitOps +
+#            G6 admission on the cluster) → Test (smoke, integration,
+#            regression, security, DAST, dependency re-check) → G3
 #     ▼ Approval Gate `staging-approval` (test results, scans, notes)
-#   staging  Release (notes, rollback plan) → Deliver (verify + G5) →
-#            Deploy (G6) → Test (G3) → Monitor/UAT
+#   staging  Deliver + Release records → G5 → Deploy (G6) → Test
+#            (smoke, e2e, regression, performance, security, DAST, TLS)
+#            → G3 → UAT ready (feeds prod's G4)
 #     ▼ G4 `release-approval` (UAT sign-off, Go/No-Go, change window)
-#   prod     Release (change mgmt: G4 CAB) → Deliver (verify + G5) →
-#            Deploy (G6 canary) → Test (read-only smoke) → Monitor
-#            (health watch; G6 gate) → a failure starts the rollback
+#   prod     Deliver + Release records (G4 CAB: `release-approval`, then
+#            the dashboard's decision on the change request) → G5 →
+#            Deploy (canary, G6 admission) → Test (read-only smoke) →
+#            Monitor (health watch) → G6 gate → a failure starts the
+#            rollback
 #   Operate   rollback prod (automatic, on a failure after the deploy)
 #   Feedback  summary, change-request + PR comments, rollback command
 #
-# Each stage is devsecops-stage.yml for one environment, and each passes
-# the next the digest it deployed: staging and prod refuse to run if the
-# previous environment has moved on to a newer release since.
+# Each stage passes the next the digest it deployed: staging and prod
+# refuse to run if the previous environment has moved on to a newer
+# release since.
 #
 # The pipeline starts a run at dev for every main commit it published.
 # Start one by hand at any stage (Actions → devsecops-release → Run
