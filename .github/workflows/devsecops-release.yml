@@ -1,25 +1,22 @@
 # The release pipeline: every dynamic test runs against an environment
-# AFTER the new digest is deployed to it, never against a build. The SDLC
-# from a developer's commit to production, the control gates between:
+# AFTER the new digest is deployed to it, never against a build. One run
+# walks the SDLC phases in order — the same signed digest all the way —
+# and a stage's phase sequence only starts when the previous environment
+# finished its own (its tests included):
 #
-#   devsecops-pipeline (CI)    1 Code → G1 (PR merge) → 2 Build → 3 Package
-#     └ G2 Control Gate ─────  4 Release: starts this pipeline at dev
-#   dev      5 Deploy to Dev            Verify → Plan → G5 → Deploy → G6 →
-#     │                                 Test: smoke · integration · regression
-#     │                                 · security tests · nuclei · dependency
-#     │                                 re-check → G3
-#     ▼ Approval Gate `staging-approval` (test results, scans, release notes)
-#   staging  6 Deploy to Staging        Verify → Plan → G5 → Deploy → G6 →
-#     │                                 Test: smoke · end-to-end · regression
-#     │                                 · performance · security tests ·
-#     │                                 nuclei · testssl.sh → G3 → UAT
-#     ▼ G4 `release-approval` + change request (UAT sign-off, Go/No-Go, window)
-#   prod     7 Deploy to Production     Verify → Plan → G5 → Deploy (canary) →
-#     │                                 G6 → smoke · health watch → G6 gate
-#     ▼
-#   8 Operate   rollback prod (automatic, on a failure after the deploy) ·
-#               monitoring, logging & feedback (summary, change request + PR
-#               comments, rollback command)
+#   devsecops-pipeline (CI)    Plan → Develop ─ G1 ─ → Build ─ G2 ─ → Release
+#     └ starts this pipeline for the digest it published
+#   dev      Release (notes, rollback plan) → Deliver (verify + G5) →
+#            Deploy (G6) → Test (G3) →
+#     ▼ Approval Gate `staging-approval` (test results, scans, notes)
+#   staging  Release (notes, rollback plan) → Deliver (verify + G5) →
+#            Deploy (G6) → Test (G3) → Monitor/UAT
+#     ▼ G4 `release-approval` (UAT sign-off, Go/No-Go, change window)
+#   prod     Release (change mgmt: G4 CAB) → Deliver (verify + G5) →
+#            Deploy (G6 canary) → Test (read-only smoke) → Monitor
+#            (health watch; G6 gate) → a failure starts the rollback
+#   Operate   rollback prod (automatic, on a failure after the deploy)
+#   Feedback  summary, change-request + PR comments, rollback command
 #
 # Each stage is devsecops-stage.yml for one environment, and each passes
 # the next the digest it deployed: staging and prod refuse to run if the
@@ -75,7 +72,7 @@ permissions: {}
 
 jobs:
   dev:
-    name: 5 Deploy to Dev
+    name: Dev · deploy + test (Dev)
     if: github.ref == 'refs/heads/main' && inputs.start == 'dev'
     uses: ./.github/workflows/devsecops-stage.yml
     permissions:
@@ -94,7 +91,7 @@ jobs:
       allow-self-approval: ${{ inputs.allow-self-approval }}
 
   staging:
-    name: 6 Deploy to Staging
+    name: Staging · deploy + test (Staging)
     needs: dev
     # Chained: only after dev deployed AND passed its tests (the stage
     # fails otherwise). A rollback stays in the environment it started in.
@@ -118,7 +115,7 @@ jobs:
       allow-self-approval: ${{ inputs.allow-self-approval }}
 
   prod:
-    name: 7 Deploy to Production
+    name: Production · deploy + test (Production)
     needs: staging
     if: >-
       !cancelled() && github.ref == 'refs/heads/main' &&
@@ -141,7 +138,7 @@ jobs:
       allow-self-approval: ${{ inputs.allow-self-approval }}
 
   rollback:
-    name: 8 Operate · rollback prod (automatic)
+    name: Operate · rollback prod (automatic)
     # prod deployed and then failed its smoke tests or health watch (or
     # Argo CD's G6): start the rollback right away. It redeploys the
     # digest prod ran before (the deploy commit's Rollback-Digest) through
@@ -170,7 +167,7 @@ jobs:
             | tee -a "$GITHUB_STEP_SUMMARY"
 
   feedback:
-    name: 8 Operate · monitoring, logging & feedback
+    name: Feedback · monitoring, logging & feedback
     # Every run ends here, whatever happened: where the release got to,
     # told to the people behind it (change request, pull requests) and, if
     # a stage failed after it deployed, the rollback that undoes it. The
@@ -211,7 +208,7 @@ jobs:
             r=$(jq -r --arg e "$env" '.[$e].result' <<<"$NEEDS")
             d=$(jq -r --arg e "$env" '.[$e].outputs.digest // ""' <<<"$NEEDS")
             g=$(jq -r --arg e "$env" '.[$e].outputs["gitops-sha"] // ""' <<<"$NEEDS")
-            name=$(case "$env" in dev) echo "5 Deploy to Dev";; staging) echo "6 Deploy to Staging";; prod) echo "7 Deploy to Production";; esac)
+            name=$(case "$env" in dev) echo "Dev · deploy + test (Dev)";; staging) echo "Staging · deploy + test (Staging)";; prod) echo "Production · deploy + test (Production)";; esac)
             failed=$(jq -r --arg n "$name" '[.[] | select((.name | startswith($n + " / ")) and .conclusion == "failure") | .name | sub("^[^/]+/ "; "")] | join(", ")' <<<"$jobs")
             table+=$'\n'"| ${name} | $(icon "$r") ${r} | ${d:+\`${d:0:19}…\`} | ${g:0:7} | ${failed} |"
             # Deployed, then failed its checks: say how to go back.
