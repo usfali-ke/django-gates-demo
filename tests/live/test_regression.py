@@ -10,7 +10,7 @@ import re
 
 import requests
 
-from .client import BASE, TIMEOUT, create, csrf_token, notes, unique
+from .client import BASE, TIMEOUT, create, csrf_token, notes, total_notes, unique
 
 
 def test_static_files_send_no_cors_header():
@@ -30,18 +30,18 @@ def test_api_does_not_coerce_non_strings(a):
     for text in (5, 5.5, True, None, ["x"], {"x": 1}):
         r = a.post(BASE + "/api/notes/", json={"text": text}, timeout=TIMEOUT)
         assert r.status_code == 400 and r.json() == {
-            "error": "text must be a string"
+            "error": "Text must be a string"
         }, text
     assert not [n for n in notes(a) if n["text"] in ("5", "5.5", "True", "None")]
 
 
 def test_per_user_note_limit(b):
     """MAX_NOTES_PER_USER (200): one account can't fill the database."""
-    have = len(notes(b))
+    have = total_notes(b)
     for i in range(200 - have):
         create(b, f"limit {i}")
     r = b.post(BASE + "/api/notes/", json={"text": "one too many"}, timeout=TIMEOUT)
-    assert r.status_code == 409 and r.json() == {"error": "note limit reached"}
+    assert r.status_code == 409 and r.json() == {"error": "Note limit reached"}
     token = csrf_token(b, "/notes/")
     page = b.post(
         BASE + "/notes/",
@@ -49,8 +49,10 @@ def test_per_user_note_limit(b):
         timeout=TIMEOUT,
     )
     assert page.status_code == 400 and "at most 200 notes" in page.text
-    for n in notes(b):
-        b.delete(f"{BASE}/api/notes/{n['id']}/", timeout=TIMEOUT)
+    # The list API pages, so delete page by page until the account is empty.
+    while (page := notes(b)):
+        for n in page:
+            b.delete(f"{BASE}/api/notes/{n['id']}/", timeout=TIMEOUT)
     assert notes(b) == []
 
 
@@ -91,7 +93,7 @@ def test_api_method_allow_lists(a):
 def test_oversized_body_rejected(a):
     """DATA_UPLOAD_MAX_MEMORY_SIZE (64 KiB): the app takes small notes only."""
     r = a.post(BASE + "/api/notes/", json={"text": "x" * (70 * 1024)}, timeout=TIMEOUT)
-    assert r.status_code == 400
+    assert r.status_code == 413 and r.json() == {"error": "Request body too large"}
 
 
 def test_logged_in_user_skips_login_page(a):
