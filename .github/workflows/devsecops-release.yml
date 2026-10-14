@@ -185,9 +185,9 @@ jobs:
           SELF_APPROVAL: ${{ vars.ALLOW_SELF_APPROVAL }}
         run: |
           set -euo pipefail
-          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            -f start=prod -f kind=rollback -f change="$CHANGE_ID" \
-            ${SELF_APPROVAL:+-f allow-self-approval="$SELF_APPROVAL"
+          args=(-f start=prod -f kind=rollback -f "change=$CHANGE_ID")
+          [ -z "${SELF_APPROVAL:-}" ] || args+=(-f "allow-self-approval=$SELF_APPROVAL")
+          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main "${args[@]}"
           echo "prod failed after deploy ${GITOPS_SHA:0:7}: rollback started (devsecops-release, start prod, kind rollback${CHANGE_ID:+, ${CHANGE_ID}}); it waits for release-approval" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 

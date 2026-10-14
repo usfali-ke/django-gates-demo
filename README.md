@@ -267,6 +267,11 @@ this one waited for approval.
     a manual run passes `allow-self-approval`, and a run the pipeline starts
     itself — the normal path — takes the `ALLOW_SELF_APPROVAL` repository
     variable (`Settings → Secrets and variables → Actions → Variables`).
+    The waiver is admin-level: `approvals.sh` honours it only when the account
+    behind the attempt is a repository admin, or the run was started by the
+    pipeline itself, whose dispatch carries the value from that variable —
+    which only an admin can set. Anyone else asking for it is refused, and the
+    refusal is recorded.
 - **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
   trailers (`Environment`, `Image-Digest`, `Source-Commit`,
   `Rollback-Digest`, `Rollback-Source`) are what the next stage's Deliver
