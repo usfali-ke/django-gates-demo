@@ -284,10 +284,12 @@ How to release:
 
 1. Open a **Change request** issue whose change window covers the
    release. Someone other than you adds `change-approved`.
-2. Merge to main, and put the merge commit's SHA (or the release run's
-   URL) in the change request's **Release** field. When **devsecops-pipeline**'s Control Gate passes, it
-   starts **devsecops-release** for that commit, which deploys to dev and
-   tests it there.
+2. Merge to main, and tell the change request which release it is for:
+   put the merge commit's SHA (or the release run's URL) in its
+   **Release** field, or comment `/release <sha|run-url>` on it. When
+   **devsecops-pipeline**'s Control Gate passes, it starts
+   **devsecops-release** for that commit, which deploys to dev and tests
+   it there.
 3. Someone who didn't start the run or write the change approves
    `staging-approval`. Staging is deployed and tested; the change request
    gets a comment that UAT can start.
@@ -296,9 +298,22 @@ How to release:
    start the run or write the change approves `release-approval`. Prod is
    deployed, smoke-tested and watched.
 
+Before prod, the run asks **which change request it is for** rather than
+guessing: `G4 · choose the change request (prod)` lists the open change
+requests in the run summary and waits (up to 20 minutes) for you to pick
+one — by commenting `/release <sha|run-url>` on it, or by filling its
+Release field — and only then is the `release-approval` review requested,
+so the approval is one you could already see and choose. A `/release`
+comment is the pick even if another request's Release field also names the
+release; two requests naming it is an error rather than a coin toss. This
+is what lets a change request that predates the Release field (issues are
+rendered with the form as it was when they were opened) still carry a
+release.
+
 A run can also start at any stage (Actions → devsecops-release → Run
 workflow): `start: staging` promotes what dev runs, `start: prod` what
-staging runs (pass `change` if no change request names the commit). A
+staging runs (pass `change: <number>` to name the change request outright
+on a manual run). A
 push that only touches `deploy/**` or `*.md` doesn't build; to deploy an
 older published commit, use `start: dev` and `commit: <sha>`.
 
