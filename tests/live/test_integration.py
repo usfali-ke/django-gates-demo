@@ -102,7 +102,7 @@ def test_text_is_trimmed_and_validated(a):
         headers={"Content-Type": "application/json"},
         timeout=TIMEOUT,
     )
-    assert r.status_code == 400 and r.json() == {"error": "body must be JSON"}
+    assert r.status_code == 400 and r.json() == {"error": "Malformed JSON request body"}
 
 
 def test_logout_ends_session(user_b):

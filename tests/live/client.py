@@ -59,5 +59,13 @@ def notes(s):
     return r.json()["notes"]
 
 
+def total_notes(s):
+    """How many notes the account holds. The list API pages (25 per page by
+    default), so len(notes(s)) is only the first page."""
+    r = s.get(BASE + "/api/notes/?page_size=1", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    return r.json()["pagination"]["total"]
+
+
 def unique(prefix):
     return f"{prefix}-{uuid.uuid4()}"
