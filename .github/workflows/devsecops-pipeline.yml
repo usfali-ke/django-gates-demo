@@ -1134,10 +1134,17 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
+          # Opt-in, repo-wide: a two-person team where the author and the
+          # releaser are the run's only two accounts has no eligible approver
+          # left, so the pipeline carries the documented segregation-of-duties
+          # exception into the run it starts. Unset (the default) keeps the
+          # strict rule. The waiver is recorded in each gate's verdict detail.
+          SELF_APPROVAL: ${{ vars.ALLOW_SELF_APPROVAL }}
         run: |
           set -euo pipefail
           gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            -f start=dev -f kind=planned -f commit="$GITHUB_SHA"
+            -f start=dev -f kind=planned -f commit="$GITHUB_SHA" \
+            ${SELF_APPROVAL:+-f allow-self-approval="$SELF_APPROVAL"
           echo "Started devsecops-release for ${GITHUB_SHA:0:7} (dev → staging → prod): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Feedback: back to the developers.
