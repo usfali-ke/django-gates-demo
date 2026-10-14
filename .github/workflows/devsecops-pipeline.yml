@@ -461,8 +461,17 @@ jobs:
         with:
           gate: G1
           needs: ${{ toJSON(needs) }}
-          subject: pr-${{ github.event.pull_request.number }}
-          commit-sha: ${{ github.event.pull_request.head.sha }}
+          # The merge gate runs on the pull request, where nothing is being
+          # promoted. record=false makes the action upload `gate-preview-G1`
+          # (as G2/G3 do) instead of `gate-result-G1`, so a PR's pre-merge
+          # state — unsigned author commits, no reviewer yet — never enters
+          # the promotion evidence the dashboard's gate rate is computed
+          # from. It was the only gate that recorded on PRs, and those rows
+          # (subject `pr-<number>`, one per run) were what made the Secure
+          # Gates KPI read 63% on the build side.
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          subject: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+          commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
 
   # ── Build: the artifact — reproducible, scanned, signed. Nothing here
   #    runs on a PR whose G1 failed. SCA, IaC and the reproducible build
