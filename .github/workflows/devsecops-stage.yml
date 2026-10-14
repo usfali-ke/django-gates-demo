@@ -833,6 +833,7 @@ jobs:
 
           Pick it (the \`release-approval\` approval is asked once it is picked):
 
+          - run **Actions → Pick the change request for a release → Run workflow** with its number (the form-based way to pick) — or
           - comment \`/release ${SOURCE_SHA:0:7}\` on the change request this release is for — or paste \`${RUN_URL}\` — or
           - put the commit (\`${SOURCE_SHA:0:7}\`) or this run's URL in that request's **Release** field.
 
@@ -848,7 +849,7 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::no change request was picked within 20 minutes — comment '/release ${SOURCE_SHA:0:7}' on the one this release is for (or fill its Release field), then re-run this stage"
+          echo "::error::no change request was picked within 20 minutes — run Actions → 'Pick the change request for a release' with its number, or comment '/release ${SOURCE_SHA:0:7}' on it (or fill its Release field), then re-run this stage"
           exit 1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -904,13 +905,24 @@ jobs:
           ID: ${{ steps.change.outputs.id }}
           STATE: ${{ steps.change.outputs.state }}
           LABELS: ${{ steps.change.outputs.labels }}
+          URL: ${{ steps.change.outputs.url }}
+          AUTHOR: ${{ steps.change.outputs.author }}
         run: |
           set -euo pipefail
           problems=$(jq -rn --arg state "$STATE" --argjson l "$LABELS" '[
               (if $state != "open" then "is \($state)" else empty end),
               (("change","change-approved","readiness-approved","uat-approved") | select(. as $x | $l | index($x) | not) | "missing label \(.)")
             ] | join("; ")')
-          [ -z "$problems" ] || { echo "::error::${ID}: ${problems}"; exit 1; }
+          if [ -n "$problems" ]; then
+            echo "::error::${ID}: ${problems} — add them at ${URL}#labels"
+            {
+              echo "### ${ID} is not ready for prod"
+              echo "${ID} still needs: ${problems}."
+              echo "Add the label(s) on the change request: ${URL}#labels"
+              echo "The dashboard counts a label as an approval only when someone other than the requester (${AUTHOR:-the requester}) applies it, so the tester and the Go/No-Go reviewer are the other person — and \`uat-approved\` has to come *after* staging's tests passed for the digest being released."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           echo "${ID}: change approved, Go/No-Go (readiness) approved, UAT signed off" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Separation of duties
         id: sod
@@ -1883,18 +1895,19 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           NUMBER: ${{ steps.change.outputs.number }}
+          URL: ${{ steps.change.outputs.url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           body="**Staging is ready for UAT.** \`${DIGEST:0:19}…\` (built from ${SOURCE_SHA:0:7}) is deployed to staging and passed its smoke, end-to-end, regression, performance and security tests (authenticated, nuclei, testssl.sh): ${RUN_URL}
 
-          Sign off by adding the \`uat-approved\` label (someone other than the requester). Prod's Approval Gate (\`release-approval\` in that run) and G4 require it."
+          Sign off by adding the \`uat-approved\` label at ${URL}#labels — someone other than the requester, and now that staging's tests above have passed (a sign-off from before this digest passed G3 doesn't count). Prod's Approval Gate (\`release-approval\`) and G4 require it, plus \`change-approved\` and \`readiness-approved\`."
           echo "$body" >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$NUMBER" ]; then
             gh api "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}/comments" -f body="$body" > /dev/null
             echo "Commented on CHG-${NUMBER}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No change request names ${SOURCE_SHA:0:7} yet: comment `/release ${SOURCE_SHA:0:7}` on the one this release is for, or fill its Release field, before approving prod (prod waits for that pick)." >> "$GITHUB_STEP_SUMMARY"
+            echo "No change request is picked for ${SOURCE_SHA:0:7} yet: run Actions → Pick the change request for a release, comment `/release ${SOURCE_SHA:0:7}` on the one it is for, or fill its Release field — prod waits for that pick." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ── Record: the signed release record — runs even when the stage

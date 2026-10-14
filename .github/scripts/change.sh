@@ -19,6 +19,7 @@
 set -euo pipefail
 
 run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+issue_url="https://github.com/${GITHUB_REPOSITORY}/issues"
 none() {
   if [ "${REQUIRE:-}" = true ]; then echo "::error::$1"; exit 1; fi
   echo "::notice::$1"; exit 0
@@ -69,7 +70,8 @@ else
         fi
       fi
     done
-    open_list="${open_list}${open_list:+; }CHG-${n} (${t}): Release = ${r}${picked_list:+; /release comments: ${picked_list}}"
+    labels=$(jq -r --argjson n "$n" '.[] | select(.number == $n) | [.labels[].name] | join(", ")' <<<"$all")
+    open_list="${open_list}${open_list:+; }CHG-${n} (${t}) [${labels:-no labels}]: Release = ${r}${picked_list:+; /release comments: ${picked_list}} — ${issue_url}/${n}"
   done
   [ -n "$open_list" ] || open_list="no open issue carries the change label"
 
@@ -83,14 +85,18 @@ else
     chosen_by="its Release field"
   else
     if [ "$count" = 0 ]; then
-      none "no open change request names ${SOURCE_SHA:0:7} or this run — neither in its Release field nor by a /release comment. Open ones: ${open_list}. Pick one by commenting '/release ${SOURCE_SHA:0:7}' on it (or fill its Release field), or pass its number as the change input on a manual run"
+      none "no open change request names ${SOURCE_SHA:0:7} or this run — neither in its Release field nor by a /release comment. Open ones: ${open_list}. Pick one by commenting '/release ${SOURCE_SHA:0:7}' on it, by running the 'Pick the change request for a release' workflow with its number, or by filling its Release field"
     else
-      none "${count} open change requests name ${SOURCE_SHA:0:7} or this run; pass the one meant as input change, or comment '/release ${SOURCE_SHA:0:7}' on it. Open ones: ${open_list}"
+      none "${count} open change requests name ${SOURCE_SHA:0:7} or this run; comment '/release ${SOURCE_SHA:0:7}' on the one meant, or pass its number as the change input on a manual run. Open ones: ${open_list}"
     fi
   fi
 fi
 n=$(jq -r .number <<<"$issue")
+# GITHUB_OUTPUT is set by Actions; a maintainer running this by hand gets the
+# printed line instead of an unbound-variable error.
+out_file=${GITHUB_OUTPUT:-/dev/null}
 { echo "id=CHG-${n}"; echo "number=${n}"; echo "url=$(jq -r .html_url <<<"$issue")"
   echo "state=$(jq -r .state <<<"$issue")"; echo "labels=$(jq -c '[.labels[].name]' <<<"$issue")"
-  echo "chosen_by=${chosen_by:-its Release field}"; } >> "$GITHUB_OUTPUT"
+  echo "author=$(jq -r '.user.login // empty' <<<"$issue")"
+  echo "chosen_by=${chosen_by:-its Release field}"; } >> "$out_file"
 echo "Change request: CHG-${n} ($(jq -r .title <<<"$issue")) — chosen by ${chosen_by:-its Release field}"

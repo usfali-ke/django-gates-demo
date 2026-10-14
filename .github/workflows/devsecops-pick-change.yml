@@ -1,0 +1,55 @@
+name: Pick the change request for a release
+
+# Prod's CAB gate has to know *which* change request a release belongs to
+# before it asks for the release-approval review, and a workflow that is
+# already running can't show a picker of its own. Run this one with the
+# number of the change request and it records the pick on that request (a
+# `/release <sha>` comment), where the waiting release — and every later run
+# of it — reads it. Run it with no number to be shown what is open.
+#
+# The waiting stage's summary lists the open change requests too, with each
+# one's labels and links, and accepts the same pick however it was recorded
+# (`/release` comment, Release field, or the `change:` input of a manual run).
+
+on:
+  workflow_dispatch:
+    inputs:
+      change:
+        description: 'Change request number (7, #7 or CHG-7). Leave empty to list the open ones.'
+        required: false
+        type: string
+      release:
+        description: 'What the pick is for: a commit on main (at least 7 characters) or a release run URL. Empty = the newest commit on main.'
+        required: false
+        type: string
+      note:
+        description: Optional note recorded with the pick
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  pick:
+    name: Record the pick on the change request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGE: ${{ inputs.change }}
+          RELEASE: ${{ inputs.release }}
+          NOTE: ${{ inputs.note }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/pick-change.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"

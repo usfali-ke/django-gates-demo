@@ -310,6 +310,23 @@ is what lets a change request that predates the Release field (issues are
 rendered with the form as it was when they were opened) still carry a
 release.
 
+Picking it, four ways — the first that resolves wins:
+
+- run **Actions → Pick the change request for a release → Run workflow**
+  with the request's number. That is the form-based way: leave the number
+  empty and it lists what is open, with each one's labels and link. The pick
+  is written on the change request, so every later run reads it directly;
+- comment `/release <sha|run-url>` on the change request;
+- fill in its **Release** field;
+- pass `change: <number>` to a manual run of **devsecops-release**.
+
+The request then has to carry `change-approved`, `readiness-approved` and
+`uat-approved`. The dashboard counts a label as an approval only when someone
+*other than the requester* applies it, so the tester and the Go/No-Go
+reviewer are that other person — and `uat-approved` has to come **after**
+staging's tests passed for the digest being released: a sign-off from before
+that G3 doesn't count, and the gate says so when it refuses.
+
 A run can also start at any stage (Actions → devsecops-release → Run
 workflow): `start: staging` promotes what dev runs, `start: prod` what
 staging runs (pass `change: <number>` to name the change request outright
