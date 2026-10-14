@@ -1142,9 +1142,12 @@ jobs:
           SELF_APPROVAL: ${{ vars.ALLOW_SELF_APPROVAL }}
         run: |
           set -euo pipefail
-          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            -f start=dev -f kind=planned -f commit="$GITHUB_SHA" \
-            ${SELF_APPROVAL:+-f allow-self-approval="$SELF_APPROVAL"
+          args=(-f start=dev -f kind=planned -f "commit=$GITHUB_SHA")
+          # The documented segregation-of-duties exception, opt-in from the
+          # ALLOW_SELF_APPROVAL repository variable. approvals.sh refuses it
+          # unless the account behind the run is a repository admin.
+          [ -z "$SELF_APPROVAL" ] || args+=(-f "allow-self-approval=$SELF_APPROVAL")
+          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main "${args[@]}"
           echo "Started devsecops-release for ${GITHUB_SHA:0:7} (dev → staging → prod): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Feedback: back to the developers.
