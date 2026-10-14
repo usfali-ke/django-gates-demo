@@ -34,4 +34,4 @@ images:
   # starts at the digest prod already ran; promotion replaces it.
   - name: django-gates-demo
     newName: ghcr.io/usfali-ke/django-gates-demo
-    digest: sha256:68267c58b66823f8531df891d40e70a2e5ce3addaa1591f60497be4839cd5435
+    digest: sha256:590fb726a3d857ed57155c9bd4bb7ce6236a8e1d34069c7859523c161c99c8a1
