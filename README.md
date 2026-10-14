@@ -249,11 +249,24 @@ this one waited for approval.
   - *rollback plan*: the digest running now (or, on a redeploy, the one it
     replaced) is still signed and still in the registry. The deploy
     commit records it as `Rollback-Digest`.
-- **Approval Gates**: `staging-approval` and `release-approval`. The
-  approver can't be whoever started or re-ran the run, nor whoever
-  authored the change (the commit or its pull request). G4 also needs the
-  change request labelled `change-approved`, `readiness-approved` and
-  `uat-approved`, and the dashboard's own decision on it.
+- **Approval Gates**: `staging-approval` and `release-approval`. At least
+  one approval must come from someone who neither started nor re-ran this
+  run, nor authored the change. "Authored the change" is the pull request
+  and the commits in it, not the merge commit on main — GitHub attributes a
+  merge to whoever merged it, and the releaser must stay able to approve
+  their own merge. The starter is the run's actor, and the re-runner counts
+  only on a re-run (`run_attempt > 1`), since a run the pipeline starts
+  itself has `github-actions` as its actor. When every reviewer of the
+  environment is excluded, the gate says so instead of blaming the approver.
+  G4 also needs the change request labelled `change-approved`,
+  `readiness-approved` and `uat-approved`, and the dashboard's own decision
+  on it.
+  - *Single-operator teams* (one account, or two where one opens the change
+    and the other merges it) can opt into the documented exception, which is
+    recorded in the gate's verdict detail so the dashboard shows it verbatim:
+    a manual run passes `allow-self-approval`, and a run the pipeline starts
+    itself — the normal path — takes the `ALLOW_SELF_APPROVAL` repository
+    variable (`Settings → Secrets and variables → Actions → Variables`).
 - **Deploy** is a commit to `deploy/<env>/kustomization.yaml`. Its
   trailers (`Environment`, `Image-Digest`, `Source-Commit`,
   `Rollback-Digest`, `Rollback-Source`) are what the next stage's Deliver
