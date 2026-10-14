@@ -787,13 +787,84 @@ jobs:
           path: reports/approve-staging/
           if-no-files-found: ignore
 
+  # ── Prod's CAB gate needs to know *which* change request this release is
+  #    for, and whoever approves `release-approval` should pick it first. ───
+  g4-choose:
+    name: G4 · choose the change request (prod)
+    # Waits (up to 20 minutes) for the pick, then hands the number to g4 —
+    # so the approval that gets asked for is one the approver could already
+    # see and choose. The pick is either a `/release <sha|run-url>` comment
+    # on the change request or its Release field; the job lists what is open
+    # so there is something to choose from.
+    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
+    if: ${{ !cancelled() && inputs.environment == 'prod' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      number: ${{ steps.pick.outputs.number }}
+      change-id: ${{ steps.pick.outputs.id }}
+      chosen-by: ${{ steps.pick.outputs.chosen_by }}
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: pick
+        name: Wait for the change request to be picked
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGE: ${{ inputs.change }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports/g4-choose
+          # What is open right now, in the run summary, so the approver can see
+          # what there is to pick (change.sh lists each request's Release value
+          # and any /release comment).
+          GH_TOKEN="$GH_TOKEN" SOURCE_SHA="$SOURCE_SHA" REQUIRE=false GITHUB_OUTPUT="$RUNNER_TEMP/g4-choose-lookup" \
+            bash .github/scripts/change.sh > reports/g4-choose/lookup.txt 2>&1 || true
+          { echo "### Prod is waiting for the change request this release is for"; cat reports/g4-choose/lookup.txt; } >> "$GITHUB_STEP_SUMMARY"
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+          Pick it (the \`release-approval\` approval is asked once it is picked):
+
+          - comment \`/release ${SOURCE_SHA:0:7}\` on the change request this release is for — or paste \`${RUN_URL}\` — or
+          - put the commit (\`${SOURCE_SHA:0:7}\`) or this run's URL in that request's **Release** field.
+
+          Waiting up to 20 minutes.
+          EOF
+          for _ in $(seq 40); do
+            out=$(mktemp)
+            if GITHUB_OUTPUT="$out" REQUIRE=true bash .github/scripts/change.sh >> reports/g4-choose/lookup.txt 2>&1; then
+              cat "$out" >> "$GITHUB_OUTPUT"
+              cp "$out" reports/g4-choose/choice.txt
+              echo "Picked: $(sed -n 's/^id=//p' "$out") (chosen by $(sed -n 's/^chosen_by=//p' "$out"))" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::no change request was picked within 20 minutes — comment '/release ${SOURCE_SHA:0:7}' on the one this release is for (or fill its Release field), then re-run this stage"
+          exit 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-prod-g4-choose
+          path: reports/g4-choose/
+          if-no-files-found: ignore
+
   g4:
     name: G4 approval gate · prod (CAB)
-    # `release-approval` is asked once staging's tests passed and
-    # everything above verified. Approve after UAT sign-off, the Go/No-Go
-    # review and inside the change window; the change request must say so
-    # by its labels, and the dashboard's G4 checks the same independently.
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
+    # `release-approval` is asked once staging's tests passed, everything
+    # above verified, and g4-choose resolved which change request this
+    # release is for. Approve after UAT sign-off, the Go/No-Go review and
+    # inside the change window; the change request must say so by its labels,
+    # and the dashboard's G4 checks the same independently.
+    needs: [g4-choose, resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
     if: inputs.environment == 'prod'
     environment: release-approval
     runs-on: ubuntu-latest
@@ -820,9 +891,11 @@ jobs:
           sparse-checkout: .github
       - id: change
         name: Change request
+        # The one g4-choose resolved (the approver's pick, or the `change`
+        # input passed to a manual run).
         env:
           GH_TOKEN: ${{ github.token }}
-          CHANGE: ${{ inputs.change }}
+          CHANGE: ${{ needs.g4-choose.outputs.number || inputs.change }}
           REQUIRE: "true"
         run: bash .github/scripts/change.sh
       - id: uat
@@ -896,7 +969,7 @@ jobs:
           OUT: reports/g4
           VERDICT_FILE: reports/g4/verdict.json
           STATUS: ${{ steps.change.outcome == 'success' && steps.uat.outcome == 'success' && steps.sod.outcome == 'success' && steps.wait.outcome == 'success' && 'pass' || 'fail' }}
-          DETAIL: ${{ steps.change.outputs.id && format('change {0} · ', steps.change.outputs.id) || '' }}${{ steps.sod.outputs.detail || 'approval steps did not all run' }}
+          DETAIL: ${{ steps.change.outputs.id && format('change {0} (picked by {1}) · ', steps.change.outputs.id, needs.g4-choose.outputs.chosen-by) || '' }}${{ steps.sod.outputs.detail || 'approval steps did not all run' }}
           TOOL: GitHub environment review (release-approval) + dashboard G4
         run: |
           mkdir -p "$OUT"
@@ -1821,7 +1894,7 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}/comments" -f body="$body" > /dev/null
             echo "Commented on CHG-${NUMBER}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No change request names ${SOURCE_SHA:0:7} in its Release field yet: open one (Change request form) before approving prod." >> "$GITHUB_STEP_SUMMARY"
+            echo "No change request names ${SOURCE_SHA:0:7} yet: comment `/release ${SOURCE_SHA:0:7}` on the one this release is for, or fill its Release field, before approving prod (prod waits for that pick)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ── Record: the signed release record — runs even when the stage
@@ -1829,7 +1902,7 @@ jobs:
   release-evidence:
     name: Release · record (attested)
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
-            g4, gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
+            g4-choose, g4, gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
             performance, dast-nuclei, dast-tls, dependency-check, health-watch, test-gate]
     if: always() && needs.resolve.result == 'success'
     runs-on: ubuntu-latest
