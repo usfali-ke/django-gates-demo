@@ -7,7 +7,7 @@
 #   Develop   the source, before anything is built: SAST (semgrep) ·
 #             secrets (gitleaks, trufflehog) · quality (ruff: lint +
 #             complexity) · unit tests + coverage · PR: reviewers ·
-#             signed commits · AI security review
+#             signed commits · SAST review (Hermes Agent)
 #     ── G1 merge gate (Develop → Build, on pull requests): reviewed,
 #        signed, tested, no SAST or secret findings. A failed G1 skips
 #        every Build job — the pipeline does not proceed to the phase ──
@@ -358,7 +358,7 @@ jobs:
           if-no-files-found: ignore
 
   ai-review:
-    name: Develop · AI security review · Hermes
+    name: Develop · SAST · Hermes Agent
     if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: lab-runner
     timeout-minutes: 30
