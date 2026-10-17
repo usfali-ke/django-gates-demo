@@ -1,3 +1,4 @@
-# Every issue is a change request or an incident — the security dashboard
-# parses both from these forms, so free-form issues are disabled.
+# Issues here are incidents (a release attaches no change request): the
+# security dashboard parses them from this form, so free-form issues are
+# disabled.
 blank_issues_enabled: false

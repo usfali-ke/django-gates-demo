@@ -90,7 +90,7 @@ GATES = {
         ("dependency_check_clean", "security", [("dependency-check", "result")]),
     ],
     # staging: smoke, end-to-end and regression tests, performance, and the
-    # security scans (nuclei, testssl.sh, authenticated); UAT follows.
+    # security scans (nuclei, testssl.sh, authenticated).
     "G3@staging": [
         ("functional_integration_regression_pass", "quality",
          [("smoke", "result"), ("e2e", "result"), ("regression", "result")]),
@@ -108,15 +108,18 @@ GATES = {
     # Before each environment's deploy commit (devsecops-stage.yml).
     "G5": _G5,
     "G5@dev": _G5,
-    # Promotion from dev (the first Approval Gate): dev's G3 for this
-    # digest (test results + security scans), the release notes the
-    # approver read, and the staging-approval environment's reviewer.
+    # Promotion into staging (dev and staging are otherwise the same
+    # process): dev's G3 for this digest (test results + security scans) and
+    # the release notes the reader of the run summary reads. No approval:
+    # only prod has one.
     "G5@staging": _G5 + [
         ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
         ("release_notes_published", "governance", [("release-notes", "result")]),
     ],
-    # The approval for prod is G4 (the CAB job's verdict; the dashboard
-    # records the same decision independently from the release request).
+    # prod: the same criteria as staging plus its own approval — the
+    # `release-approval` environment review (job approve-prod), by someone
+    # who neither started the run nor authored the change. The dashboard
+    # records its own G4 decision on the product's change record separately.
     "G5@prod": _G5 + [
         ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
         ("release_notes_published", "governance", [("release-notes", "result")]),

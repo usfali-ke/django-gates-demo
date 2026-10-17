@@ -8,7 +8,7 @@
 #   staging  the digest running in dev, once G6 verified it there and G3
 #            passed against it there
 #   prod     the digest running in staging, once G6 verified it and G3
-#            passed against it there, and only after G4
+#            passed against it there, and only after prod's own approval
 #   rollback (kind) the digest the environment ran before its last deploy:
 #            that deploy commit's Rollback-Digest trailer
 #
@@ -34,12 +34,11 @@
 #              now: still signed and pullable — G5 rollback_plan_ready).
 #              Both run in parallel with the Deliver checks; the approver
 #              reads them with the checks' evidence. Then the phase's
-#              approval: staging → Approval Gate `staging-approval`
-#              (segregation of duties; G5@staging
-#              promotion_approved_by_other), prod → G4 `release-approval`
-#              (UAT sign-off, Go/No-Go, change window, the change request
-#              labels, then the security dashboard's own decision on it —
-#              the doc's Release gate, G4, fires here, before G5)
+#              approval, which only prod has: the `release-approval`
+#              environment review (segregation of duties; G5@prod
+#              promotion_approved_by_other). dev and staging have no
+#              approval step at all — nothing about them differs from prod
+#              but that one job
 #   G5         deployment gate — every Deliver criterion plus the
 #              approval, BEFORE anything is committed. A failed G5 skips
 #              Deploy and the whole stage fails
@@ -103,7 +102,7 @@ on:
         type: string
         default: ""
       allow-self-approval:
-        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
+        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode), prod only: approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
         required: false
         type: string
         default: ""
@@ -558,11 +557,9 @@ jobs:
           path: reports/previous-env-tests/
           if-no-files-found: ignore
 
-  # ── Release: the candidate's records and the phase's approvals —
-  #    staging's Approval Gate, and on prod the doc's Release gate (G4:
-  #    `release-approval`, then the dashboard's decision on the change
-  #    request). Records run in the Deliver wave; approvals wait for all
-  #    of them. ─────────────────────────────────────────────────────────────
+  # ── Release: the candidate's records, and prod's approval — the
+  #    `release-approval` environment review. Records run in the Deliver
+  #    wave; prod's approval waits for all of them. ────────────────────────
   release-notes:
     name: Release · release notes
     # What the approver approves: every change between the source running
@@ -713,7 +710,7 @@ jobs:
           { echo "### Rollback plan (${TARGET_ENV})"
             echo
             echo "If ${TARGET_ENV} misbehaves after this deploy: Actions → devsecops-release → start \`${TARGET_ENV}\`, kind \`rollback\`."
-            echo "That redeploys \`${target}\` (built from ${source:0:7}) through the same gates${TARGET_ENV/#prod/, G4 included}."; } >> "$GITHUB_STEP_SUMMARY"
+            echo "That redeploys \`${target}\` (built from ${source:0:7}) through the same gates${TARGET_ENV/#prod/, approval included}."; } >> "$GITHUB_STEP_SUMMARY"
           res pass "rollback target ${target:0:19}… (built from ${source:0:7}): signature verified, image pullable; recorded on the deploy commit"
       - id: verdict
         if: always()
@@ -731,11 +728,11 @@ jobs:
 
   approve-prod:
     name: Release · approval gate · prod
-    # Prod's approval, and its change/CAB approval: a GitHub environment
-    # review by someone who neither started this release nor authored the
-    # change (approvals.sh enforces that; the environment enforces that a
-    # review happens at all). Everything else about prod is the same process
-    # as dev and staging.
+    # Prod's approval: a GitHub environment review by someone who neither
+    # started this release nor authored the change (approvals.sh enforces
+    # that; the environment enforces that a review happens at all). This is
+    # the only difference between prod and dev/staging, which run the same
+    # jobs and gates without it.
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
     if: ${{ !cancelled() && inputs.environment == 'prod' }}
     environment: release-approval
@@ -782,7 +779,8 @@ jobs:
   gate-g5:
     name: G5 deployment gate
     # Before the deploy commit: nothing reaches an environment unless G5
-    # passed for it. staging also needs its approval first, prod G4.
+    # passed for it. Prod also needs its approval first (approve-prod);
+    # dev and staging have no approval step, so theirs is skipped.
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-prod]
     if: >-
       always() && needs.resolve.result == 'success' &&
