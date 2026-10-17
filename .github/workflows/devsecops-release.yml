@@ -66,10 +66,6 @@ on:
         description: start dev only — the main commit whose image to deploy (default the commit this runs on)
         required: false
         type: string
-      change:
-        description: prod — change request being released (7, #7 or CHG-7); default the one whose Release field names this release
-        required: false
-        type: string
       allow-self-approval:
         description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
         required: false
@@ -156,7 +152,6 @@ jobs:
     with:
       environment: prod
       kind: ${{ inputs.kind }}
-      change: ${{ inputs.change }}
       expect-digest: ${{ needs.staging.outputs.digest }}
       allow-self-approval: ${{ inputs.allow-self-approval }}
 
@@ -180,15 +175,14 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          CHANGE_ID: ${{ needs.prod.outputs.change-id }}
           GITOPS_SHA: ${{ needs.prod.outputs.gitops-sha }}
           SELF_APPROVAL: ${{ vars.ALLOW_SELF_APPROVAL }}
         run: |
           set -euo pipefail
-          args=(-f start=prod -f kind=rollback -f "change=$CHANGE_ID")
+          args=(-f start=prod -f kind=rollback)
           [ -z "${SELF_APPROVAL:-}" ] || args+=(-f "allow-self-approval=$SELF_APPROVAL")
           gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main "${args[@]}"
-          echo "prod failed after deploy ${GITOPS_SHA:0:7}: rollback started (devsecops-release, start prod, kind rollback${CHANGE_ID:+, ${CHANGE_ID}}); it waits for release-approval" \
+          echo "prod failed after deploy ${GITOPS_SHA:0:7}: rollback started (devsecops-release, start prod, kind rollback); it waits for the prod approval" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
   feedback:
@@ -218,7 +212,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           KIND: ${{ inputs.kind }}
-          CHANGE: ${{ inputs.change }}
           ROLLBACK: ${{ needs.rollback.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -247,11 +240,7 @@ jobs:
           [ -z "$rollback" ] || body+=$'\n\n'"#### Rollback"$'\n'"Argo Rollouts already aborts a canary that fails its analysis. For a problem found after the rollout:${rollback}"
           echo "$body" >> "$GITHUB_STEP_SUMMARY"
           [ -n "$source" ] || exit 0
-          # The change request (if any names this release) and the pull
-          # requests merged as this commit hear how far it got.
-          SOURCE_SHA=$source CHANGE=$CHANGE GITHUB_OUTPUT="$RUNNER_TEMP/change.out" bash .github/scripts/change.sh || true
-          n=$(sed -n 's/^number=//p' "$RUNNER_TEMP/change.out" 2>/dev/null)
-          [ -z "$n" ] || gh api "repos/${GITHUB_REPOSITORY}/issues/${n}/comments" -f body="$body" > /dev/null
+          # The pull requests merged as this commit hear how far it got.
           for pr in $(gh api "repos/${GITHUB_REPOSITORY}/commits/${source}/pulls" --jq '.[].number' 2>/dev/null); do
             gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" -f body="$body" > /dev/null || true
           done
