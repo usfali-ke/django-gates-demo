@@ -83,7 +83,9 @@ class Browser:
         return self
 
     def _load(self, r):
-        self.page, self.url = r, r.url
+        # httpx hands back a URL object where requests gave a string; the
+        # suite joins/parses it, so normalise once here.
+        self.page, self.url = r, str(r.url)
         p = _Forms()
         p.feed(r.text)
         self.forms, self.items = p.forms, p.items
