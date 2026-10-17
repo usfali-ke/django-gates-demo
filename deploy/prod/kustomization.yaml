@@ -1,5 +1,5 @@
-# prod: gets only a digest that passed G3 in staging, and only after G4
-# (change approval). devsecops-release.yml (environment: prod) commits it
+# prod: gets only a digest that passed G3 in staging, and only after the
+# release-approval review (job approve-prod). devsecops-release.yml
 # after G5. Argo CD app `django-gates-demo-prod` syncs it with selfHeal;
 # nothing else writes to the namespace.
 # The only automated edit is the image digest below (set_digest.py).

@@ -179,7 +179,8 @@ that was applied is listed in the verdict and in the manifest.
 The digest the build pipeline signed moves dev → staging → prod in **one
 run**, and is never rebuilt. Each stage is `devsecops-stage.yml` for one
 environment, and every test in it runs against that environment after the
-digest is deployed there:
+digest is deployed there. Dev, staging and prod run the **same process**;
+prod adds exactly one job, its approval gate:
 
 ```
 devsecops-pipeline (CI)
@@ -191,42 +192,48 @@ Build ──────────── reproducible image build · SCA · Ia
    G2 Control Gate (Build → Release)
 Release ────────── evidence bundle (attested) → starts devsecops-release ↓
 
-devsecops-release, one stage per environment, each a job per control.
-Every stage walks the SDLC phases in order, each phase ending at its
-control gate — a failed gate breaks the run there; a stage also starts
-only when the previous one deployed and passed its tests:
+devsecops-release, the same stage workflow per environment. Every stage
+walks the SDLC phases in order, each phase ending at its control gate — a
+failed gate breaks the run there; a stage also starts only when the
+previous one deployed and passed its tests:
 Dev ────────────── Deliver (resolve · provenance · evidence · config)
                    ∥ Release (notes, rollback plan) → G5 → Deploy
                    (GitOps; G6 admission on the cluster) → Test: smoke
                    · integration · regression · security tests · DAST
                    (nuclei) · dependency re-check → G3 test gate
-   Approval Gate ─ staging-approval: dev's test results + security scans,
-                   release notes (in the run summary)
-Staging ────────── Deliver ∥ Release records → G5 → Deploy (G6) →
-                   Test: smoke · end-to-end · regression · performance
-                   (k6) · security tests · DAST (nuclei) · TLS (testssl.sh)
-                   → G3 test gate → UAT ready (feeds prod's G4)
-   G4 ──────────── release-approval: UAT sign-off (uat-approved), test
-                   results, Go/No-Go (readiness-approved), change window
-Production ─────── Deliver ∥ Release records (G4 CAB first) → G5 →
-                   Deploy (canary; G6 admission) → Test: read-only smoke
-                   ∥ Monitor: health watch (5 min of /healthz probes,
-                   latency SLO, no restarts) → G6 post-deploy gate; a
-                   failure starts the rollback
+Staging ────────── the same process as dev: Deliver ∥ Release records →
+                   G5 → Deploy (G6) → Test: smoke · end-to-end ·
+                   regression · performance (k6) · security tests · DAST
+                   (nuclei) · TLS (testssl.sh) → G3 test gate
+   Approval ────── release-approval, prod only: nothing is committed until
+                   someone who neither started this run nor wrote the
+                   change approves the environment review
+Production ─────── Deliver ∥ Release records → G5 → Deploy (canary; G6
+                   admission) → Test: read-only smoke ∥ Monitor: health
+                   watch (5 min of /healthz probes, latency SLO, no
+                   restarts) → G6 post-deploy gate; a failure starts the
+                   rollback
 Operate ────────── automatic prod rollback · Feedback: run summary per
-                   stage, a comment on the change request and the pull
-                   requests, the rollback command if a deployed stage
-                   failed; gate results, deployment events and release
-                   evidence to the security dashboard; Argo CD
-                   notifications for every sync and canary.
+                   stage, a comment on the pull requests, the rollback
+                   command if a deployed stage failed; gate results,
+                   deployment events and release evidence to the security
+                   dashboard; Argo CD notifications for every sync and
+                   canary.
 ```
+
+Dev, staging and prod are the *same* workflow (`devsecops-stage.yml`, one
+call per environment), so nothing about an environment changes what is
+verified: the phases, the gates and the tests are identical, and every gate
+still has to pass before the next environment starts. The single difference
+is prod's `Release · approval gate · prod` job above G5. The release carries
+no change request: there is nothing to attach to a prod run.
 
 Deliver checks (resolve, provenance, evidence, config, and on staging/
 prod the previous environment's G3) and the Release records (release
 notes, rollback plan) run in parallel — the approver reads both. G5 then
-decides with the approval: staging's Approval Gate, or prod's G4
-(`release-approval`, then the dashboard's own decision on the change
-request) — and only then is anything committed. Admission is the G6 half
+decides with the approval — on prod the `release-approval` review, on dev
+and staging the checks alone, since there is no approval to wait for — and
+only then is anything committed. Admission is the G6 half
 that happens on the cluster: Kyverno verifies the cosign signature and
 the approved registry at pod admission, Argo runs the canary analysis,
 and the stage waits for the dashboard's mirrored G6 status before any
@@ -249,7 +256,9 @@ this one waited for approval.
   - *rollback plan*: the digest running now (or, on a redeploy, the one it
     replaced) is still signed and still in the registry. The deploy
     commit records it as `Rollback-Digest`.
-- **Approval Gates**: `staging-approval` and `release-approval`. At least
+- **Approval**: only prod has one — the `release-approval` environment
+  review requested by `Release · approval gate · prod` (dev and staging
+  deploy on their checks alone). At least
   one approval must come from someone who neither started nor re-ran this
   run, nor authored the change. "Authored the change" is the pull request
   and the commits in it, not the merge commit on main — GitHub attributes a
@@ -258,9 +267,11 @@ this one waited for approval.
   only on a re-run (`run_attempt > 1`), since a run the pipeline starts
   itself has `github-actions` as its actor. When every reviewer of the
   environment is excluded, the gate says so instead of blaming the approver.
-  G4 also needs the change request labelled `change-approved`,
-  `readiness-approved` and `uat-approved`, and the dashboard's own decision
-  on it.
+  This pipeline no longer attaches a change request to a release, so the
+  dashboard's G4 change rows for this product come from the change feed
+  (`POST /ingest/change-records`, see the dashboard's
+  `pipeline/change-management/README.md`) — its checklist shows G4
+  fail-closed until such a record exists.
   - *Single-operator teams* (one account, or two where one opens the change
     and the other merges it) can opt into the documented exception, which is
     recorded in the gate's verdict detail so the dashboard shows it verbatim:
@@ -282,61 +293,25 @@ this one waited for approval.
 
 How to release:
 
-1. Open a **Change request** issue whose change window covers the
-   release. Someone other than you adds `change-approved`.
-2. Merge to main, and tell the change request which release it is for:
-   put the merge commit's SHA (or the release run's URL) in its
-   **Release** field, or comment `/release <sha|run-url>` on it. When
-   **devsecops-pipeline**'s Control Gate passes, it starts
-   **devsecops-release** for that commit, which deploys to dev and tests
-   it there.
-3. Someone who didn't start the run or write the change approves
-   `staging-approval`. Staging is deployed and tested; the change request
-   gets a comment that UAT can start.
-4. The tester adds `uat-approved`; the Go/No-Go review adds
-   `readiness-approved`. Inside the change window, someone who didn't
-   start the run or write the change approves `release-approval`. Prod is
+1. Merge to main. When **devsecops-pipeline**'s Control Gate passes, it
+   starts **devsecops-release** for that commit, which deploys to dev and
+   tests it there.
+2. Staging follows in the same run, with no approval to wait for: dev's
+   tests and gates passed, so staging is deployed and tested the same way.
+3. Prod is next in the same run and stops at its one difference —
+   `Release · approval gate · prod` asks for a `release-approval` review.
+   Someone who didn't start the run or write the change approves, prod is
    deployed, smoke-tested and watched.
-
-Before prod, the run asks **which change request it is for** rather than
-guessing: `G4 · choose the change request (prod)` lists the open change
-requests in the run summary and waits (up to 20 minutes) for you to pick
-one — by commenting `/release <sha|run-url>` on it, or by filling its
-Release field — and only then is the `release-approval` review requested,
-so the approval is one you could already see and choose. A `/release`
-comment is the pick even if another request's Release field also names the
-release; two requests naming it is an error rather than a coin toss. This
-is what lets a change request that predates the Release field (issues are
-rendered with the form as it was when they were opened) still carry a
-release.
-
-Picking it, four ways — the first that resolves wins:
-
-- run **Actions → Pick the change request for a release → Run workflow**
-  with the request's number. That is the form-based way: leave the number
-  empty and it lists what is open, with each one's labels and link. The pick
-  is written on the change request, so every later run reads it directly;
-- comment `/release <sha|run-url>` on the change request;
-- fill in its **Release** field;
-- pass `change: <number>` to a manual run of **devsecops-release**.
-
-The request then has to carry `change-approved`, `readiness-approved` and
-`uat-approved`. The dashboard counts a label as an approval only when someone
-*other than the requester* applies it, so the tester and the Go/No-Go
-reviewer are that other person — and `uat-approved` has to come **after**
-staging's tests passed for the digest being released: a sign-off from before
-that G3 doesn't count, and the gate says so when it refuses.
 
 A run can also start at any stage (Actions → devsecops-release → Run
 workflow): `start: staging` promotes what dev runs, `start: prod` what
-staging runs (pass `change: <number>` to name the change request outright
-on a manual run). A
+staging runs. A
 push that only touches `deploy/**` or `*.md` doesn't build; to deploy an
 older published commit, use `start: dev` and `commit: <sha>`.
 
 To roll back, run with `start: <env>` and `kind: rollback`. It redeploys
 the environment's recorded `Rollback-Digest` through the same gates (for
-prod, the same change and approval) and stops there. The dashboard counts
+prod, the same approval) and stops there. The dashboard counts
 it as a rollback. When prod fails after its deploy (smoke tests, health
 watch or G6), the run starts that rollback itself; it still waits for a
 `release-approval` reviewer. For dev and staging, the feedback job prints

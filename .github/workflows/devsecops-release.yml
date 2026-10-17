@@ -13,18 +13,19 @@
 #            (notes, rollback plan) in parallel → G5 → Deploy (GitOps +
 #            G6 admission on the cluster) → Test (smoke, integration,
 #            regression, security, DAST, dependency re-check) → G3
-#     ▼ Approval Gate `staging-approval` (test results, scans, notes)
-#   staging  Deliver + Release records → G5 → Deploy (G6) → Test
-#            (smoke, e2e, regression, performance, security, DAST, TLS)
-#            → G3 → UAT ready (feeds prod's G4)
-#     ▼ G4 `release-approval` (UAT sign-off, Go/No-Go, change window)
-#   prod     Deliver + Release records (G4 CAB: `release-approval`, then
-#            the dashboard's decision on the change request) → G5 →
-#            Deploy (canary, G6 admission) → Test (read-only smoke) →
-#            Monitor (health watch) → G6 gate → a failure starts the
-#            rollback
+#   staging  the same process as dev (smoke, e2e, regression, performance,
+#            security, DAST, TLS) → G3
+#   prod     the same process as dev and staging, plus exactly one job of
+#            its own before G5: `approve-prod`, the `release-approval`
+#            environment review → Deploy (canary, G6 admission) → Test
+#            (read-only smoke) → Monitor (health watch) → G6 gate → a
+#            failure starts the rollback
 #   Operate   rollback prod (automatic, on a failure after the deploy)
-#   Feedback  summary, change-request + PR comments, rollback command
+#   Feedback  summary, PR comments, rollback command
+#
+# Dev, staging and prod are the same workflow (devsecops-stage.yml) with the
+# same gates and the same tests; only prod's approval differs, and the
+# release attaches no change request. A failed gate breaks the run there.
 #
 # Each stage passes the next the digest it deployed: staging and prod
 # refuse to run if the previous environment has moved on to a newer
@@ -34,9 +35,8 @@
 # Start one by hand at any stage (Actions → devsecops-release → Run
 # workflow): `start: staging` promotes what dev runs, `start: prod` what
 # staging runs; `kind: rollback` redeploys the start environment's previous
-# digest and stops there. prod needs the change request (input `change`,
-# or the one whose Release field names the commit), and whoever started,
-# re-ran or authored the change can't approve a stage.
+# digest and stops there. Whoever started or re-ran a run, or authored the
+# change it carries, can't approve prod (approvals.sh, four-eyes).
 #
 # Waiting at an Approval Gate holds nothing up: a newer run's deploy to the
 # same environment waits for this one's (concurrency per environment in
@@ -97,7 +97,6 @@ jobs:
       environment: dev
       kind: ${{ inputs.kind }}
       commit: ${{ inputs.commit }}
-      allow-self-approval: ${{ inputs.allow-self-approval }}
 
   staging:
     name: Staging · deploy + test (Staging)
@@ -126,7 +125,6 @@ jobs:
       environment: staging
       kind: ${{ inputs.kind }}
       expect-digest: ${{ needs.dev.outputs.digest }}
-      allow-self-approval: ${{ inputs.allow-self-approval }}
 
   prod:
     name: Production · deploy + test (Production)
@@ -153,6 +151,8 @@ jobs:
       environment: prod
       kind: ${{ inputs.kind }}
       expect-digest: ${{ needs.staging.outputs.digest }}
+      # prod's approval is the only approval in the pipeline, so this waiver
+      # only means something here.
       allow-self-approval: ${{ inputs.allow-self-approval }}
 
   rollback:
@@ -188,7 +188,8 @@ jobs:
   feedback:
     name: Feedback · monitoring, logging & feedback
     # Every run ends here, whatever happened: where the release got to,
-    # told to the people behind it (change request, pull requests) and, if
+    # told to the people behind it (the pull requests merged as this
+    # release's commit) and, if
     # a stage failed after it deployed, the rollback that undoes it. The
     # dashboard gets the same from the artifacts (gate results, deployment
     # events, release evidence) and Argo CD's notifications.
