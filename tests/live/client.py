@@ -8,14 +8,16 @@ import os
 import re
 import uuid
 
-import requests
+import httpx
 
 BASE = os.environ["BASE_URL"].rstrip("/")
 TIMEOUT = 10
 
 
 def new_session():
-    s = requests.Session()
+    # requests follows redirects by default and httpx does not; the suites
+    # rely on that, so keep it explicit.
+    s = httpx.Client(follow_redirects=True)
     # Django checks Origin (and Referer) on HTTPS POSTs.
     s.headers.update({"Origin": BASE, "Referer": BASE + "/"})
     return s
@@ -35,7 +37,7 @@ def post_login(s, user, password, next_url=None):
     if next_url is not None:
         data["next"] = next_url
     return s.post(
-        BASE + "/accounts/login/", data=data, allow_redirects=False, timeout=TIMEOUT
+        BASE + "/accounts/login/", data=data, follow_redirects=False, timeout=TIMEOUT
     )
 
 

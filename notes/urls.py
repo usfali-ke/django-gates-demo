@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import search, views
+from . import search, stats, views
 
 app_name = "notes"
 urlpatterns = [
@@ -12,4 +12,5 @@ urlpatterns = [
     path("notes/<int:pk>/export/", search.export_note, name="export"),
     path("notes/export/archive/", search.export_archive, name="export-archive"),
     path("notes/attachment/", search.attachment, name="attachment"),
+    path("notes/stats/daily/", stats.daily_counts, name="stats-daily"),
 ]
