@@ -36,8 +36,9 @@ def daily_counts(request):
             "SELECT DATE(created_at) AS day, COUNT(*)"
             " FROM notes_note"
             " WHERE owner_id = %s AND created_at >= %s"
-            " GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC",
-            [request.user.pk, cutoff],
+            " GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC"
+            " LIMIT %s",
+            [request.user.pk, cutoff, MAX_DAYS],
         )
         rows = cursor.fetchall()
 
