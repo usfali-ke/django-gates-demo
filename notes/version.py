@@ -1,3 +1,3 @@
 """Build marker bumped by each deployment-pipeline test cycle."""
 
-VERSION = "pipe-05"
+VERSION = "pipe-06"
