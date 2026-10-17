@@ -53,7 +53,10 @@ def export_archive(request):
         return HttpResponseBadRequest("name may contain only letters, digits, '-' and '_' (max 64)")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("notes.txt", "".join(n.text + "\n" for n in Note.objects.filter(owner=request.user)))
+        zf.writestr(
+            "notes.txt",
+            "".join(n.text + "\n" for n in Note.objects.filter(owner=request.user).only("text")),
+        )
     buf.seek(0)
     return FileResponse(buf, as_attachment=True, filename=f"{name}.zip", content_type="application/zip")
 

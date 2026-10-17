@@ -60,13 +60,13 @@ def test_unsafe_actions_need_post(a):
     note = create(a, unique("get-delete"))
     assert (
         a.get(
-            f"{BASE}/notes/{note['id']}/delete/", allow_redirects=False, timeout=TIMEOUT
+            f"{BASE}/notes/{note['id']}/delete/", follow_redirects=False, timeout=TIMEOUT
         ).status_code
         == 405
     )
     assert (
         a.get(
-            BASE + "/accounts/logout/", allow_redirects=False, timeout=TIMEOUT
+            BASE + "/accounts/logout/", follow_redirects=False, timeout=TIMEOUT
         ).status_code
         == 405
     )
@@ -97,7 +97,7 @@ def test_oversized_body_rejected(a):
 
 
 def test_logged_in_user_skips_login_page(a):
-    r = a.get(BASE + "/accounts/login/", allow_redirects=False, timeout=TIMEOUT)
+    r = a.get(BASE + "/accounts/login/", follow_redirects=False, timeout=TIMEOUT)
     assert r.status_code == 302 and r.headers["Location"].endswith("/notes/")
 
 

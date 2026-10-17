@@ -26,7 +26,8 @@ def test_login_sets_a_secure_session(user_a):
     r = post_login(s, *user_a)
     assert r.status_code == 302 and r.headers["Location"].endswith("/notes/")
     # Secure only if Django saw the ingress's X-Forwarded-Proto: https.
-    c = next(c for c in s.cookies if c.name == "sessionid")
+    # httpx.Cookies iterates domain strings; the jar holds Cookie objects.
+    c = next(c for c in s.cookies.jar if c.name == "sessionid")
     assert c.secure and c.has_nonstandard_attr("HttpOnly")
 
 
@@ -111,7 +112,7 @@ def test_logout_ends_session(user_b):
     r = s.post(
         BASE + "/accounts/logout/",
         data={"csrfmiddlewaretoken": token},
-        allow_redirects=False,
+        follow_redirects=False,
         timeout=TIMEOUT,
     )
     assert r.status_code == 302

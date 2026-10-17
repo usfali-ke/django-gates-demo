@@ -140,7 +140,9 @@ def test_no_user_enumeration(user_a):
 def test_cookie_flags(a):
     """A05: both cookies Secure, HttpOnly, SameSite=Lax."""
     for name in ("sessionid", "csrftoken"):
-        c = next(c for c in a.cookies if c.name == name)
+        # requests' jar iterates Cookie objects; httpx.Cookies yields domain
+        # strings, so go through the jar to keep the same assertions.
+        c = next(c for c in a.cookies.jar if c.name == name)
         assert c.secure, name
         assert c.has_nonstandard_attr("HttpOnly"), name
         assert (c.get_nonstandard_attr("SameSite") or "").lower() == "lax", name
