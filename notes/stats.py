@@ -38,7 +38,7 @@ def daily_counts(request):
             " WHERE owner_id = %s AND created_at >= %s"
             " GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC"
             " LIMIT %s",
-            [request.user.pk, cutoff, MAX_DAYS],
+            [request.user.pk, cutoff, days + 1],
         )
         rows = cursor.fetchall()
 
