@@ -13,6 +13,7 @@ class Note(models.Model):
         ordering = ["-created_at", "-id"]
         indexes = [
             models.Index(fields=["owner", "-created_at"], name="note_owner_recent_idx"),
+            models.Index(fields=["-created_at"], name="note_recent_idx"),
         ]
 
     def as_dict(self) -> dict:
