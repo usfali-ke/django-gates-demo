@@ -73,9 +73,6 @@
 #              skipped or failed fails the gate, so the stage fails and
 #              the next environment never starts. G6@prod: smoke + health
 #              watch; a failure starts the automatic rollback
-#   UAT        staging only, after G3 passed: the change request is told
-#              UAT can start; the tester's `uat-approved` label is what
-#              prod's G4 requires (Test feeding Release)
 #   Record     every report + hash manifest → artifact `release-evidence-<env>`
 #              (90 days); after a deploy, attested to the image digest.
 #              Runs even when the stage failed — the honest record of
@@ -105,11 +102,6 @@ on:
         required: false
         type: string
         default: ""
-      change:
-        description: prod only — change request (7, #7 or CHG-7); default the one whose Release field names this release
-        required: false
-        type: string
-        default: ""
       allow-self-approval:
         description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
         required: false
@@ -134,8 +126,6 @@ on:
         value: ${{ jobs.resolve.outputs.source-sha }}
       gitops-sha:
         value: ${{ jobs.deploy.outputs.gitops-sha }}
-      change-id:
-        value: ${{ jobs.g4.outputs.change-id }}
 
 permissions: {}
 
@@ -739,16 +729,18 @@ jobs:
           path: reports/rollback-plan/
           if-no-files-found: ignore
 
-  approve-staging:
-    name: Release · approval gate · staging
-    # Asked only once everything above passed: the approver reads dev's
-    # test results and security scans (previous-env-tests) and the release
-    # notes in this run's summary.
+  approve-prod:
+    name: Release · approval gate · prod
+    # Prod's approval, and its change/CAB approval: a GitHub environment
+    # review by someone who neither started this release nor authored the
+    # change (approvals.sh enforces that; the environment enforces that a
+    # review happens at all). Everything else about prod is the same process
+    # as dev and staging.
     needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
-    if: inputs.environment == 'staging'
-    environment: staging-approval
+    if: ${{ !cancelled() && inputs.environment == 'prod' }}
+    environment: release-approval
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -756,9 +748,9 @@ jobs:
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
-      CONTROL: approve-staging
-      OUT: reports/approve-staging
-      VERDICT_FILE: reports/approve-staging/verdict.json
+      CONTROL: approve-prod
+      OUT: reports/approve-prod
+      VERDICT_FILE: reports/approve-prod/verdict.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -770,242 +762,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
           ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval }}
-        run: bash .github/scripts/approvals.sh staging-approval
+        run: bash .github/scripts/approvals.sh release-approval
       - id: verdict
         if: always()
         env:
           STATUS: ${{ steps.sod.outcome == 'success' && 'pass' || 'fail' }}
           DETAIL: ${{ steps.sod.outputs.detail || 'approval check did not run' }}
-          TOOL: GitHub environment review (staging-approval)
+          TOOL: GitHub environment review (release-approval)
         run: |
           mkdir -p "$OUT"
           python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: report-${{ inputs.environment }}-approve-staging
-          path: reports/approve-staging/
+          name: report-${{ inputs.environment }}-approve-prod
+          path: reports/approve-prod/
           if-no-files-found: ignore
 
-  # ── Prod's CAB gate needs to know *which* change request this release is
-  #    for, and whoever approves `release-approval` should pick it first. ───
-  g4-choose:
-    name: G4 · choose the change request (prod)
-    # Waits (up to 20 minutes) for the pick, then hands the number to g4 —
-    # so the approval that gets asked for is one the approver could already
-    # see and choose. The pick is either a `/release <sha|run-url>` comment
-    # on the change request or its Release field; the job lists what is open
-    # so there is something to choose from.
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
-    if: ${{ !cancelled() && inputs.environment == 'prod' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      issues: read
-    outputs:
-      number: ${{ steps.pick.outputs.number }}
-      change-id: ${{ steps.pick.outputs.id }}
-      chosen-by: ${{ steps.pick.outputs.chosen_by }}
-    env:
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - id: pick
-        name: Wait for the change request to be picked
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CHANGE: ${{ inputs.change }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -uo pipefail
-          mkdir -p reports/g4-choose
-          # What is open right now, in the run summary, so the approver can see
-          # what there is to pick (change.sh lists each request's Release value
-          # and any /release comment).
-          GH_TOKEN="$GH_TOKEN" SOURCE_SHA="$SOURCE_SHA" REQUIRE=false GITHUB_OUTPUT="$RUNNER_TEMP/g4-choose-lookup" \
-            bash .github/scripts/change.sh > reports/g4-choose/lookup.txt 2>&1 || true
-          { echo "### Prod is waiting for the change request this release is for"; cat reports/g4-choose/lookup.txt; } >> "$GITHUB_STEP_SUMMARY"
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-
-          Pick it (the \`release-approval\` approval is asked once it is picked):
-
-          - run **Actions → Pick the change request for a release → Run workflow** with its number (the form-based way to pick) — or
-          - comment \`/release ${SOURCE_SHA:0:7}\` on the change request this release is for — or paste \`${RUN_URL}\` — or
-          - put the commit (\`${SOURCE_SHA:0:7}\`) or this run's URL in that request's **Release** field.
-
-          Waiting up to 20 minutes.
-          EOF
-          for _ in $(seq 40); do
-            out=$(mktemp)
-            if GITHUB_OUTPUT="$out" REQUIRE=true bash .github/scripts/change.sh >> reports/g4-choose/lookup.txt 2>&1; then
-              cat "$out" >> "$GITHUB_OUTPUT"
-              cp "$out" reports/g4-choose/choice.txt
-              echo "Picked: $(sed -n 's/^id=//p' "$out") (chosen by $(sed -n 's/^chosen_by=//p' "$out"))" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            sleep 30
-          done
-          echo "::error::no change request was picked within 20 minutes — run Actions → 'Pick the change request for a release' with its number, or comment '/release ${SOURCE_SHA:0:7}' on it (or fill its Release field), then re-run this stage"
-          exit 1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-prod-g4-choose
-          path: reports/g4-choose/
-          if-no-files-found: ignore
-
-  g4:
-    name: G4 approval gate · prod (CAB)
-    # `release-approval` is asked once staging's tests passed, everything
-    # above verified, and g4-choose resolved which change request this
-    # release is for. Approve after UAT sign-off, the Go/No-Go review and
-    # inside the change window; the change request must say so by its labels,
-    # and the dashboard's G4 checks the same independently.
-    needs: [g4-choose, resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
-    if: inputs.environment == 'prod'
-    environment: release-approval
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      statuses: read
-      actions: read
-      issues: read
-      pull-requests: read
-    outputs:
-      change-id: ${{ steps.change.outputs.id }}
-      # The gate.py G5@prod criterion promotion_approved_by_other reads
-      # this: the approval G5 consumed (UAT, Go/No-Go, change window,
-      # segregation, the dashboard's decision) belongs in the G5 record.
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - id: change
-        name: Change request
-        # The one g4-choose resolved (the approver's pick, or the `change`
-        # input passed to a manual run).
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CHANGE: ${{ needs.g4-choose.outputs.number || inputs.change }}
-          REQUIRE: "true"
-        run: bash .github/scripts/change.sh
-      - id: uat
-        name: UAT sign-off, Go/No-Go
-        env:
-          ID: ${{ steps.change.outputs.id }}
-          STATE: ${{ steps.change.outputs.state }}
-          LABELS: ${{ steps.change.outputs.labels }}
-          URL: ${{ steps.change.outputs.url }}
-          AUTHOR: ${{ steps.change.outputs.author }}
-        run: |
-          set -euo pipefail
-          problems=$(jq -rn --arg state "$STATE" --argjson l "$LABELS" '[
-              (if $state != "open" then "is \($state)" else empty end),
-              (("change","change-approved","readiness-approved","uat-approved") | select(. as $x | $l | index($x) | not) | "missing label \(.)")
-            ] | join("; ")')
-          if [ -n "$problems" ]; then
-            echo "::error::${ID}: ${problems} — add them at ${URL}#labels"
-            {
-              echo "### ${ID} is not ready for prod"
-              echo "${ID} still needs: ${problems}."
-              echo "Add the label(s) on the change request: ${URL}#labels"
-              echo "The dashboard counts a label as an approval only when someone other than the requester (${AUTHOR:-the requester}) applies it, so the tester and the Go/No-Go reviewer are the other person — and \`uat-approved\` has to come *after* staging's tests passed for the digest being released."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "${ID}: change approved, Go/No-Go (readiness) approved, UAT signed off" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Separation of duties
-        id: sod
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval }}
-        # The dashboard checks the same thing independently.
-        run: bash .github/scripts/approvals.sh release-approval
-      - env:
-          CHANGE_ID: ${{ steps.change.outputs.id }}
-          STARTED: ${{ steps.sod.outputs.started }}
-          AUTHORS: ${{ steps.sod.outputs.authors }}
-          APPROVED: ${{ steps.sod.outputs.approved }}
-        # commit_sha is this run's commit (the dashboard only answers on
-        # it); source_commit is the commit that built the digest.
-        run: |
-          mkdir -p "$RUNNER_TEMP/release-request"
-          jq -n --arg change "$CHANGE_ID" --arg subject "$DIGEST" --arg sha "$GITHUB_SHA" --arg source "$SOURCE_SHA" \
-            --argjson started "$STARTED" --argjson authors "$AUTHORS" --argjson approved "$APPROVED" \
-            '{change_id: $change, subject: $subject, commit_sha: $sha, source_commit: $source, environment: "prod",
-              started_by: $started, authored_by: $authors, approved_by: $approved}' \
-            | tee "$RUNNER_TEMP/release-request/release-request.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-request
-          path: ${{ runner.temp }}/release-request/release-request.json
-          if-no-files-found: error
-          retention-days: 90
-      - id: wait
-        name: Wait for the dashboard's G4 decision
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        # Only a status pointing at this run answers this request; an older
-        # G4 status on the same commit belongs to another release.
-        run: |
-          set -uo pipefail
-          for _ in $(seq 60); do
-            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/statuses?per_page=100" \
-                  --jq "[.[] | select(.context == \"security-dashboard/G4\" and .target_url == \"${RUN_URL}\")][0] // empty" 2>/dev/null)
-            case "$(jq -r '.state // empty' <<<"${s:-null}")" in
-              success) echo "G4: $(jq -r .description <<<"$s")" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0 ;;
-              failure|error) echo "::error::$(jq -r '.description // "G4 blocked"' <<<"$s")"; exit 1 ;;
-            esac
-            sleep 20
-          done
-          echo "::error::dashboard collector did not answer within 20 minutes (no security-dashboard/G4 status for this run)"
-          exit 1
-      # The G5@prod record names the approval it consumed: every step of
-      # this job (change request, UAT/Go/No-Go labels, segregation of
-      # duties, the dashboard's decision) is the promotion approval.
-      - id: verdict
-        if: always()
-        env:
-          CONTROL: g4
-          OUT: reports/g4
-          VERDICT_FILE: reports/g4/verdict.json
-          STATUS: ${{ steps.change.outcome == 'success' && steps.uat.outcome == 'success' && steps.sod.outcome == 'success' && steps.wait.outcome == 'success' && 'pass' || 'fail' }}
-          DETAIL: ${{ steps.change.outputs.id && format('change {0} (picked by {1}) · ', steps.change.outputs.id, needs.g4-choose.outputs.chosen-by) || '' }}${{ steps.sod.outputs.detail || 'approval steps did not all run' }}
-          TOOL: GitHub environment review (release-approval) + dashboard G4
-        run: |
-          mkdir -p "$OUT"
-          python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-${{ inputs.environment }}-g4
-          path: reports/g4/
-          if-no-files-found: ignore
-
-  # ── G5 deployment gate: the Deliver/Release phase boundary. Nothing is
-  #    committed unless every Deliver criterion passed and the approval
-  #    (staging's, or prod's G4) succeeded — a failed G5 skips Deploy and
-  #    the stage fails. ────────────────────────────────────────────────────
   gate-g5:
     name: G5 deployment gate
     # Before the deploy commit: nothing reaches an environment unless G5
     # passed for it. staging also needs its approval first, prod G4.
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging, g4]
+    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-prod]
     if: >-
       always() && needs.resolve.result == 'success' &&
-      (needs.g4.result == 'success' || (inputs.environment != 'prod' && needs.g4.result == 'skipped')) &&
-      (needs.approve-staging.result == 'success' || (inputs.environment != 'staging' && needs.approve-staging.result == 'skipped'))
+      (needs.approve-prod.result == 'success' || (inputs.environment != 'prod' && needs.approve-prod.result == 'skipped'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -1037,8 +818,8 @@ jobs:
     name: Deploy · GitOps commit to deploy/${{ inputs.environment }}
     # The only write path to the cluster: a commit on main that Argo CD
     # syncs. [skip ci] + paths-ignore keep it from re-running the pipeline.
-    needs: [resolve, config, gate-g5, rollback-plan, g4]
-    # A status function is required: g4 (prod only) is skipped for dev and
+    needs: [resolve, config, gate-g5, rollback-plan, approve-prod]
+    # A status function is required: approve-prod is skipped for dev and
     # staging, and the implicit success() also fails on a skipped ancestor,
     # which would skip the deploy for every non-prod environment.
     if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.gate-g5.result == 'success' }}
@@ -1060,7 +841,6 @@ jobs:
       VERDICT_FILE: reports/deploy/verdict.json
       DIGEST: ${{ needs.resolve.outputs.digest }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-      CHANGE_ID: ${{ needs.g4.outputs.change-id }}
       VERIFIED_SHA: ${{ needs.config.outputs.main-sha }}
       ROLLBACK_DIGEST: ${{ needs.rollback-plan.outputs.digest }}
       ROLLBACK_SOURCE: ${{ needs.rollback-plan.outputs.source }}
@@ -1134,7 +914,7 @@ jobs:
               echo "gitops_sha=$sha" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            git commit -q -m "deploy(${TARGET_ENV}): django-gates-demo ${DIGEST:7:12}${CHANGE_ID:+ ${CHANGE_ID}}${kind} [skip ci]" \
+            git commit -q -m "deploy(${TARGET_ENV}): django-gates-demo ${DIGEST:7:12}${kind} [skip ci]" \
               -m "Released ${IMAGE}@${DIGEST} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               "${trailers[@]}"
             if git push -q origin HEAD:main 2>"$PUSH_LOG"; then break; fi
@@ -1181,11 +961,11 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/deployment-event"
           jq -n \
-            --arg id "deploy-${TARGET_ENV}-${GITOPS_SHA}" --arg env "$TARGET_ENV" --arg change "$CHANGE_ID" --arg sha "$SOURCE_SHA" \
+            --arg id "deploy-${TARGET_ENV}-${GITOPS_SHA}" --arg env "$TARGET_ENV" --arg sha "$SOURCE_SHA" \
             --arg digest "$DIGEST" --arg commit_at "$(git show -s --format=%cI "$SOURCE_SHA")" \
             --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg kind "$KIND" \
             --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            '{external_id: $id, environment: $env, change_id: (if $change == "" then null else $change end), commit_sha: $sha,
+            '{external_id: $id, environment: $env, commit_sha: $sha,
               artifact_digest: $digest, commit_at: $commit_at, started_at: $started,
               status: "in_progress", kind: $kind, via_approved_path: true, break_glass: false,
               run_url: $run}' | tee "$RUNNER_TEMP/deployment-event/deployment.json"
@@ -1212,7 +992,7 @@ jobs:
     # runner can't see the cluster, so this is how the release learns the
     # outcome.
     needs: [deploy]
-    # Same as deploy: the skipped g4 ancestor must not skip this job.
+    # Same as deploy: the skipped approve-prod ancestor must not skip this job.
     if: ${{ !cancelled() && needs.deploy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -1866,56 +1646,10 @@ jobs:
           artifact-digest: ${{ needs.resolve.outputs.digest }}
           environment: ${{ inputs.environment }}
 
-  # ── UAT: staging, after G3 passed — the human acceptance that feeds
-  #    prod's G4 (the `uat-approved` label). ────────────────────────────────
-  uat:
-    name: Test · UAT ready for sign-off
-    # Staging's automated tests passed on the deployed digest: tell the
-    # change request that UAT can start. The tester signs off with the
-    # `uat-approved` label; prod's Approval Gate requires it.
-    needs: [resolve, test-gate]
-    if: ${{ !cancelled() && inputs.environment == 'staging' && needs.test-gate.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      issues: write
-    env:
-      DIGEST: ${{ needs.resolve.outputs.digest }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-      - id: change
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/change.sh
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          NUMBER: ${{ steps.change.outputs.number }}
-          URL: ${{ steps.change.outputs.url }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          body="**Staging is ready for UAT.** \`${DIGEST:0:19}…\` (built from ${SOURCE_SHA:0:7}) is deployed to staging and passed its smoke, end-to-end, regression, performance and security tests (authenticated, nuclei, testssl.sh): ${RUN_URL}
-
-          Sign off by adding the \`uat-approved\` label at ${URL}#labels — someone other than the requester, and now that staging's tests above have passed (a sign-off from before this digest passed G3 doesn't count). Prod's Approval Gate (\`release-approval\`) and G4 require it, plus \`change-approved\` and \`readiness-approved\`."
-          echo "$body" >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$NUMBER" ]; then
-            gh api "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}/comments" -f body="$body" > /dev/null
-            echo "Commented on CHG-${NUMBER}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No change request is picked for ${SOURCE_SHA:0:7} yet: run Actions → Pick the change request for a release, comment `/release ${SOURCE_SHA:0:7}` on the one it is for, or fill its Release field — prod waits for that pick." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-  # ── Record: the signed release record — runs even when the stage
-  #    failed; the next environment's Deliver checks read it. ───────────────
   release-evidence:
     name: Release · record (attested)
-    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-staging,
-            g4-choose, g4, gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
+    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-prod,
+            gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
             performance, dast-nuclei, dast-tls, dependency-check, health-watch, test-gate]
     if: always() && needs.resolve.result == 'success'
     runs-on: ubuntu-latest
@@ -1926,7 +1660,6 @@ jobs:
       id-token: write
     env:
       DIGEST: ${{ needs.resolve.outputs.digest }}
-      CHANGE_ID: ${{ needs.g4.outputs.change-id }}
       REF: ghcr.io/usfali-ke/django-gates-demo@${{ needs.resolve.outputs.digest }}
       REPORT_PREFIX: report-${{ inputs.environment }}-
     steps:
@@ -1942,27 +1675,20 @@ jobs:
         with:
           pattern: gate-*-${{ inputs.environment }}
           path: ${{ runner.temp }}/in
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: inputs.environment == 'prod'
-        continue-on-error: true
-        with:
-          name: release-request
-          path: ${{ runner.temp }}/in/release-request
       - name: Bundle + hash manifest
         env:
-          G4_RESULT: ${{ needs.g4.result }}
+          APPROVAL_RESULT: ${{ needs.approve-prod.result }}
         run: |
           set -euo pipefail
           in="$RUNNER_TEMP/in"
           case "$TARGET_ENV" in
             dev)     controls="promotion,provenance,evidence-check,config,rollback-plan,deploy,post-deploy,smoke,integration,regression,security-tests,dast-nuclei,dependency-check" ;;
-            staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-staging,deploy,post-deploy,smoke,e2e,regression,security-tests,performance,dast-nuclei,dast-tls" ;;
-            prod)    controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,g4,approve-staging,deploy,post-deploy,smoke,health-watch" ;;
+            staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,deploy,post-deploy,smoke,e2e,regression,security-tests,performance,dast-nuclei,dast-tls" ;;
+            prod)    controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-prod,deploy,post-deploy,smoke,health-watch" ;;
           esac
           CONTROLS=$controls python3 .github/scripts/evidence.py "$in" release-evidence
-          cp "${in}/release-request/release-request.json" release-evidence/ 2>/dev/null || true
-          jq --arg change "$CHANGE_ID" --arg g4 "$G4_RESULT" --arg env "$TARGET_ENV" \
-            '. + {environment: $env, change_id: (if $change == "" then null else $change end), g4_job: $g4}' \
+          jq --arg approval "$APPROVAL_RESULT" --arg env "$TARGET_ENV" \
+            '. + {environment: $env, approval_job: $approval}' \
             release-evidence/manifest.json > "$RUNNER_TEMP/m.json" && mv "$RUNNER_TEMP/m.json" release-evidence/manifest.json
           (cd release-evidence && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -62,8 +62,7 @@ CONTROLS = {
     "previous-env-tests": ("deliver", None, None),
     "release-notes": ("release", None, None),
     "rollback-plan": ("release", None, None),
-    "approve-staging": ("release", None, None),
-    "g4": ("release", None, None),
+    "approve-prod": ("release", None, None),
     "deploy": ("deploy", None, None),
     "post-deploy": ("deploy", None, None),
     # against the deployed environment

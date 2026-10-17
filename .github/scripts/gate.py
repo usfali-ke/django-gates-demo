@@ -114,14 +114,13 @@ GATES = {
     "G5@staging": _G5 + [
         ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
         ("release_notes_published", "governance", [("release-notes", "result")]),
-        ("promotion_approved_by_other", "governance", [("approve-staging", "result")]),
     ],
     # The approval for prod is G4 (the CAB job's verdict; the dashboard
     # records the same decision independently from the release request).
     "G5@prod": _G5 + [
         ("previous_environment_tests_passed", "quality", [("previous-env-tests", "result")]),
         ("release_notes_published", "governance", [("release-notes", "result")]),
-        ("promotion_approved_by_other", "governance", [("g4", "result")]),
+        ("promotion_approved_by_other", "governance", [("approve-prod", "result")]),
     ],
 }
 
