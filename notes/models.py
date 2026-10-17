@@ -11,6 +11,9 @@ class Note(models.Model):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["owner", "-created_at"], name="note_owner_recent_idx"),
+        ]
 
     def as_dict(self) -> dict:
         return {"id": self.pk, "text": self.text, "created_at": self.created_at.isoformat()}

@@ -15,6 +15,7 @@ dev = [
     "pytest>=8",
     "pytest-cov>=6",
     "pytest-django>=4.14",
+    "httpx>=0.28",
     "requests>=2.32",
     "ruff>=0.14",
 ]
