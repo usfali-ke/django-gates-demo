@@ -20,8 +20,15 @@ spec:
     - name: functional
       interval: 15s
       count: 3
+      # The canary Service's selector switches the moment the canary pod is
+      # created, so its endpoints can lag the first seconds — and a refused
+      # connection is an Error, not a failed check. Let the pod get ready
+      # before the first check, and survive a few errors (a cold image pull on
+      # prod aborted the canary on 2026-10-18 with
+      # "consecutiveErrors (2) > consecutiveErrorLimit (1): connection refused").
+      initialDelay: 30s
       failureLimit: 0
-      consecutiveErrorLimit: 1
+      consecutiveErrorLimit: 3
       successCondition: result.status == 'ok'
       provider:
         web:
