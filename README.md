@@ -57,9 +57,9 @@ new digest was just deployed to.
 ```
 Develop ──────── SAST (semgrep) · gitleaks · trufflehog · quality (ruff)
                  · unit tests + coverage · PR: reviewers · signed commits
-                 · AI security review
+                 · SAST review (Hermes Agent)
    └─ G1 merge gate (PRs, Develop → Build) ── reviewed · signed · unit
-      tests · SAST · secrets · AI review. A failed G1 skips every Build
+      tests · SAST · secrets · Hermes Agent review. A failed G1 skips every Build
       job — the pipeline does not proceed to the next phase
 Build ────────── build twice (reproducible?) · SCA · checkov · the built
                  image: trivy scan · syft SBOM · dockle · check --deploy
@@ -185,7 +185,7 @@ prod adds exactly one job, its approval gate:
 ```
 devsecops-pipeline (CI)
 Develop ────────── SAST · secrets ×2 · quality · unit tests + coverage
-                   · reviewers · signed commits · AI review
+                   · reviewers · signed commits · Hermes Agent review
    G1 merge gate (pull requests, Develop → Build)
 Build ──────────── reproducible image build · SCA · IaC · image scan · SBOM
                    · CIS (dockle) · check --deploy → push + sign + attest
