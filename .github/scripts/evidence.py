@@ -48,7 +48,7 @@ CONTROLS = {
     "iac-checkov": ("build", "checkov.json", "Checkov Scan"),
     "reviewers": ("develop", None, None),
     "commits-signed": ("develop", None, None),
-    "ai-review": ("develop", None, None),
+    "ai-review": ("develop", "hermes-findings.json", "Generic Findings Import"),
     "image-scan": ("build", "trivy.json", "Trivy Scan"),
     "sbom": ("build", "sbom.cdx.json", "CycloneDX Scan"),
     "image-compliance": ("build", "dockle.json", "Dockle Scan"),
