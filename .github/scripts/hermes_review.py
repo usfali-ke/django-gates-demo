@@ -51,6 +51,14 @@ from typing import Any, NoReturn
 MARKER = re.compile(r"Automated review by Hermes on commit ([0-9a-f]{7,40})")
 BLOCKING = {"critical", "high"}
 POLL_SECONDS = 20
+# The comment this is parsed from is only as trustworthy as HERMES_COMMENTER
+# makes it (see review_for()); these are a second, independent backstop so a
+# single comment can't inject unbounded text into DefectDojo's findings
+# table regardless of whose identity it carries. Found by Hermes reviewing
+# this file's own diff (2026-11-05): Low, CWE-74.
+MAX_FINDINGS = 50
+MAX_FIELD_CHARS = 2000
+MAX_TITLE_CHARS = 200
 
 # One finding block, written by the route prompt's OUTPUT FORMAT section
 # (hermes-route.yaml) as:
@@ -145,12 +153,19 @@ def comments(since: dt.datetime | None) -> list[dict]:
 
 
 def review_for(head: str, asked_at: dt.datetime | None) -> dict | None:
+    # HERMES_COMMENTER is required, not optional: this comment is the only
+    # thing verdict() trusts (G1's ai_security_review_clean criterion), so
+    # without an identity check anyone who can comment on the PR can post a
+    # fake "Automated review by Hermes on commit <sha> ... no blocking
+    # issues" and the control passes. Caught live by Hermes reviewing this
+    # very diff (2026-11-05): High, CWE-345. main() enforces this is set
+    # before ever reaching here.
     commenter = env("HERMES_COMMENTER")
     for c in reversed(comments(asked_at)):  # newest first
         m = MARKER.search(c.get("body") or "")
         if not m or not head.startswith(m.group(1)) and not m.group(1).startswith(head):
             continue
-        if commenter and (c.get("user") or {}).get("login") != commenter:
+        if (c.get("user") or {}).get("login") != commenter:
             continue
         created = dt.datetime.fromisoformat(c["created_at"].replace("Z", "+00:00"))
         if asked_at and created < asked_at:
@@ -170,13 +185,24 @@ def _findings_section(body: str) -> str:
     return rest[: end.start()] if end else rest
 
 
+def _clean(text: str, max_chars: int) -> str:
+    """Strip control characters (CWE-74 backstop: this text lands in a
+    JSON file DefectDojo parses) and cap length so one block can't inject
+    unbounded content into the findings record."""
+    text = "".join(ch for ch in text if ch == "\n" or ch >= " ")
+    return text[:max_chars]
+
+
 def parse_findings(body: str) -> list[dict[str, Any]]:
     """Each '### [F1] <title> (Severity: X)' block in the findings section,
     as a DefectDojo Generic Findings Import finding. A field the model
     omitted is left out rather than guessed; CWE "N/A" is dropped, not
-    coerced to a number."""
+    coerced to a number. Capped at MAX_FINDINGS blocks, each field capped
+    and control-character-stripped (see MAX_* above) — this comment's
+    trustworthiness rests entirely on HERMES_COMMENTER (review_for()), and
+    these are an independent backstop regardless of that."""
     section = _findings_section(body)
-    headers = list(FINDING_HEADER.finditer(section))
+    headers = list(FINDING_HEADER.finditer(section))[:MAX_FINDINGS]
     out: list[dict[str, Any]] = []
     today = dt.datetime.now(dt.UTC).date().isoformat()
     for i, m in enumerate(headers):
@@ -186,17 +212,17 @@ def parse_findings(body: str) -> list[dict[str, Any]]:
             fields[fm.group("label").lower()] = fm.group("value").strip()
         severity = m.group("severity").title()
         finding: dict[str, Any] = {
-            "title": f"[{m.group('id')}] {m.group('title')}",
+            "title": _clean(f"[{m.group('id')}] {m.group('title')}", MAX_TITLE_CHARS),
             "severity": severity,
-            "description": fields.get("description") or m.group("title"),
+            "description": _clean(fields.get("description") or m.group("title"), MAX_FIELD_CHARS),
             "static_finding": True,
             "dynamic_finding": False,
             "date": today,
         }
         if fields.get("mitigation"):
-            finding["mitigation"] = fields["mitigation"]
+            finding["mitigation"] = _clean(fields["mitigation"], MAX_FIELD_CHARS)
         if fields.get("impact"):
-            finding["impact"] = fields["impact"]
+            finding["impact"] = _clean(fields["impact"], MAX_FIELD_CHARS)
         cwe = fields.get("cwe", "")
         cwe_digits = re.search(r"\d+", cwe)
         if cwe_digits and cwe.strip().upper() != "N/A":
@@ -204,10 +230,10 @@ def parse_findings(body: str) -> list[dict[str, Any]]:
         loc = fields.get("location", "")
         fl = FILE_LINE.match(loc)
         if fl:
-            finding["file_path"] = fl.group("path")
+            finding["file_path"] = _clean(fl.group("path"), MAX_TITLE_CHARS)
             finding["line"] = int(fl.group("line"))
         elif loc and loc.strip().upper() != "N/A":
-            finding["file_path"] = loc
+            finding["file_path"] = _clean(loc, MAX_TITLE_CHARS)
         out.append(finding)
     return out
 
@@ -251,6 +277,10 @@ def verdict(comment: dict) -> None:
 
 
 def main() -> None:
+    if not env("HERMES_COMMENTER"):
+        finish("fail", "HERMES_COMMENTER is not set for this repository — without it any PR comment matching "
+                       "the marker text would be trusted as Hermes's own verdict. Set the repo variable to the "
+                       "GitHub login Hermes's gh is authenticated as on the gateway host.")
     head = env("HEAD_SHA")
     event_name = env("GITHUB_EVENT_NAME")
     asked_at = None
