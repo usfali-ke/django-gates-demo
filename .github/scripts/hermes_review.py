@@ -5,7 +5,6 @@ import hmac
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.error
@@ -45,9 +44,6 @@ VERDICT_FILE = Path(
     )
 )
 
-GH_BIN = "gh"
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -58,30 +54,57 @@ def log(message: str) -> None:
 
 def run_gh(*args: str, timeout: int = 120) -> str:
     """
-    Execute a read-only GitHub CLI command using the workflow's GITHUB_TOKEN.
+    Read-only GitHub access using the workflow's GITHUB_TOKEN over the REST
+    API (stdlib only). The self-hosted lab-runner has no `gh` binary, so this
+    implements the three invocations this script needs, with `gh`'s argument
+    shapes:
+
+      pr diff <n> --repo <owner/repo>               -> unified diff
+      pr diff <n> --repo <owner/repo> --name-only   -> changed file names
+      api <path>                                    -> raw JSON body
     """
 
-    env = os.environ.copy()
-    env["GH_TOKEN"] = GH_TOKEN
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    accept = "application/vnd.github+json"
 
-    result = subprocess.run(
-        [GH_BIN, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        timeout=timeout,
-        check=False,
-    )
+    if args[:2] == ("pr", "diff"):
+        number, repo = args[2], args[args.index("--repo") + 1]
+        if "--name-only" in args:
+            names: list[str] = []
+            page = 1
+            while True:
+                chunk = json.loads(_gh_http(
+                    f"{api}/repos/{repo}/pulls/{number}/files?per_page=100&page={page}",
+                    accept, timeout))
+                names.extend(f["filename"] for f in chunk)
+                if len(chunk) < 100 or page >= 30:
+                    break
+                page += 1
+            return "\n".join(names) + ("\n" if names else "")
+        return _gh_http(f"{api}/repos/{repo}/pulls/{number}",
+                        "application/vnd.github.diff", timeout)
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gh {' '.join(args)} failed "
-            f"(exit={result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
+    if args[:1] == ("api",) and len(args) == 2:
+        return _gh_http(f"{api}/{args[1].lstrip('/')}", accept, timeout)
 
-    return result.stdout
+    raise RuntimeError(f"unsupported GitHub request: {' '.join(args)}")
+
+
+def _gh_http(url: str, accept: str, timeout: int) -> str:
+    request = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "hermes-review",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"GitHub API {exc.code} for {url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GitHub API unreachable ({url}): {exc}") from exc
 
 
 def write_output(name: str, value: str) -> None:
