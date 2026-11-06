@@ -60,6 +60,11 @@ FILE_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^dockle\.json$"), "Dockle Scan"),
     (re.compile(r"^bandit\.json$"), "Bandit Scan"),
     (re.compile(r"^zap[-\w]*\.xml$"), "ZAP Scan"),
+    # Hermes AI security review (ai-review job, hermes_review.py): one
+    # DefectDojo-shaped finding per '### [Fn] ... (Severity: X)' block of its
+    # PR comment — title, description, severity, CWE, file/line, mitigation
+    # and impact already filled in, so no tool-specific parser is needed.
+    (re.compile(r"^hermes-findings\.json$"), "Generic Findings Import"),
 ]
 # Recognised but not importable as-is: say so instead of failing silently.
 UNSUPPORTED = {
