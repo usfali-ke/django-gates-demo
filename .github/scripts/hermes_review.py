@@ -512,18 +512,52 @@ CVSS_FIELD = re.compile(
     r"VC:[HLN]/VI:[HLN]/VA:[HLN]/SC:[HLN]/SI:[HLN]/SA:[HLN])\s*(?:\(?\s*(?P<score>\d{1,2}(?:\.\d)?)\s*\)?)?",
 )
 SCORE_BY_SEVERITY = {"Critical": 9.5, "High": 8.0, "Medium": 5.5, "Low": 3.0}  # SARIF fallback only
+RANK = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
+
+
+def band(score: float) -> str:
+    return "Critical" if score >= 9.0 else "High" if score >= 7.0 else "Medium" if score >= 4.0 else "Low"
 
 
 def assess_finding(finding: dict) -> None:
-    """Hermes decides the severity: the `(Severity: X)` label in the heading is
-    final and is reported as written. This only reads the supporting fields
-    (CVSS v4.0 vector and the score Hermes stated) so they can be carried to
-    DefectDojo and the report; nothing is recalculated, corrected or rejected."""
+    """Hermes assigns the severity: the `(Severity: X)` heading label is what is
+    reported. Because that comment is model output produced from untrusted PR
+    content, three cheap integrity checks run on it (none recalculates CVSS):
+
+      * the CVSS v4.0 vector and the score Hermes stated must be present and
+        well-formed, otherwise the finding is flagged;
+      * a label BELOW the band of Hermes's own stated score is flagged, and when
+        that band is Critical/High (the blocking levels) the severity is raised
+        to it, i.e. an inconsistency can only ever make the gate stricter;
+      * flags travel with the finding into the report, DefectDojo and the job
+        summary, so a downgrade is visible to a human instead of silent."""
 
     match = CVSS_FIELD.match(finding["cvss"].strip())
     finding["cvss_vector"] = match.group("vector") if match else ""
     finding["cvss_score"] = float(match.group("score")) if match and match.group("score") else None
     finding["unconfirmed"] = finding["evidence"].strip().lower().startswith("not confirmed")
+    finding["hermes_label"] = finding["severity"]
+    flags = []
+
+    if not finding["cvss_vector"]:
+        flags.append("CVSS v4.0 vector missing or malformed")
+    if finding["cvss_score"] is None:
+        flags.append("CVSS score not stated")
+    elif not 0.0 < finding["cvss_score"] <= 10.0:
+        flags.append(f"stated CVSS score {finding['cvss_score']} out of range")
+        finding["cvss_score"] = None
+    if not finding["evidence"].strip():
+        flags.append("Evidence missing")
+
+    if finding["cvss_score"] is not None:
+        stated = band(finding["cvss_score"])
+        if RANK[stated] > RANK[finding["severity"]]:
+            if stated in ("Critical", "High"):
+                flags.append(f"labelled {finding['severity']} but its own score {finding['cvss_score']} is {stated}: raised to {stated}")
+                finding["severity"] = stated
+            else:
+                flags.append(f"labelled {finding['severity']} but its own score {finding['cvss_score']} is {stated} (flag only)")
+    finding["flags"] = flags
 
 
 def parse_review(comment: dict) -> dict:
@@ -550,6 +584,12 @@ def parse_review(comment: dict) -> dict:
                 "severity_counts": counts, "findings": findings,
                 "detail": f"comment declares {declared.group(1)} finding(s) but {len(findings)} were parsed — "
                           "comment format changed; refusing to pass"}
+
+    if findings and not any(f["cvss_vector"] and f["cvss_score"] is not None for f in findings):
+        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+                "severity_counts": counts, "findings": findings,
+                "detail": f"none of the {len(findings)} finding(s) carries a valid CVSS v4.0 vector and score: "
+                          "the review did not follow the severity method; refusing to pass"}
 
     for finding in findings:
         counts[finding["severity"]] += 1
@@ -599,7 +639,8 @@ def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
             f"{'CWE-' + str(finding['cwe']) if finding['cwe'] else 'CWE: n/a'}",
             f"**Severity basis:** {basis}, vector `{finding['cvss_vector'] or finding['cvss'] or 'not stated'}`. "
             f"Business adjustment: {finding['business_adjustment'] or 'none'}. "
-            f"Severity: {finding['severity']} (assigned by Hermes).",
+            f"Severity: {finding['severity']} (assigned by Hermes)."
+            + (f" Integrity flags: {'; '.join(finding['flags'])}." if finding["flags"] else ""),
             f"**Exploitability evidence:** {finding['evidence']}",
             f"**Business context:** {finding['business_context']}",
             finding["description"],
@@ -625,6 +666,7 @@ def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
             "unique_id_from_tool": "hermes-" + hashlib.sha256(identity.encode()).hexdigest()[:24],
             "tags": ["ai-sast", "hermes", f"pr-{PR_NUMBER}"]
                     + (["unconfirmed"] if finding.get("unconfirmed") else [])
+                    + (["severity-flagged"] if finding["flags"] else [])
                     + ([re.sub(r"[^a-z0-9]+", "-", finding["owasp"].split()[0].lower()).strip("-")]
                        if finding["owasp"] and finding["owasp"].upper() != "N/A" else []),
             "cvssv4": finding["cvss_vector"],
@@ -710,7 +752,8 @@ def build_markdown_report(assessment: dict, comment: dict, context: dict) -> str
             f"- **OWASP:** {finding['owasp'] or 'n/a'}  **CWE:** {finding['cwe'] or 'n/a'}",
             f"- **Location:** `{_location(finding)}`",
             f"- **CVSS v4.0:** {finding['cvss_score'] if finding['cvss_score'] is not None else 'score not stated'} `{finding['cvss_vector'] or finding['cvss'] or 'not stated'}`",
-            f"- **Severity:** {finding['severity']} (assigned by Hermes)",
+            f"- **Severity:** {finding['severity']} (assigned by Hermes)"
+            + (f" — **flags:** {'; '.join(finding['flags'])}" if finding["flags"] else ""),
             f"- **Exploitability evidence:** {finding['evidence']}",
             f"- **Business context:** {finding['business_context']}",
             f"- **Business adjustment:** {finding['business_adjustment']}",
@@ -785,6 +828,11 @@ def main() -> None:
     if not HERMES_SECRET:
         fail_review("HERMES_SECRET is not set.")
 
+    if not HERMES_COMMENTER:
+        # The verdict is read from a PR comment; without a pinned author, anyone
+        # who can comment could post a fake "Automated review by Hermes".
+        fail_review("HERMES_COMMENTER is not set: refusing to trust an unauthenticated review comment.")
+
     try:
         event, payload_bytes = build_payload()
 
@@ -827,6 +875,9 @@ def main() -> None:
 
         counts = assessment["severity_counts"]
         summary = ", ".join(f"{counts[s]} {s}" for s in SEVERITY_ORDER if counts[s]) or "no findings"
+        flagged = [f["id"] for f in assessment["findings"] if f["flags"]]
+        if flagged:
+            summary += f" ({len(flagged)} flagged: {', '.join(flagged)}, see hermes-report.md)"
         link = comment.get("html_url") or ""
         log(f"Review completed: result={assessment['result']} blocking_findings={assessment['blocking_findings']}")
 
