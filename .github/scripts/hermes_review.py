@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import datetime as dt
 import hashlib
 import hmac
 import json
@@ -279,7 +280,14 @@ def send_to_hermes(payload_bytes: bytes) -> None:
     run_id = os.environ.get("GITHUB_RUN_ID", "unknown")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
 
-    delivery = f"gha-{run_id}-{run_attempt}"
+    # The gateway de-duplicates on this id for an hour (a repeat gets HTTP 200
+    # {"status": "duplicate"} and no second agent run). It identifies the REVIEW
+    # being asked for, not the workflow run: a pull_request run and the
+    # pull_request_review run that cancels it are two runs for one commit, and
+    # keying on the run id made Hermes review, and comment, twice. The attempt
+    # number keeps a deliberate re-run of the same commit a fresh request.
+    repo_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", REPOSITORY)
+    delivery = f"gha-{repo_slug}-pr{PR_NUMBER}-{HEAD_SHA[:12]}-a{run_attempt}"
 
     request = urllib.request.Request(
         _http_url(HERMES_URL),
@@ -295,6 +303,8 @@ def send_to_hermes(payload_bytes: bytes) -> None:
     )
 
     log(f"Sending signed review payload to Hermes ({delivery})")
+    global SENT_AT
+    SENT_AT = dt.datetime.now(dt.timezone.utc)
 
     try:
         with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected -- scheme checked by _http_url
@@ -315,6 +325,13 @@ def send_to_hermes(payload_bytes: bytes) -> None:
                 log(
                     f"Hermes response: "
                     f"{response_body[:500]}"
+                )
+
+            if '"duplicate"' in response_body:
+                log(
+                    "Hermes already has a review requested for this commit "
+                    "(another run asked first); waiting for that review instead "
+                    "of asking again"
                 )
 
     except urllib.error.HTTPError as exc:
@@ -352,8 +369,23 @@ def get_comments() -> list:
     return parsed
 
 
+SENT_AT: "dt.datetime | None" = None  # when this run asked Hermes (set by send_to_hermes)
+
+
 def matching_comment(comment: dict) -> bool:
     body = comment.get("body") or ""
+
+    # A first attempt may share the review another run for this commit already
+    # asked for, so any comment for the commit counts. A deliberate re-run
+    # (attempt > 1) asked for a NEW review: only a comment posted after the
+    # request is that review, never the one from before.
+    if SENT_AT and os.environ.get("GITHUB_RUN_ATTEMPT", "1") != "1":
+        try:
+            created = dt.datetime.fromisoformat(str(comment.get("created_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if created < SENT_AT - dt.timedelta(seconds=5):
+            return False
 
     user = (
         comment.get("user") or {}
