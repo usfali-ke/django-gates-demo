@@ -507,7 +507,7 @@ EVIDENCE_REF = re.compile(r"[\w./-]+\.\w+:\d+")
 RAISED = re.compile(r"^\W*raised(?:\s+one\s+level)?\s*[-\u2013\u2014:]*\s*(?P<why>.*)$", re.IGNORECASE)
 
 
-def assess_finding(finding: dict) -> None:
+def assess_finding(finding: dict, changed_files: frozenset = frozenset()) -> None:
     """Severity is derived, not trusted. The label Hermes wrote is kept as
     `hermes_label`; the effective severity follows from the evidence rules:
 
@@ -525,8 +525,12 @@ def assess_finding(finding: dict) -> None:
     finding["unconfirmed"] = False
 
     evidence = finding["evidence"].strip()
-    if len(evidence) < 20 or not EVIDENCE_REF.search(evidence):
+    refs = [m.rsplit(":", 1)[0] for m in EVIDENCE_REF.findall(evidence)]
+    if len(evidence) < 20 or not refs:
         problems.append("Evidence missing or has no file:line references")
+    elif changed_files and not any(r == c or c.endswith("/" + r) or r.endswith("/" + c)
+                                   for r in refs for c in changed_files):
+        problems.append("Evidence cites no file changed in this PR")
     finding["unconfirmed"] = evidence.lower().startswith("not confirmed")
 
     try:
@@ -570,7 +574,7 @@ def assess_finding(finding: dict) -> None:
     finding["notes"] = notes
 
 
-def parse_review(comment: dict) -> dict:
+def parse_review(comment: dict, changed_files: frozenset = frozenset()) -> dict:
     """Verdict inputs from the comment. Fails closed: a comment whose own
     'N finding(s)' header disagrees with the blocks parsed is an error, so a
     format drift can never again turn nine findings into a clean pass."""
@@ -586,7 +590,7 @@ def parse_review(comment: dict) -> dict:
 
     findings = parse_findings(body)
     for finding in findings:
-        assess_finding(finding)
+        assess_finding(finding, changed_files)
 
     declared = COUNT_HEADER.match(first)
     if declared and int(declared.group(1)) != len(findings):
@@ -615,7 +619,7 @@ def parse_review(comment: dict) -> dict:
 # Reports: DefectDojo Generic Findings Import, SARIF, markdown
 # ---------------------------------------------------------------------------
 
-SARIF_LEVEL_BY_SEVERITY = {"Critical": "critical", "High": "high", "Medium": "warning", "Low": "note"}
+SARIF_LEVEL_BY_SEVERITY = {"Critical": "error", "High": "error", "Medium": "warning", "Low": "note"}  # SARIF 2.1.0 levels; the CVSS score rides in security-severity
 
 
 def _location(finding: dict) -> str:
@@ -639,7 +643,8 @@ def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
         references.append(comment_url)
 
     out = []
-    for finding in findings:
+    seen_keys: dict = {}
+    for finding in sorted(findings, key=lambda f: (f["file"], f["line"] or 0, f["id"])):
         basis = (f"CVSS v4.0 base score {finding['cvss_score']} ({finding['cvss_band']})"
                  if finding["cvss_score"] is not None else "CVSS v4.0 not computed")
         parts = [
@@ -658,7 +663,11 @@ def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
             finding["description"],
         ]
         description = "\n\n".join(parts)
-        identity = "|".join([REPOSITORY, finding["file"], str(finding["cwe"] or ""), finding["title"].lower()])
+        # Identity ignores the free-text title (a reworded re-review must reimport, not duplicate);
+        # two findings of one class in one file are told apart by their order in the file.
+        key = (finding["file"], finding["cwe"], finding["owasp"].split(" ")[0].upper())
+        seen_keys[key] = seen_keys.get(key, 0) + 1
+        identity = "|".join([REPOSITORY, finding["file"], str(finding["cwe"] or ""), key[2], str(seen_keys[key])])
         item = {
             "title": f"[{finding['id']}] {finding['title']}"[:MAX_TITLE_CHARS],
             "severity": finding["severity"],
@@ -851,7 +860,8 @@ def main() -> None:
 
         comment = wait_for_review_comment()
 
-        assessment = parse_review(comment)
+        changed = frozenset(line.strip() for line in str(context.get("changed_files", "")).splitlines() if line.strip())
+        assessment = parse_review(comment, changed)
 
         written = write_reports(assessment, comment, context)
         log(f"Reports written to {OUT}: {', '.join(written)} "
