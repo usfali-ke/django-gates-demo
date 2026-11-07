@@ -8,8 +8,12 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cvss4  # noqa: E402  (CVSS v4.0 base score, same directory)
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +56,14 @@ def log(message: str) -> None:
     print(f"[hermes-review] {message}", flush=True)
 
 
+def _http_url(url: str) -> str:
+    """Only http(s) URLs are ever opened: a file:, ftp: or data: URL is refused
+    before it reaches urllib (the dynamic-urllib-use-detected concern)."""
+    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+        raise RuntimeError(f"refusing non-HTTP(S) URL: {url!r}")
+    return url
+
+
 def run_gh(*args: str, timeout: int = 120) -> str:
     """
     Read-only GitHub access using the workflow's GITHUB_TOKEN over the REST
@@ -91,14 +103,14 @@ def run_gh(*args: str, timeout: int = 120) -> str:
 
 
 def _gh_http(url: str, accept: str, timeout: int) -> str:
-    request = urllib.request.Request(url, headers={
+    request = urllib.request.Request(_http_url(url), headers={
         "Authorization": f"Bearer {GH_TOKEN}",
         "Accept": accept,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "hermes-review",
     })
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep: dynamic-urllib-use-detected -- scheme checked by _http_url
             return response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -138,7 +150,7 @@ def fail_review(reason: str) -> None:
     }
 
     write_verdict(verdict)
-    write_output("result", "error")
+    write_output("result", json.dumps({"status": "fail", "detail": reason[:500], "metrics": {}}))
 
     raise SystemExit(1)
 
@@ -233,6 +245,13 @@ def load_event() -> dict:
 def build_payload() -> tuple[dict, bytes]:
     event = load_event()
 
+    # pull_request_review events carry the PR only under `pull_request`, but the
+    # Hermes route addresses its comment with {number}: without this top-level
+    # field the gateway reviews the diff and then cannot deliver the result
+    # ("invalid pr_number: '{number}'").
+    if PR_NUMBER.isdigit():
+        event.setdefault("number", int(PR_NUMBER))
+
     context = retrieve_pr_context()
 
     event["hermes_context"] = context
@@ -265,7 +284,7 @@ def send_to_hermes(payload_bytes: bytes) -> None:
     delivery = f"gha-{run_id}-{run_attempt}"
 
     request = urllib.request.Request(
-        HERMES_URL,
+        _http_url(HERMES_URL),
         data=payload_bytes,
         method="POST",
         headers={
@@ -280,7 +299,7 @@ def send_to_hermes(payload_bytes: bytes) -> None:
     log(f"Sending signed review payload to Hermes ({delivery})")
 
     try:
-        with urllib.request.urlopen(
+        with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected -- scheme checked by _http_url
             request,
             timeout=60,
         ) as response:
@@ -390,177 +409,425 @@ def wait_for_review_comment() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Parse security result
+# Parse the review comment
 # ---------------------------------------------------------------------------
+# The PR comment format is owned by the route prompt (hermes-route.yaml) and
+# is deliberately unchanged:
+#   Security review: <N> finding(s)
+#   ## Security findings
+#   ### [F1] <title> (Severity: Critical)
+#   - CWE: 89
+#   - Location: path/to/file.py:42
+#   - Description: ...
+#   - Impact: ...
+#   - Mitigation: ...
+# followed by "## Schema / database changes", "## Dependency / library
+# changes" and "## Other notes". Everything below is derived from it.
 
-SEVERITY_RE = re.compile(
-    r"^\|\s*"
-    r"(Critical|High|Medium|Low)"
-    r"\s*\|",
+BLOCKING = {"critical", "high"}
+MAX_FINDINGS = 50
+MAX_FIELD_CHARS = 2000
+MAX_TITLE_CHARS = 200
+
+FINDING_HEADER = re.compile(
+    r"^###\s*\[(?P<id>F\d+)\]\s*(?P<title>.+?)\s*"
+    r"\(Severity:\s*(?P<severity>Critical|High|Medium|Low)\)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
-
-
-def parse_review(comment: dict) -> dict:
-    body = comment.get("body") or ""
-
-    first_line = (
-        body.strip().splitlines()[0]
-        if body.strip()
-        else ""
-    )
-
-    if first_line.strip().lower() == \
-            "security review: not completed":
-
-        return {
-            "status": "not_completed",
-            "result": "error",
-            "blocking_findings": 0,
-            "severity_counts": {},
-        }
-
-    severity_counts = {
-        "Critical": 0,
-        "High": 0,
-        "Medium": 0,
-        "Low": 0,
-    }
-
-    for match in SEVERITY_RE.finditer(body):
-        severity = match.group(1).capitalize()
-        severity_counts[severity] += 1
-
-    blocking = (
-        severity_counts["Critical"]
-        + severity_counts["High"]
-    )
-
-    result = "fail" if blocking else "pass"
-
-    return {
-        "status": "completed",
-        "result": result,
-        "blocking_findings": blocking,
-        "severity_counts": severity_counts,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Parse the findings table (per-finding detail for ai-review.sarif)
-# ---------------------------------------------------------------------------
-
-FINDING_ROW_RE = re.compile(
-    r"^\|\s*(Critical|High|Medium|Low)\s*\|"
-    r"\s*([^|]+?)\s*\|"
-    r"\s*([^|]*?)\s*\|"
-    r"\s*([^|]*?)\s*\|\s*$",
+FIELD_LINE = re.compile(
+    r"^-\s*(?P<label>OWASP|CWE|Location|CVSS|Evidence|Business context|Business adjustment|Description|Impact|Mitigation)\s*:\s*(?P<value>.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
+FILE_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:-\d+)?$")
+SECTION_END = re.compile(r"^(---\s*$|##\s)", re.MULTILINE)
+COUNT_HEADER = re.compile(r"^Security review:\s*(\d+)\s+finding", re.IGNORECASE)
+NOT_COMPLETED = re.compile(r"^Security review:\s*not completed", re.IGNORECASE)
+SEVERITY_ORDER = ["Critical", "High", "Medium", "Low"]
+
+
+def _clean(text: str, max_chars: int) -> str:
+    """Strip control characters and cap the length: this text lands in JSON
+    that DefectDojo imports, so one comment can't inject unbounded content."""
+    return "".join(ch for ch in text if ch == "\n" or ch >= " ")[:max_chars]
+
+
+def _section(body: str, heading: str) -> str:
+    start = body.find(heading)
+    if start == -1:
+        return ""
+    rest = body[start + len(heading):]
+    end = SECTION_END.search(rest)
+    return rest[: end.start()] if end else rest
 
 
 def parse_findings(body: str) -> list[dict]:
-    """The security-findings table of the review comment as per-finding
-    dicts (severity, file, line, issue, fix)."""
+    """One dict per '### [Fn] title (Severity: X)' block of the findings
+    section. A field the model omitted is left out, never guessed."""
 
+    section = _section(body, "## Security findings")
+    headers = list(FINDING_HEADER.finditer(section))[:MAX_FINDINGS]
     findings = []
 
-    for match in FINDING_ROW_RE.finditer(body):
-        severity = match.group(1).capitalize()
-        location = match.group(2).strip()
+    for i, match in enumerate(headers):
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(section)
+        fields = {
+            f.group("label").lower(): f.group("value").strip()
+            for f in FIELD_LINE.finditer(section[match.end():end])
+        }
 
-        file, sep, line = location.rpartition(":")
-        if sep and line.isdigit():
-            file = file.strip() or location
-            line = int(line)
-        else:
-            file, line = location, None
+        finding = {
+            "id": match.group("id").upper(),
+            "title": _clean(match.group("title").strip(), MAX_TITLE_CHARS),
+            "severity": match.group("severity").title(),
+            "owasp": _clean(fields.get("owasp", ""), MAX_TITLE_CHARS),
+            "cvss": fields.get("cvss", "").split()[0] if fields.get("cvss", "").strip() else "",
+            "evidence": _clean(fields.get("evidence", ""), MAX_FIELD_CHARS),
+            "business_context": _clean(fields.get("business context", ""), MAX_FIELD_CHARS),
+            "business_adjustment": _clean(fields.get("business adjustment", ""), MAX_FIELD_CHARS),
+            "cwe": None,
+            "file": "",
+            "line": None,
+            "description": _clean(fields.get("description") or match.group("title"), MAX_FIELD_CHARS),
+            "impact": _clean(fields.get("impact", ""), MAX_FIELD_CHARS),
+            "mitigation": _clean(fields.get("mitigation", ""), MAX_FIELD_CHARS),
+        }
 
-        findings.append({
-            "severity": severity,
-            "file": file,
-            "line": line,
-            "issue": match.group(3).strip(),
-            "fix": match.group(4).strip(),
-        })
+        cwe = re.search(r"\d+", fields.get("cwe", ""))
+        if cwe:
+            finding["cwe"] = int(cwe.group())
+
+        location = fields.get("location", "")
+        loc = FILE_LINE.match(location)
+        if loc:
+            finding["file"] = _clean(loc.group("path"), MAX_TITLE_CHARS)
+            finding["line"] = int(loc.group("line"))
+        elif location and location.upper() != "N/A":
+            finding["file"] = _clean(location, MAX_TITLE_CHARS)
+
+        findings.append(finding)
 
     return findings
 
 
-SARIF_LEVEL_BY_SEVERITY = {
-    "Critical": "critical",
-    "High": "high",
-    "Medium": "warning",
-    "Low": "note",
-}
+LEVELS_UP = {"Low": "Medium", "Medium": "High", "High": "Critical", "Critical": "Critical"}
+EVIDENCE_REF = re.compile(r"[\w./-]+\.\w+:\d+")
+RAISED = re.compile(r"^\W*raised(?:\s+one\s+level)?\s*[-\u2013\u2014:]*\s*(?P<why>.*)$", re.IGNORECASE)
+
+
+def assess_finding(finding: dict, changed_files: frozenset = frozenset()) -> None:
+    """Severity is derived, not trusted. The label Hermes wrote is kept as
+    `hermes_label`; the effective severity follows from the evidence rules:
+
+      CVSS v4.0 base score of Hermes's vector (computed here, any score it
+      wrote is ignored) -> band; raised one level only by a reasoned business
+      adjustment; capped at Low when the exploit path was 'not confirmed'.
+
+    Anything that makes that derivation impossible is recorded in
+    finding['problems'] and fails the control closed (see parse_review)."""
+
+    problems, notes = [], []
+    finding["hermes_label"] = finding["severity"]
+    finding["cvss_score"] = None
+    finding["cvss_band"] = ""
+    finding["unconfirmed"] = False
+
+    evidence = finding["evidence"].strip()
+    refs = [m.rsplit(":", 1)[0] for m in EVIDENCE_REF.findall(evidence)]
+    if len(evidence) < 20 or not refs:
+        problems.append("Evidence missing or has no file:line references")
+    elif changed_files and not any(r == c or c.endswith("/" + r) or r.endswith("/" + c)
+                                   for r in refs for c in changed_files):
+        problems.append("Evidence cites no file changed in this PR")
+    finding["unconfirmed"] = evidence.lower().startswith("not confirmed")
+
+    try:
+        finding["cvss_score"] = cvss4.score(finding["cvss"])
+        finding["cvss_band"] = cvss4.severity(finding["cvss_score"])
+    except ValueError as exc:
+        problems.append(f"CVSS v4.0 vector invalid ({exc})")
+    if finding["cvss_band"] == "None":
+        problems.append("CVSS vector has no impact (score 0.0); not a reportable finding")
+
+    if not finding["business_context"].strip():
+        problems.append("Business context missing")
+
+    adjustment = finding["business_adjustment"].strip()
+    raised = RAISED.match(adjustment)
+    if raised:
+        if len(raised.group("why").strip()) < 15:
+            problems.append("Business adjustment 'raised' has no reason")
+    elif adjustment.lower().strip(" .\"'") != "none":
+        problems.append("Business adjustment must be 'none' or 'raised one level - <reason>'")
+
+    if problems:
+        finding["problems"] = problems
+        finding["severity"] = finding["hermes_label"]
+        finding["notes"] = []
+        return
+
+    effective = finding["cvss_band"]
+    if raised:
+        raised_to = LEVELS_UP[effective]
+        if raised_to != effective:
+            notes.append(f"business context raised {effective} to {raised_to}")
+        effective = raised_to
+    if finding["unconfirmed"] and effective != "Low":
+        notes.append(f"exploit path not confirmed, capped at Low (would be {effective})")
+        effective = "Low"
+    if effective != finding["hermes_label"]:
+        notes.append(f"Hermes labelled it {finding['hermes_label']}")
+    finding["severity"] = effective
+    finding["problems"] = []
+    finding["notes"] = notes
+
+
+def parse_review(comment: dict, changed_files: frozenset = frozenset()) -> dict:
+    """Verdict inputs from the comment. Fails closed: a comment whose own
+    'N finding(s)' header disagrees with the blocks parsed is an error, so a
+    format drift can never again turn nine findings into a clean pass."""
+
+    body = comment.get("body") or ""
+    first = body.strip().splitlines()[0].strip() if body.strip() else ""
+    counts = {s: 0 for s in SEVERITY_ORDER}
+
+    if NOT_COMPLETED.match(first):
+        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+                "severity_counts": counts, "findings": [],
+                "detail": "Hermes could not complete the review (no diff to review)"}
+
+    findings = parse_findings(body)
+    for finding in findings:
+        assess_finding(finding, changed_files)
+
+    declared = COUNT_HEADER.match(first)
+    if declared and int(declared.group(1)) != len(findings):
+        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+                "severity_counts": counts, "findings": findings,
+                "detail": f"comment declares {declared.group(1)} finding(s) but {len(findings)} were parsed — "
+                          "comment format changed; refusing to pass"}
+
+    incomplete = [f for f in findings if f["problems"]]
+    if incomplete:
+        shown = "; ".join(f"[{f['id']}] {', '.join(f['problems'])}" for f in incomplete[:3])
+        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+                "severity_counts": counts, "findings": findings,
+                "detail": f"severity cannot be established for {len(incomplete)} finding(s): {shown}. "
+                          "Re-run the review; a finding without evidence and a valid CVSS v4.0 vector is not rated"}
+
+    for finding in findings:
+        counts[finding["severity"]] += 1
+    blocking = counts["Critical"] + counts["High"]
+    return {"status": "completed", "result": "fail" if blocking else "pass",
+            "blocking_findings": blocking, "severity_counts": counts,
+            "findings": findings, "detail": ""}
+
+
+# ---------------------------------------------------------------------------
+# Reports: DefectDojo Generic Findings Import, SARIF, markdown
+# ---------------------------------------------------------------------------
+
+SARIF_LEVEL_BY_SEVERITY = {"Critical": "error", "High": "error", "Medium": "warning", "Low": "note"}  # SARIF 2.1.0 levels; the CVSS score rides in security-severity
+
+
+def _location(finding: dict) -> str:
+    if not finding["file"]:
+        return "not stated"
+    return f"{finding['file']}:{finding['line']}" if finding["line"] else finding["file"]
+
+
+def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
+    """DefectDojo 'Generic Findings Import' JSON, filled in like the AI
+    SAST/DAST sample (test 17): bracketed source id in the title, structured
+    description, mitigation, impact, references, CWE, file and line, the
+    static_finding flag for SAST classification, and a stable
+    unique_id_from_tool so a re-run on a newer commit reimports (closing what
+    was fixed) instead of duplicating."""
+
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    pr_url = f"https://github.com/{REPOSITORY}/pull/{PR_NUMBER}"
+    references = [f"Hermes AI security review of {REPOSITORY}#{PR_NUMBER} at commit {HEAD_SHA}", pr_url]
+    if comment_url:
+        references.append(comment_url)
+
+    out = []
+    seen_keys: dict = {}
+    for finding in sorted(findings, key=lambda f: (f["file"], f["line"] or 0, f["id"])):
+        basis = (f"CVSS v4.0 base score {finding['cvss_score']} ({finding['cvss_band']})"
+                 if finding["cvss_score"] is not None else "CVSS v4.0 not computed")
+        parts = [
+            f"**Source finding ID:** {finding['id']} (Hermes AI security review, PR #{PR_NUMBER}, "
+            f"commit `{HEAD_SHA[:12]}`)",
+            f"**Location:** `{_location(finding)}`",
+            f"**Classification:** {finding['owasp'] or 'OWASP: n/a'}; "
+            f"{'CWE-' + str(finding['cwe']) if finding['cwe'] else 'CWE: n/a'}",
+            f"**Severity basis:** {basis}, vector `{finding['cvss']}`. "
+            f"Business adjustment: {finding['business_adjustment'] or 'none'}. "
+            f"Final severity: {finding['severity']}"
+            + (f" ({'; '.join(finding['notes'])})" if finding.get("notes") else "")
+            + ".",
+            f"**Exploitability evidence:** {finding['evidence']}",
+            f"**Business context:** {finding['business_context']}",
+            finding["description"],
+        ]
+        description = "\n\n".join(parts)
+        # Identity ignores the free-text title (a reworded re-review must reimport, not duplicate);
+        # two findings of one class in one file are told apart by their order in the file.
+        key = (finding["file"], finding["cwe"], finding["owasp"].split(" ")[0].upper())
+        seen_keys[key] = seen_keys.get(key, 0) + 1
+        identity = "|".join([REPOSITORY, finding["file"], str(finding["cwe"] or ""), key[2], str(seen_keys[key])])
+        item = {
+            "title": f"[{finding['id']}] {finding['title']}"[:MAX_TITLE_CHARS],
+            "severity": finding["severity"],
+            "description": description,
+            "mitigation": finding["mitigation"],
+            "impact": finding["impact"],
+            "references": "\n".join(references),
+            "static_finding": True,
+            "dynamic_finding": False,
+            "active": True,
+            "verified": False,
+            "date": today,
+            "unique_id_from_tool": "hermes-" + hashlib.sha256(identity.encode()).hexdigest()[:24],
+            "tags": ["ai-sast", "hermes", f"pr-{PR_NUMBER}"]
+                    + (["unconfirmed"] if finding.get("unconfirmed") else [])
+                    + ([re.sub(r"[^a-z0-9]+", "-", finding["owasp"].split()[0].lower()).strip("-")]
+                       if finding["owasp"] and finding["owasp"].upper() != "N/A" else []),
+            "cvssv4": finding["cvss"],
+            "cvssv4_score": finding["cvss_score"],
+        }
+        if finding["file"]:
+            item["file_path"] = finding["file"]
+        if finding["line"]:
+            item["line"] = finding["line"]
+        if finding["cwe"]:
+            item["cwe"] = finding["cwe"]
+            item["vuln_id_from_tool"] = f"CWE-{finding['cwe']}"
+        out.append({k: v for k, v in item.items() if v not in ("", None)})
+
+    return {"findings": out}
 
 
 def build_sarif(findings: list[dict]) -> dict:
-    """SARIF 2.1.0 for the review findings. Consumed by pr_findings.py /
-    gate_findings.py through the standard SARIF path (level/ruleId/
-    physicalLocation) and, later, by the DefDojo reimport-scan. The rule id
-    encodes the severity (the renderer's AI-review key carries the location
-    and message, so same-file findings never collapse)."""
+    """SARIF 2.1.0 for the review findings (level/ruleId/physicalLocation).
+    The rule id encodes the severity."""
 
-    rules = []
-    seen = set()
+    rules, seen, results = [], set(), []
     for finding in findings:
         rule_id = "hermes.ai-review." + finding["severity"].lower()
         if rule_id not in seen:
             seen.add(rule_id)
             rules.append({
                 "id": rule_id,
-                "name": "Hermes AI security review finding ("
-                         + finding["severity"] + ")",
-                "shortDescription": {
-                    "text": finding["severity"]
-                             + " finding reported by the Hermes AI security "
-                               "review",
-                },
+                "name": f"Hermes AI security review finding ({finding['severity']})",
+                "shortDescription": {"text": f"{finding['severity']} finding reported by the Hermes AI security review"},
             })
-
-    results = []
-    for finding in findings:
-        text = finding["issue"]
-        if finding["fix"]:
-            text = (text + " Suggested fix: " + finding["fix"]).strip()
-        physical = {"artifactLocation": {"uri": finding["file"]}}
-        if finding["line"]:
-            physical["region"] = {"startLine": finding["line"]}
-        results.append({
-            "ruleId": "hermes.ai-review." + finding["severity"].lower(),
-            "level": SARIF_LEVEL_BY_SEVERITY[finding["severity"]],
-            "message": {"text": text},
-            "locations": [{"physicalLocation": physical}],
-        })
+        text = f"[{finding['id']}] {finding['title']}. {finding['description']}"
+        if finding["mitigation"]:
+            text += f" Suggested fix: {finding['mitigation']}"
+        result = {"ruleId": rule_id, "level": SARIF_LEVEL_BY_SEVERITY[finding["severity"]],
+                  "message": {"text": text},
+                  "properties": {"security-severity": str(finding["cvss_score"]),
+                                 "cvssV4": finding["cvss"], "owasp": finding["owasp"],
+                                 "cwe": finding["cwe"], "hermesLabel": finding["hermes_label"]}}
+        if finding["file"]:
+            physical = {"artifactLocation": {"uri": finding["file"]}}
+            if finding["line"]:
+                physical["region"] = {"startLine": finding["line"]}
+            result["locations"] = [{"physicalLocation": physical}]
+        results.append(result)
 
     return {
         "version": "2.1.0",
-        "$schema":
-            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/"
-            "master/Schemata/sarif-schema-2.1.0.json",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "Hermes AI Security Review",
-                    "informationUri": "https://hermes.usfali.com",
-                    "version": "1.0",
-                    "rules": rules,
-                }
-            },
-            "results": results,
-        }],
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "runs": [{"tool": {"driver": {"name": "Hermes AI Security Review", "version": "1.0", "rules": rules}},
+                  "results": results}],
     }
 
 
-def write_sarif(findings: list[dict]) -> Path:
+def build_markdown_report(assessment: dict, comment: dict, context: dict) -> str:
+    """Human-readable report: scope, severity table, every finding in full,
+    then the comment's schema / dependency / notes sections verbatim."""
+
+    body = comment.get("body") or ""
+    counts = assessment["severity_counts"]
+    lines = [
+        f"# Hermes AI security review — {REPOSITORY}#{PR_NUMBER}",
+        "",
+        f"- Commit: `{HEAD_SHA}`",
+        *([f"- **Not rated:** {assessment['detail']}"] if assessment.get("detail") else []),
+        f"- Result: **{assessment['result'].upper()}** "
+        f"({assessment['blocking_findings']} Critical/High blocking)",
+        f"- Diff reviewed: {context['file_count']} file(s), {context['diff_bytes']} bytes, "
+        f"sha256 `{context['diff_sha256']}`",
+        f"- PR comment: {comment.get('html_url', '')}",
+        "",
+        "| Severity | Findings |", "|---|---|",
+        *[f"| {s} | {counts[s]} |" for s in SEVERITY_ORDER],
+        "",
+        "## Findings",
+        "",
+    ]
+    for finding in sorted(assessment["findings"], key=lambda f: SEVERITY_ORDER.index(f["severity"])):
+        lines += [
+            f"### [{finding['id']}] {finding['title']} ({finding['severity']})",
+            "",
+            f"- **OWASP:** {finding['owasp'] or 'n/a'}  **CWE:** {finding['cwe'] or 'n/a'}",
+            f"- **Location:** `{_location(finding)}`",
+            f"- **CVSS v4.0:** {finding['cvss_score'] if finding['cvss_score'] is not None else 'not computed'} ({finding['cvss_band'] or 'n/a'}) `{finding['cvss']}`",
+            f"- **Severity:** {finding['severity']}"
+            + (f" — {'; '.join(finding['notes'])}" if finding.get("notes") else ""),
+            f"- **Exploitability evidence:** {finding['evidence']}",
+            f"- **Business context:** {finding['business_context']}",
+            f"- **Business adjustment:** {finding['business_adjustment']}",
+            f"- **Description:** {finding['description']}",
+            f"- **Impact:** {finding['impact'] or 'n/a'}",
+            f"- **Mitigation:** {finding['mitigation'] or 'n/a'}",
+            "",
+        ]
+    for heading in ("## Schema / database changes", "## Dependency / library changes", "## Other notes"):
+        text = _section(body, heading).strip()
+        if text:
+            lines += [heading, "", text, ""]
+    return "\n".join(lines)
+
+
+def write_reports(assessment: dict, comment: dict, context: dict) -> list[str]:
+    """Writes into $OUT (uploaded as artifact report-ai-review/, from which
+    defectdojo_upload.py imports hermes-findings.json). Written even with
+    zero findings so a clean run still shows as an imported, empty test."""
+
     OUT.mkdir(parents=True, exist_ok=True)
-    path = OUT / "ai-review.sarif"
-    path.write_text(
-        json.dumps(build_sarif(findings), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    return path
+    findings = assessment["findings"]
+    if assessment["status"] != "completed":
+        # No machine-readable files for a review that could not be rated: with
+        # close_old_findings, an empty or partial import would tell DefectDojo
+        # that everything reported before had been fixed.
+        (OUT / "hermes-report.md").write_text(
+            build_markdown_report(assessment, comment, context) + "\n", encoding="utf-8")
+        return ["hermes-report.md"]
+    files = {
+        "hermes-findings.json": json.dumps(
+            build_defectdojo_findings(findings, comment.get("html_url") or ""), indent=2, ensure_ascii=False),
+        "ai-review.sarif": json.dumps(build_sarif(findings), indent=2, ensure_ascii=False),
+        "hermes-report.md": build_markdown_report(assessment, comment, context),
+    }
+    for name, content in files.items():
+        (OUT / name).write_text(content + "\n", encoding="utf-8")
+    return sorted(files)
+
+
+def finish(status: str, detail: str, **metrics) -> None:
+    """The gate reads `result` as JSON {status, detail, metrics} (gate.py); a
+    bare string reads as 'control did not complete'."""
+    result = {"status": status, "detail": detail[:1000], "metrics": metrics}
+    write_output("result", json.dumps(result))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(f"### AI security review · Hermes: {status}\n\n{detail}\n")
+    if status != "pass":
+        print(f"::error::{detail[:500]}")
+    raise SystemExit(0 if status == "pass" else 1)  # a verdict is final
 
 
 # ---------------------------------------------------------------------------
@@ -600,60 +867,42 @@ def main() -> None:
 
         comment = wait_for_review_comment()
 
-        assessment = parse_review(comment)
+        changed = frozenset(line.strip() for line in str(context.get("changed_files", "")).splitlines() if line.strip())
+        assessment = parse_review(comment, changed)
 
-        if assessment["status"] == "completed":
-            findings = parse_findings(comment.get("body") or "")
-            sarif_path = write_sarif(findings)
-            log(
-                f"Findings persisted: {len(findings)} "
-                f"-> {sarif_path}"
-            )
+        written = write_reports(assessment, comment, context)
+        log(f"Reports written to {OUT}: {', '.join(written)} "
+            f"({len(assessment['findings'])} finding(s))")
 
         verdict = {
             "repository": REPOSITORY,
             "pr_number": int(PR_NUMBER),
             "head_sha": HEAD_SHA,
-
             "source": "github-actions-authenticated",
-
             "diff_status": context["diff_status"],
             "diff_bytes": context["diff_bytes"],
             "file_count": context["file_count"],
             "diff_sha256": context["diff_sha256"],
-
             "status": assessment["status"],
             "result": assessment["result"],
-            "blocking_findings": assessment[
-                "blocking_findings"
-            ],
-            "severity_counts": assessment[
-                "severity_counts"
-            ],
-
+            "blocking_findings": assessment["blocking_findings"],
+            "severity_counts": assessment["severity_counts"],
             "comment_url": comment.get("html_url"),
         }
-
         write_verdict(verdict)
 
-        write_output(
-            "result",
-            assessment["result"],
-        )
-
-        log(
-            "Review completed: "
-            f"result={assessment['result']} "
-            f"blocking_findings="
-            f"{assessment['blocking_findings']}"
-        )
+        counts = assessment["severity_counts"]
+        summary = ", ".join(f"{counts[s]} {s}" for s in SEVERITY_ORDER if counts[s]) or "no findings"
+        link = comment.get("html_url") or ""
+        log(f"Review completed: result={assessment['result']} blocking_findings={assessment['blocking_findings']}")
 
         if assessment["result"] == "error":
-            raise SystemExit(1)
-
-        # Findings are advisory — Critical/High can be enforced by a
-        # separate gate using the 'result' job output.
-        raise SystemExit(0)
+            finish("fail", assessment["detail"], findings=0)
+        if assessment["result"] == "fail":
+            finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}",
+                   findings=len(assessment["findings"]), blocking=assessment["blocking_findings"])
+        finish("pass", f"Hermes: {summary}; no Critical/High; see {link}",
+               findings=len(assessment["findings"]), blocking=0)
 
     except Exception as exc:
         fail_review(str(exc))
