@@ -245,6 +245,13 @@ def load_event() -> dict:
 def build_payload() -> tuple[dict, bytes]:
     event = load_event()
 
+    # pull_request_review events carry the PR only under `pull_request`, but the
+    # Hermes route addresses its comment with {number}: without this top-level
+    # field the gateway reviews the diff and then cannot deliver the result
+    # ("invalid pr_number: '{number}'").
+    if PR_NUMBER.isdigit():
+        event.setdefault("number", int(PR_NUMBER))
+
     context = retrieve_pr_context()
 
     event["hermes_context"] = context
