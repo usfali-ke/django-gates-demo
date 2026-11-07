@@ -12,8 +12,6 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import cvss4  # noqa: E402  (CVSS v4.0 base score, same directory)
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +478,7 @@ def parse_findings(body: str) -> list[dict]:
             "title": _clean(match.group("title").strip(), MAX_TITLE_CHARS),
             "severity": match.group("severity").title(),
             "owasp": _clean(fields.get("owasp", ""), MAX_TITLE_CHARS),
-            "cvss": fields.get("cvss", "").split()[0] if fields.get("cvss", "").strip() else "",
+            "cvss": fields.get("cvss", "").strip(),
             "evidence": _clean(fields.get("evidence", ""), MAX_FIELD_CHARS),
             "business_context": _clean(fields.get("business context", ""), MAX_FIELD_CHARS),
             "business_adjustment": _clean(fields.get("business adjustment", ""), MAX_FIELD_CHARS),
@@ -509,79 +507,26 @@ def parse_findings(body: str) -> list[dict]:
     return findings
 
 
-LEVELS_UP = {"Low": "Medium", "Medium": "High", "High": "Critical", "Critical": "Critical"}
-EVIDENCE_REF = re.compile(r"[\w./-]+\.\w+:\d+")
-RAISED = re.compile(r"^\W*raised(?:\s+one\s+level)?\s*[-\u2013\u2014:]*\s*(?P<why>.*)$", re.IGNORECASE)
+CVSS_FIELD = re.compile(
+    r"^(?P<vector>CVSS:4\.0/AV:[NALP]/AC:[LH]/AT:[NP]/PR:[NLH]/UI:[NPA]/"
+    r"VC:[HLN]/VI:[HLN]/VA:[HLN]/SC:[HLN]/SI:[HLN]/SA:[HLN])\s*(?:\(?\s*(?P<score>\d{1,2}(?:\.\d)?)\s*\)?)?",
+)
+SCORE_BY_SEVERITY = {"Critical": 9.5, "High": 8.0, "Medium": 5.5, "Low": 3.0}  # SARIF fallback only
 
 
-def assess_finding(finding: dict, changed_files: frozenset = frozenset()) -> None:
-    """Severity is derived, not trusted. The label Hermes wrote is kept as
-    `hermes_label`; the effective severity follows from the evidence rules:
+def assess_finding(finding: dict) -> None:
+    """Hermes decides the severity: the `(Severity: X)` label in the heading is
+    final and is reported as written. This only reads the supporting fields
+    (CVSS v4.0 vector and the score Hermes stated) so they can be carried to
+    DefectDojo and the report; nothing is recalculated, corrected or rejected."""
 
-      CVSS v4.0 base score of Hermes's vector (computed here, any score it
-      wrote is ignored) -> band; raised one level only by a reasoned business
-      adjustment; capped at Low when the exploit path was 'not confirmed'.
-
-    Anything that makes that derivation impossible is recorded in
-    finding['problems'] and fails the control closed (see parse_review)."""
-
-    problems, notes = [], []
-    finding["hermes_label"] = finding["severity"]
-    finding["cvss_score"] = None
-    finding["cvss_band"] = ""
-    finding["unconfirmed"] = False
-
-    evidence = finding["evidence"].strip()
-    refs = [m.rsplit(":", 1)[0] for m in EVIDENCE_REF.findall(evidence)]
-    if len(evidence) < 20 or not refs:
-        problems.append("Evidence missing or has no file:line references")
-    elif changed_files and not any(r == c or c.endswith("/" + r) or r.endswith("/" + c)
-                                   for r in refs for c in changed_files):
-        problems.append("Evidence cites no file changed in this PR")
-    finding["unconfirmed"] = evidence.lower().startswith("not confirmed")
-
-    try:
-        finding["cvss_score"] = cvss4.score(finding["cvss"])
-        finding["cvss_band"] = cvss4.severity(finding["cvss_score"])
-    except ValueError as exc:
-        problems.append(f"CVSS v4.0 vector invalid ({exc})")
-    if finding["cvss_band"] == "None":
-        problems.append("CVSS vector has no impact (score 0.0); not a reportable finding")
-
-    if not finding["business_context"].strip():
-        problems.append("Business context missing")
-
-    adjustment = finding["business_adjustment"].strip()
-    raised = RAISED.match(adjustment)
-    if raised:
-        if len(raised.group("why").strip()) < 15:
-            problems.append("Business adjustment 'raised' has no reason")
-    elif adjustment.lower().strip(" .\"'") != "none":
-        problems.append("Business adjustment must be 'none' or 'raised one level - <reason>'")
-
-    if problems:
-        finding["problems"] = problems
-        finding["severity"] = finding["hermes_label"]
-        finding["notes"] = []
-        return
-
-    effective = finding["cvss_band"]
-    if raised:
-        raised_to = LEVELS_UP[effective]
-        if raised_to != effective:
-            notes.append(f"business context raised {effective} to {raised_to}")
-        effective = raised_to
-    if finding["unconfirmed"] and effective != "Low":
-        notes.append(f"exploit path not confirmed, capped at Low (would be {effective})")
-        effective = "Low"
-    if effective != finding["hermes_label"]:
-        notes.append(f"Hermes labelled it {finding['hermes_label']}")
-    finding["severity"] = effective
-    finding["problems"] = []
-    finding["notes"] = notes
+    match = CVSS_FIELD.match(finding["cvss"].strip())
+    finding["cvss_vector"] = match.group("vector") if match else ""
+    finding["cvss_score"] = float(match.group("score")) if match and match.group("score") else None
+    finding["unconfirmed"] = finding["evidence"].strip().lower().startswith("not confirmed")
 
 
-def parse_review(comment: dict, changed_files: frozenset = frozenset()) -> dict:
+def parse_review(comment: dict) -> dict:
     """Verdict inputs from the comment. Fails closed: a comment whose own
     'N finding(s)' header disagrees with the blocks parsed is an error, so a
     format drift can never again turn nine findings into a clean pass."""
@@ -597,7 +542,7 @@ def parse_review(comment: dict, changed_files: frozenset = frozenset()) -> dict:
 
     findings = parse_findings(body)
     for finding in findings:
-        assess_finding(finding, changed_files)
+        assess_finding(finding)
 
     declared = COUNT_HEADER.match(first)
     if declared and int(declared.group(1)) != len(findings):
@@ -605,14 +550,6 @@ def parse_review(comment: dict, changed_files: frozenset = frozenset()) -> dict:
                 "severity_counts": counts, "findings": findings,
                 "detail": f"comment declares {declared.group(1)} finding(s) but {len(findings)} were parsed — "
                           "comment format changed; refusing to pass"}
-
-    incomplete = [f for f in findings if f["problems"]]
-    if incomplete:
-        shown = "; ".join(f"[{f['id']}] {', '.join(f['problems'])}" for f in incomplete[:3])
-        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
-                "severity_counts": counts, "findings": findings,
-                "detail": f"severity cannot be established for {len(incomplete)} finding(s): {shown}. "
-                          "Re-run the review; a finding without evidence and a valid CVSS v4.0 vector is not rated"}
 
     for finding in findings:
         counts[finding["severity"]] += 1
@@ -652,19 +589,17 @@ def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
     out = []
     seen_keys: dict = {}
     for finding in sorted(findings, key=lambda f: (f["file"], f["line"] or 0, f["id"])):
-        basis = (f"CVSS v4.0 base score {finding['cvss_score']} ({finding['cvss_band']})"
-                 if finding["cvss_score"] is not None else "CVSS v4.0 not computed")
+        basis = (f"CVSS v4.0 base score {finding['cvss_score']}" if finding["cvss_score"] is not None
+                 else "CVSS v4.0 score not stated")
         parts = [
             f"**Source finding ID:** {finding['id']} (Hermes AI security review, PR #{PR_NUMBER}, "
             f"commit `{HEAD_SHA[:12]}`)",
             f"**Location:** `{_location(finding)}`",
             f"**Classification:** {finding['owasp'] or 'OWASP: n/a'}; "
             f"{'CWE-' + str(finding['cwe']) if finding['cwe'] else 'CWE: n/a'}",
-            f"**Severity basis:** {basis}, vector `{finding['cvss']}`. "
+            f"**Severity basis:** {basis}, vector `{finding['cvss_vector'] or finding['cvss'] or 'not stated'}`. "
             f"Business adjustment: {finding['business_adjustment'] or 'none'}. "
-            f"Final severity: {finding['severity']}"
-            + (f" ({'; '.join(finding['notes'])})" if finding.get("notes") else "")
-            + ".",
+            f"Severity: {finding['severity']} (assigned by Hermes).",
             f"**Exploitability evidence:** {finding['evidence']}",
             f"**Business context:** {finding['business_context']}",
             finding["description"],
@@ -692,7 +627,7 @@ def build_defectdojo_findings(findings: list[dict], comment_url: str) -> dict:
                     + (["unconfirmed"] if finding.get("unconfirmed") else [])
                     + ([re.sub(r"[^a-z0-9]+", "-", finding["owasp"].split()[0].lower()).strip("-")]
                        if finding["owasp"] and finding["owasp"].upper() != "N/A" else []),
-            "cvssv4": finding["cvss"],
+            "cvssv4": finding["cvss_vector"],
             "cvssv4_score": finding["cvss_score"],
         }
         if finding["file"]:
@@ -726,9 +661,10 @@ def build_sarif(findings: list[dict]) -> dict:
             text += f" Suggested fix: {finding['mitigation']}"
         result = {"ruleId": rule_id, "level": SARIF_LEVEL_BY_SEVERITY[finding["severity"]],
                   "message": {"text": text},
-                  "properties": {"security-severity": str(finding["cvss_score"]),
-                                 "cvssV4": finding["cvss"], "owasp": finding["owasp"],
-                                 "cwe": finding["cwe"], "hermesLabel": finding["hermes_label"]}}
+                  "properties": {"security-severity": str(finding["cvss_score"] if finding["cvss_score"] is not None
+                                                         else SCORE_BY_SEVERITY[finding["severity"]]),
+                                 "cvssV4": finding["cvss_vector"], "owasp": finding["owasp"],
+                                 "cwe": finding["cwe"]}}
         if finding["file"]:
             physical = {"artifactLocation": {"uri": finding["file"]}}
             if finding["line"]:
@@ -773,9 +709,8 @@ def build_markdown_report(assessment: dict, comment: dict, context: dict) -> str
             "",
             f"- **OWASP:** {finding['owasp'] or 'n/a'}  **CWE:** {finding['cwe'] or 'n/a'}",
             f"- **Location:** `{_location(finding)}`",
-            f"- **CVSS v4.0:** {finding['cvss_score'] if finding['cvss_score'] is not None else 'not computed'} ({finding['cvss_band'] or 'n/a'}) `{finding['cvss']}`",
-            f"- **Severity:** {finding['severity']}"
-            + (f" — {'; '.join(finding['notes'])}" if finding.get("notes") else ""),
+            f"- **CVSS v4.0:** {finding['cvss_score'] if finding['cvss_score'] is not None else 'score not stated'} `{finding['cvss_vector'] or finding['cvss'] or 'not stated'}`",
+            f"- **Severity:** {finding['severity']} (assigned by Hermes)",
             f"- **Exploitability evidence:** {finding['evidence']}",
             f"- **Business context:** {finding['business_context']}",
             f"- **Business adjustment:** {finding['business_adjustment']}",
@@ -867,8 +802,7 @@ def main() -> None:
 
         comment = wait_for_review_comment()
 
-        changed = frozenset(line.strip() for line in str(context.get("changed_files", "")).splitlines() if line.strip())
-        assessment = parse_review(comment, changed)
+        assessment = parse_review(comment)
 
         written = write_reports(assessment, comment, context)
         log(f"Reports written to {OUT}: {', '.join(written)} "
