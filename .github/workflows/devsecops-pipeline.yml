@@ -387,16 +387,54 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           WAIT_SECONDS: "1500"
         run: python3 .github/scripts/hermes_review.py
-      # Supplementary evidence only — the verdict reaches gate-g1 through the
-      # job output. lab-runner's egress to GitHub's artifact storage is
-      # flaky (ETIMEDOUT), and that must not turn a passing review red.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # The verdict reaches gate-g1 through the job output, so this upload never
+      # turns a review red. It still matters: defectdojo-upload imports a run's
+      # report-* artifacts, so a lost upload means the findings silently never
+      # reach DefectDojo (PR #77: "Failed to CreateArtifact: ETIMEDOUT").
+      # lab-runner's egress to GitHub's artifact storage is flaky, so retry with
+      # backoff (overwrite covers an upload that died after creating the
+      # artifact) and, if every attempt fails, say so loudly.
+      - id: upload1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         continue-on-error: true
         with:
           name: report-ai-review
           path: reports/ai-review/
           if-no-files-found: ignore
+      - id: wait2
+        if: always() && steps.upload1.outcome == 'failure'
+        run: sleep 20
+      - id: upload2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && steps.upload1.outcome == 'failure'
+        continue-on-error: true
+        with:
+          name: report-ai-review
+          path: reports/ai-review/
+          if-no-files-found: ignore
+          overwrite: true
+      - id: wait3
+        if: always() && steps.upload2.outcome == 'failure'
+        run: sleep 60
+      - id: upload3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && steps.upload2.outcome == 'failure'
+        continue-on-error: true
+        with:
+          name: report-ai-review
+          path: reports/ai-review/
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Report not uploaded
+        if: always() && steps.upload3.outcome == 'failure'
+        run: |
+          echo "::warning title=AI review report not uploaded::report-ai-review failed 3 upload attempts (runner egress to GitHub artifact storage). This run's AI findings will NOT reach DefectDojo until re-run."
+          {
+            echo "### :warning: AI review report not uploaded"
+            echo
+            echo "All 3 attempts to upload \`report-ai-review\` failed. DefectDojo imports a run's artifacts, so the findings of this run are **missing there**. Re-run this job to retry."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   commits-signed:
     name: Develop · governance · signed commits
