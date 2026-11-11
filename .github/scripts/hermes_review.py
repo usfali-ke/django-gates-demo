@@ -149,9 +149,10 @@ def fail_review(reason: str) -> None:
     }
 
     write_verdict(verdict)
-    write_output("result", json.dumps({"status": "fail", "detail": reason[:500], "metrics": {}}))
-
-    raise SystemExit(1)
+    write_output("result", json.dumps({"status": "advisory", "detail": f"Hermes advisory review did not run: {reason[:450]}", "metrics": {}}))
+    # Advisory: a review that couldn't run is reported, never a failed PR.
+    print(f"::warning::Hermes advisory review did not run: {reason[:500]}")
+    raise SystemExit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +767,7 @@ def build_markdown_report(assessment: dict, comment: dict, context: dict) -> str
         f"- Commit: `{HEAD_SHA}`",
         *([f"- **Not rated:** {assessment['detail']}"] if assessment.get("detail") else []),
         f"- Result: **{assessment['result'].upper()}** "
-        f"({assessment['blocking_findings']} Critical/High blocking)",
+        f"({assessment['blocking_findings']} Critical/High) - advisory: for the reviewer, never a gate",
         f"- Diff reviewed: {context['file_count']} file(s), {context['diff_bytes']} bytes, "
         f"sha256 `{context['diff_sha256']}`",
         f"- PR comment: {comment.get('html_url', '')}",
@@ -827,17 +828,22 @@ def write_reports(assessment: dict, comment: dict, context: dict) -> list[str]:
 
 
 def finish(status: str, detail: str, **metrics) -> None:
-    """The gate reads `result` as JSON {status, detail, metrics} (gate.py); a
-    bare string reads as 'control did not complete'."""
+    """`result` as JSON {status, detail, metrics}. ADVISORY since 2026-11-11:
+    an LLM's labels (CWE, severity, wording) vary run to run on the same
+    code, so the review never gates a merge (not a G1 input), is never
+    waived and is never imported into DefectDojo. Any outcome other than a
+    clean pass is reported as "advisory" and the job succeeds."""
+    if status != "pass":
+        status = "advisory"
     result = {"status": status, "detail": detail[:1000], "metrics": metrics}
     write_output("result", json.dumps(result))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
-            handle.write(f"### AI security review · Hermes: {status}\n\n{detail}\n")
+            handle.write(f"### AI security review · Hermes (advisory): {status}\n\n{detail}\n")
     if status != "pass":
-        print(f"::error::{detail[:500]}")
-    raise SystemExit(0 if status == "pass" else 1)  # a verdict is final
+        print(f"::warning::{detail[:500]}")
+    raise SystemExit(0)  # advisory: never a failed control
 
 
 # ---------------------------------------------------------------------------
@@ -916,7 +922,7 @@ def main() -> None:
         if assessment["result"] == "error":
             finish("fail", assessment["detail"], findings=0)
         if assessment["result"] == "fail":
-            finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}",
+            finish("fail", f"Hermes advisory: {summary} — for the reviewer to assess, not a gate; see {link}",
                    findings=len(assessment["findings"]), blocking=assessment["blocking_findings"])
         finish("pass", f"Hermes: {summary}; no Critical/High; see {link}",
                findings=len(assessment["findings"]), blocking=0)

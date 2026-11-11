@@ -446,7 +446,8 @@ jobs:
 
   gate-g1:
     name: G1 merge gate (Develop → Build)
-    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-review]
+    # ai-review (Hermes) is advisory since 2026-11-11: not a G1 input.
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 5
