@@ -143,7 +143,11 @@ def fail_review(reason: str) -> None:
         "repository": REPOSITORY,
         "pr_number": int(PR_NUMBER) if PR_NUMBER.isdigit() else PR_NUMBER,
         "head_sha": HEAD_SHA,
-        "status": "not_completed",
+        "control": "ai-review",
+        "status": "fail",
+        "detail": reason[:1000],
+        "metrics": {},
+        "review_status": "not_completed",
         "result": "error",
         "reason": reason,
     }
@@ -736,8 +740,10 @@ def build_sarif(findings: list[dict]) -> dict:
             text += f" Suggested fix: {finding['mitigation']}"
         result = {"ruleId": rule_id, "level": SARIF_LEVEL_BY_SEVERITY[finding["severity"]],
                   "message": {"text": text},
-                  "properties": {"security-severity": str(finding["cvss_score"] if finding["cvss_score"] is not None
-                                                         else SCORE_BY_SEVERITY[finding["severity"]]),
+                  "properties": {"security-severity": str(
+                                     finding["cvss_score"]
+                                     if finding["cvss_score"] is not None and band(finding["cvss_score"]) == finding["severity"]
+                                     else SCORE_BY_SEVERITY[finding["severity"]]),
                                  "cvssV4": finding["cvss_vector"], "owasp": finding["owasp"],
                                  "cwe": finding["cwe"]}}
         if finding["file"]:
@@ -837,6 +843,17 @@ def finish(status: str, detail: str, **metrics) -> None:
         status = "advisory"
     result = {"status": status, "detail": detail[:1000], "metrics": metrics}
     write_output("result", json.dumps(result))
+    # verdict.json carries the same {control, status, detail, metrics} every
+    # control's verdict has (the PR findings comment and findings tooling read
+    # it) next to the review's own fields (result, blocking_findings, ...).
+    try:
+        current = json.loads(VERDICT_FILE.read_text(encoding="utf-8")) if VERDICT_FILE.exists() else {}
+    except (OSError, ValueError):
+        current = {}
+    if "status" in current:
+        current["review_status"] = current.pop("status")
+    current.update({"control": "ai-review", **result})
+    write_verdict(current)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
@@ -903,7 +920,7 @@ def main() -> None:
             "diff_bytes": context["diff_bytes"],
             "file_count": context["file_count"],
             "diff_sha256": context["diff_sha256"],
-            "status": assessment["status"],
+            "review_status": assessment["status"],
             "result": assessment["result"],
             "blocking_findings": assessment["blocking_findings"],
             "severity_counts": assessment["severity_counts"],
